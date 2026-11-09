@@ -8,9 +8,8 @@
 // 基础布局是编译期常量：没有编辑态、拖动排序、用户增删卡片或 home.layout.* 持久化。
 // VPN 状态和启停操作由固定状态卡负责，不再使用猫咪悬浮按钮或顶部运行条。
 //
-// 数据流：UI 泵每 500ms 从 CoreStreams 取最新流量帧追加进 60 点环形历史
-// （State<vector<TrafficPoint>>），连接快照帧只取总量字段；内核状态与启用
-// 订阅每拍重读。Canvas 画家捕获历史快照，重组后按最新序列重绘。
+// 数据流：Android UI 泵每 500ms 采样 libbox 快照，保留最近 60 点（约 30s）。
+// 曲线画家捕获历史快照，只在采样更新后重绘，不增加逐帧动画。
 #include <huxerui/huxerui.h>
 #include <huxerui/charts.h>
 
@@ -141,6 +140,9 @@ void updateRuntime(HomeState& s, store::CoreStore& core) {
     if (s.core.state == core::CoreState::Running) {
         s.history.push_back(point);
         if (s.history.size() > kHistoryPoints) s.history.erase(s.history.begin());
+    } else {
+        s.history.clear();
+        s.latest = {};
     }
 #else
     static_cast<void>(core);
@@ -311,27 +313,46 @@ void MirrorHomeState(huxerui::State<HomeState> state,
            huxerui::CrossAlign(huxerui::CrossAxisAlignment::Start));
 }
 
-// 流量统计：圆环旁保留方向占比，累计上传/下载量固定排在卡片底部。
-// 首页流量曲线数据：把滚动窗口拍成 Lib-Charts 的坐标快照（datum key 必须非空且唯一、
-// x 必须严格递增；这里用窗口内索引当 x，天然递增）。窗口约 1 Hz 变一次，重建 60×2 个
-// 点可忽略；空窗口也是合法快照（库会呈现空数据提示）。
-huxerui::XYChartData BuildTrafficChartData(
-    const std::vector<stream::TrafficPoint>& history,
-    const std::string& downloadLabel, const std::string& uploadLabel) {
-    std::vector<huxerui::XYDatum> down;
-    std::vector<huxerui::XYDatum> up;
-    down.reserve(history.size());
-    up.reserve(history.size());
-    for (std::size_t i = 0; i < history.size(); ++i) {
-        std::string key = std::to_string(i);
-        const double x = static_cast<double>(i);
-        down.push_back({key, x, static_cast<double>(history[i].down)});
-        up.push_back({key, x, static_cast<double>(history[i].up)});
+huxerui::CanvasPainter TrafficCurvePainter(
+    const std::vector<stream::TrafficPoint>& history, bool upload,
+    huxerui::Color color, bool fresh) {
+    std::vector<double> samples(kHistoryPoints, 0.0);
+    if (fresh) {
+        const std::size_t count = std::min(history.size(), kHistoryPoints);
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto& point = history[history.size() - count + i];
+            samples[kHistoryPoints - count + i] =
+                static_cast<double>(std::max<std::int64_t>(0, upload ? point.up : point.down));
+        }
     }
-    return huxerui::XYChartData({
-        huxerui::XYSeries("down", downloadLabel, std::move(down)),
-        huxerui::XYSeries("up", uploadLabel, std::move(up)),
-    });
+    return [samples = std::move(samples), color, fresh](huxerui::PaintContext& paint,
+                                                       huxerui::Size size) {
+        if (!fresh || size.width <= 0.0F || size.height <= 0.0F) return;
+        const double maximum = std::max(1024.0, *std::max_element(samples.begin(), samples.end()));
+        const float baseline = size.height - 1.0F;
+        const float amplitude = std::min(44.0F, size.height * 0.34F);
+        const float step = size.width / static_cast<float>(samples.size() - 1);
+        const auto position = [&](std::size_t index) {
+            return huxerui::Point{
+                static_cast<float>(index) * step,
+                baseline - static_cast<float>(samples[index] / maximum) * amplitude};
+        };
+        huxerui::Path curve;
+        curve.MoveTo(position(0));
+        for (std::size_t i = 1; i < samples.size(); ++i) {
+            const auto previous = position(i - 1);
+            const auto current = position(i);
+            const float middle = (previous.x + current.x) * 0.5F;
+            // Horizontal tangents keep smoothing within each pair of measured values.
+            curve.CubicTo({middle, previous.y}, {middle, current.y}, current);
+        }
+        huxerui::Path area = curve;
+        area.LineTo({size.width, size.height}).LineTo({0.0F, size.height}).Close();
+        auto fill = color;
+        fill.alpha *= 0.18F;
+        paint.FillPath(area, fill);
+        paint.StrokePath(curve, color, huxerui::StrokeStyle{.width = 1.8F});
+    };
 }
 
 // ---- 卡片内容 --------------------------------------------------------------
@@ -486,64 +507,58 @@ std::string FormatHomeUptime(std::int64_t seconds) {
            huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch));
 }
 
-// 流量卡片：标题行 + 曲线；曲线吃掉卡片剩余高度，任意高度都成立。曲线用
-// HuxerUI Lib-Charts（面积图），替掉原先手绘的 Canvas：只保留曲线本身与
-// hover tooltip（速率数字在标题行），外观保持「下载实心面积 + 上传细线」。
-[[huxerui::composable]] huxerui::View HomeTrafficCard(const HomeState& s) {
-    const huxerui::ThemeSpec& theme = huxerui::UseTheme();
-    const bool fresh = huxerui::UseService<CoreModel>()->view.Get().health.traffic.state == health::State::Fresh;
-    const auto trafficColors = ResolveTrafficColors(theme);
-    const huxerui::Color downColor = trafficColors.download;
-    const huxerui::Color upColor = trafficColors.upload;
-    huxerui::Color fillDown = downColor;
-    fillDown.alpha = 0.18F;  // 与旧手绘面积填充同一透明度
-
-    return huxerui::Column {
+[[huxerui::composable]] huxerui::View HomeTrafficDirection(
+    const HomeState& s, bool upload, bool fresh, huxerui::Color color) {
+    const auto& theme = huxerui::UseTheme();
+    const auto islands = ResolveIslandTheme(theme);
+    const auto rate = fresh ? formatRate(std::max<std::int64_t>(0, upload ? s.latest.up : s.latest.down))
+                            : std::string{"—"};
+    const auto separator = rate.find(' ');
+    const auto amount = rate.substr(0, separator);
+    const auto unit = separator == std::string::npos ? std::string{} : rate.substr(separator + 1);
+    const auto total = s.coreReady ? formatBytes(std::max<std::int64_t>(0, upload ? s.totalUp : s.totalDown))
+                                  : std::string{"—"};
+    return huxerui::Stack {
+      huxerui::Canvas(TrafficCurvePainter(s.history, upload, color, fresh))
+          .With(huxerui::Semantics{.hidden = true}),
+      huxerui::Column {
+        huxerui::Text(upload ? Localized("↑ 上传") : Localized("↓ 下载"))
+            .Style(huxerui::TextStyle{
+                huxerui::Font::System(font_size::kCaption).WithWeight(huxerui::FontWeight::SemiBold), color}),
         huxerui::Row {
-            HomeCardHeading(app::images::speed, Localized("流量")),
-            huxerui::Spacer(),
-            huxerui::Text(fresh ? "↑ " + formatRate(s.latest.up) : "↑ —")
-                .Style(huxerui::TextStyle{
-                    huxerui::Font::System(font_size::kCaption), upColor}),
-            huxerui::Text(fresh ? "↓ " + formatRate(s.latest.down) : "↓ —")
-                .Style(huxerui::TextStyle{
-                    huxerui::Font::System(font_size::kCaption), downColor}),
-        }.With(huxerui::Spacing(12.0F),
-               huxerui::CrossAlign(huxerui::CrossAxisAlignment::Center)),
-        huxerui::AreaChart(BuildTrafficChartData(
-            s.history, huxerui::UseString(Localized("↓ 下载")),
-            huxerui::UseString(Localized("↑ 上传"))))
-            .Baseline(0.0)
-            .Interpolation(huxerui::ChartInterpolation::Linear)
-            // 只显示折线：两轴的轴线/刻度数字/网格全部隐藏（Visible(false)
-            // 不改变标度域）。Y 轴 formatter 仍供 tooltip 与语义读数使用。
-            .XAxis(huxerui::ChartAxis::Linear().Visible(false))
-            .YAxis(huxerui::ChartAxis::Linear()
-                       .IncludeZero()
-                       .Visible(false)
-                       .Formatter([](double value) {
-                           return formatRate(static_cast<std::int64_t>(value));
-                       }))
-            .Legend(huxerui::ChartLegendOptions{.visible = false})
-            .Accessibility(huxerui::ChartAccessibilityOptions{
-                .summary = huxerui::UseString(
-                    Localized("上/下行实时速率曲线"))})
-            .SeriesStyle("down",
-                         huxerui::AreaChartStyle{
-                             .fill = huxerui::Brush(fillDown),
-                             .stroke = huxerui::Brush(downColor),
-                             .stroke_style =
-                                 huxerui::StrokeStyle{.width = 2.0F}})
-            .SeriesStyle("up",
-                         huxerui::AreaChartStyle{
-                             .fill =
-                                 huxerui::Brush(huxerui::Color::Transparent()),
-                             .stroke = huxerui::Brush(upColor),
-                             .stroke_style =
-                                 huxerui::StrokeStyle{.width = 1.5F}})
-            .With(huxerui::Grow(1.0F)),
-    }.With(huxerui::Spacing(10.0F),
-           huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch));
+          huxerui::Text(amount).Style(huxerui::TextStyle{
+              huxerui::Font::System(font_size::kTitle).WithWeight(huxerui::FontWeight::Bold),
+              theme.colors.on_surface}),
+          huxerui::Text(unit).Style(huxerui::TextStyle{
+              huxerui::Font::System(font_size::kCaption).WithWeight(huxerui::FontWeight::SemiBold),
+              theme.colors.on_surface_variant}),
+        }.With(huxerui::Spacing(2.0F), huxerui::CrossAlign(huxerui::CrossAxisAlignment::Center)),
+        huxerui::Text(LocalizedFormat("累计 {}", total)).Style(huxerui::TextStyle{
+            huxerui::Font::System(font_size::kCaption), theme.colors.on_surface_variant}),
+        huxerui::Spacer(),
+      }.With(huxerui::Padding(10.0F), huxerui::Spacing(3.0F),
+             huxerui::CrossAlign(huxerui::CrossAxisAlignment::Start)),
+    }.With(huxerui::Grow(1.0F),
+           huxerui::Align(huxerui::HorizontalAlignment::Stretch, huxerui::VerticalAlignment::Stretch),
+           huxerui::Background(islands.active), huxerui::CornerRadius(islands.nested_radius),
+           huxerui::ClipChildren())
+        .Key(upload ? "traffic-upload" : "traffic-download");
+}
+
+[[huxerui::composable]] huxerui::View HomeTrafficCard(const HomeState& s) {
+    const auto& theme = huxerui::UseTheme();
+    const auto core = huxerui::UseService<CoreModel>();
+    const bool fresh = s.coreReady && s.core.state == core::CoreState::Running &&
+        core->view.Get().health.traffic.state == health::State::Fresh;
+    const auto colors = ResolveTrafficColors(theme);
+    return huxerui::Column {
+      HomeCardHeading(app::images::speed, Localized("网络速度")),
+      huxerui::Row {
+        HomeTrafficDirection(s, true, fresh, colors.upload),
+        HomeTrafficDirection(s, false, fresh, colors.download),
+      }.With(huxerui::Grow(1.0F), huxerui::Spacing(10.0F),
+             huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch)),
+    }.With(huxerui::Spacing(10.0F), huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch));
 }
 
 // 出站模式：纵向单选列表（规则/全局/直连），排布参考 FlClash；单选圈、配色

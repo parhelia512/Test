@@ -8,7 +8,7 @@
 namespace clashflux::ui {
 
 enum class HomeCardKind {
-    Traffic,    // 流量曲线（标题行带实时上/下行速率）
+    Traffic,    // 网络速度（上传/下载分区与叠加曲线）
     Total,      // 流量统计（总上传 / 总下载）
     Mode,       // 出站模式
     Profile,    // 当前订阅
@@ -29,8 +29,8 @@ struct HomeCardSpec {
 inline constexpr HomeCardSpec kMobileHomeCards[] = {
     // 整宽状态卡只在启动/停止处提供操作，运行时长沿用后台 VpnUptime 快照。
     {HomeCardKind::VpnStatus, "vpn-status", "VPN 状态", 2, 2},
-    // Lib-Charts 的紧凑绘图面最小 240×96，适配 2 行（188pt）的卡片。
-    {HomeCardKind::Traffic, "traffic", "流量曲线", 2, 2},
+    // 上传/下载分区在同一张两行卡片内绘制，曲线随分区尺寸缩放。
+    {HomeCardKind::Traffic, "traffic", "网络速度", 2, 2},
     {HomeCardKind::Total, "total", "流量统计", 1, 2},
     // 出站模式是纵向单选列表（标题 + 3 个选项），占 1x2。
     {HomeCardKind::Mode, "mode", "出站模式", 1, 2},
