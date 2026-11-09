@@ -52,11 +52,12 @@ inline huxerui::View ProxyNodeTile(huxerui::View title, huxerui::View detail,
                 huxerui::Align(huxerui::HorizontalAlignment::End, huxerui::VerticalAlignment::Center));
         }
         slot = std::move(slot).Key("node-probe-slot");
+        huxerui::View detailView = detail;
         return SelectableTile(
             huxerui::Column{
                 title,
                 huxerui::Row{
-                    std::move(detail).With(huxerui::Grow(1.0F),
+                    std::move(detailView).With(huxerui::Grow(1.0F),
                         huxerui::Frame{.min_width = 0.0F}),
                     huxerui::Spacer(),
                     std::move(slot),
