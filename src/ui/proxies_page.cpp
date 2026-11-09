@@ -45,6 +45,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "proxies_model.h"
@@ -200,7 +201,85 @@ huxerui::Color delayColor(const huxerui::ThemeSpec& theme, int delay, bool timeo
     return DelayLevelColor(theme, delay, timeout || delay <= 0);
 }
 
-// 单行截断（UTF-8 代码点安全）：超限截断加省略号。
+struct FittedTwoLineProxyLabel {
+    class Extension;
+    std::string text;
+    huxerui::TextStyle style;
+    bool operator==(const FittedTwoLineProxyLabel&) const = default;
+};
+
+class FittedTwoLineProxyLabel::Extension final : public huxerui::NodeExtension {
+public:
+    Extension(huxerui::ViewNode& node, const FittedTwoLineProxyLabel& value) {
+        Update(node, value);
+    }
+
+    void Update(huxerui::ViewNode&, const FittedTwoLineProxyLabel& value) {
+        value_ = value;
+        width_ = -1.0F;
+        InvalidatePaint(PaintInvalidation::Foreground);
+    }
+
+    PaintInvalidation PrepareGeometry(huxerui::ViewNode& node,
+                                      huxerui::TextMeasurer& measurer) override {
+        const float width = node.ContentBounds().width;
+        if (width == width_) return PaintInvalidation::None;
+        width_ = width;
+        const auto codePointEnds = [](const std::string& text) {
+            std::vector<std::size_t> ends{0};
+            for (std::size_t index = 1; index <= text.size(); ++index) {
+                if (index == text.size() ||
+                    (static_cast<unsigned char>(text[index]) & 0xc0U) != 0x80U) {
+                    ends.push_back(index);
+                }
+            }
+            return ends;
+        };
+        const auto fit = [&](std::string_view source, bool ellipsis) {
+            const std::string full(source);
+            const std::string suffix = ellipsis ? "…" : "";
+            if (measurer.MeasureText(full + suffix, value_.style).size.width <= width) {
+                return std::pair{full, source.size()};
+            }
+            const auto ends = codePointEnds(full);
+            std::size_t low = 0;
+            std::size_t high = ends.size();
+            while (low + 1 < high) {
+                const std::size_t middle = (low + high) / 2;
+                if (measurer.MeasureText(full.substr(0, ends[middle]) + suffix,
+                                         value_.style).size.width <= width) {
+                    low = middle;
+                } else {
+                    high = middle;
+                }
+            }
+            return std::pair{full.substr(0, ends[low]) + suffix, ends[low]};
+        };
+        const auto first = fit(value_.text, false);
+        const std::string_view rest(value_.text.data() + first.second,
+                                    value_.text.size() - first.second);
+        const auto second = rest.empty()
+            ? std::pair<std::string, std::size_t>{" ", 0}
+            : fit(rest, true);
+        rendered_ = first.first + "\n" + second.first;
+        return PaintInvalidation::Foreground;
+    }
+
+    void PaintAboveContent(const huxerui::ViewNode& node,
+                           huxerui::PaintContext& paint) const override {
+        const auto bounds = node.ContentBounds();
+        paint.PushClip(bounds);
+        paint.DrawText(bounds, rendered_, value_.style,
+            {.align = huxerui::TextAlign::Leading, .wrap = huxerui::TextWrap::NoWrap});
+        paint.PopClip();
+    }
+
+private:
+    FittedTwoLineProxyLabel value_;
+    float width_ = -1.0F;
+    std::string rendered_;
+};
+
 std::string truncateOneLine(const std::string& s, std::size_t maxCodePoints) {
     std::size_t count = 0;
     std::size_t i = 0;
@@ -214,36 +293,18 @@ std::string truncateOneLine(const std::string& s, std::size_t maxCodePoints) {
     return s;
 }
 
-// 两行截断（UTF-8 代码点安全）：名称按卡片预算拆成两行，超出第二行以省略号结束。
-// 代理卡片固定保留两行标题高度，避免短名与长名改变网格行节奏。
-std::string truncateTwoLines(const std::string& s, std::size_t lineLimit) {
-    if (lineLimit == 0 || s.empty()) return "\n ";
-    std::size_t count = 0;
-    std::size_t split = 0;
-    std::size_t i = 0;
-    while (i < s.size() && count < lineLimit) {
-        const unsigned char c = static_cast<unsigned char>(s[i]);
-        const std::size_t len = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
-        i += std::min(len, s.size() - i);
-        ++count;
-        split = i;
-    }
-    if (i == s.size()) return s + "\n ";
-    const std::string first = s.substr(0, split);
-    const std::string rest = s.substr(split);
-    return first + "\n" + truncateOneLine(rest, lineLimit);
-}
-
 // Windows' bundled emoji font displays regional-indicator pairs as country
-// letters. Draw only the leading flag from the packaged atlas; keep the
-// original UTF-8 name for proxy identity, search and accessibility.
-huxerui::View NodeTitle(const std::string& name, std::size_t limit,
+// letters. Draw the original UTF-8 name in a retained two-line label; its
+// ellipsis budget is measured against the card's final content width.
+huxerui::View NodeTitle(const std::string& name,
                         huxerui::Color foreground) {
-    return huxerui::Column {
-        huxerui::Text(truncateTwoLines(name, limit)).Style(huxerui::TextStyle{
-            huxerui::Font::System(font_size::kBodySmall), foreground}),
-    }.With(huxerui::Grow(1.0F),
-           huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch));
+    const huxerui::TextStyle style{
+        huxerui::Font::System(font_size::kBodySmall), foreground};
+    return huxerui::Row{}.With(
+        huxerui::Frame{.height = 32.0F, .min_width = 0.0F},
+        huxerui::Grow(1.0F),
+        huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch),
+        FittedTwoLineProxyLabel{name, style});
 }
 
 // 卡片第二行元数据：协议（大写）+ UDP 标记；组节点写「组 · 当前分支」。
@@ -303,8 +364,7 @@ huxerui::Task<std::map<std::string, int>> MeasureProxyGroupDelay(const std::stri
 // 宽度由 VirtualGrid 均分，高度由 EstimatedRowExtent 提供估计。
 [[huxerui::composable]] huxerui::View NodeCard(
     const ProxyNode& node, bool selected,
-    bool selectable, std::function<void()> onActivate, std::size_t nameLimit,
-    std::size_t detailLimit) {
+    bool selectable, std::function<void()> onActivate, std::size_t detailLimit) {
     const huxerui::ThemeSpec& theme = huxerui::UseTheme();
     const auto tasks = huxerui::UseApplicationTaskScope();
     const auto coreModel = huxerui::UseService<CoreModel>();
@@ -357,6 +417,10 @@ huxerui::Task<std::map<std::string, int>> MeasureProxyGroupDelay(const std::stri
     const SelectableTileColors tile =
         ResolveSelectableTileColors(theme, selected);
     const huxerui::Color detailColor = selected ? tile.fg : tile.muted;
+    const huxerui::TextStyle detailStyle{
+        huxerui::Font::System(font_size::kCaption), detailColor};
+    const huxerui::View detailView =
+        FittedSingleLineLabel(detail, detailStyle);
     const huxerui::Color metaColor =
         selected ? tile.fg
                  : (meta == "超时"
@@ -395,9 +459,8 @@ huxerui::Task<std::map<std::string, int>> MeasureProxyGroupDelay(const std::stri
         };
         LaunchSingleProxyProbe(tasks, tests, tag, entry, MeasureProxyDelay, valid);
     };
-    return ProxyNodeTile(NodeTitle(node.displayName, nameLimit, tile.fg),
-        huxerui::Text(detail).Style(huxerui::TextStyle{
-            huxerui::Font::System(font_size::kCaption), detailColor}),
+    return ProxyNodeTile(NodeTitle(node.displayName, tile.fg),
+        detailView,
         std::move(metaView), selected, node.displayName, std::move(onActivate),
         selectable ? SelectableTileInteraction::Selectable : SelectableTileInteraction::ReadOnly,
         !node.isGroup && !ProxyTestUsesNativeGroup(), currentProbe.testing,
@@ -672,9 +735,7 @@ std::function<void()> NodeSelectAction(
 
     const bool compact =
         huxerui::UseViewportClass() == huxerui::ViewportClass::Compact;
-    // 节点名单行预算：名称两行各使用同一预算，底部协议文本另行收窄。
-    const std::size_t nodeNameLimit = compact ? 9 : 16;
-    // 第二行左侧必须给右侧固定测速槽留出空间，协议名过长时在此处截断。
+    // 协议文本的实际宽度由 FittedSingleLineLabel 在卡片测量阶段决定。
     const std::size_t detailLimit = compact ? 7 : 12;
 
     // 不可见时只保留本页 State/Lifecycle，不构建重子树：huxerui 的 Pager 会把
@@ -731,7 +792,7 @@ std::function<void()> NodeSelectAction(
                                  nodeCount,
                                  [groups, visibleNodes = std::move(visibleNodes),
                                   detailLimit,
-                                  tasks, toast, nodeNameLimit, contentGroupName,
+                                  tasks, toast, contentGroupName,
                                   nodeCount, compact, proxiesModel,
                                   selectionIntent](std::size_t index)
                                      -> huxerui::View {
@@ -766,7 +827,7 @@ std::function<void()> NodeSelectAction(
                                                             "此分组不支持手动切换节点，仅作展示"));
                                                     },
                                                     *group, node),
-                                                nodeNameLimit, detailLimit)
+                                                detailLimit)
                                          .Key(group->name + "::" + nodeName);
                                  }, PageScrollInset(theme, true), kSectionCardSpacing,
                                  compact ? kCompactFloatingNavigationInset : (showSpeedFab ? kSpeedFabFooterHeight : 0.0F))

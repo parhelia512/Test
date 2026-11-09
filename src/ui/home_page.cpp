@@ -423,7 +423,7 @@ std::string FormatHomeUptime(std::int64_t seconds) {
                 theme.colors.on_surface}),
         }.With(huxerui::Spacing(2.0F),
                huxerui::Grow(1.0F),
-               huxerui::MainAlign(huxerui::MainAxisAlignment::Center),
+               huxerui::MainAlign(huxerui::MainAxisAlignment::Start),
                huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch)),
         huxerui::Theme(actionTheme,
             huxerui::IconButton(status.connected ? app::images::pause : app::images::play,
