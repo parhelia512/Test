@@ -710,6 +710,36 @@ extern "C" const char* clashflux_android_proxy_groups() noexcept {
     return result.c_str();
 }
 
+extern "C" const char* clashflux_android_outbounds() noexcept {
+    thread_local std::string result;
+    result.clear();
+
+    std::lock_guard lock(g_mutex);
+    bool attached = false;
+    JNIEnv* environment = current_environment(attached);
+    if (environment == nullptr || g_activity_class == nullptr) {
+        if (attached) g_vm->DetachCurrentThread();
+        return result.c_str();
+    }
+    const jmethodID method = environment->GetStaticMethodID(
+        g_activity_class, "outboundsSnapshot", "()Ljava/lang/String;");
+    if (method != nullptr) {
+        auto* value = static_cast<jstring>(
+            environment->CallStaticObjectMethod(g_activity_class, method));
+        if (!environment->ExceptionCheck() && value != nullptr) {
+            if (const char* chars = environment->GetStringUTFChars(value, nullptr)) {
+                result = chars;
+                environment->ReleaseStringUTFChars(value, chars);
+            }
+            environment->DeleteLocalRef(value);
+        } else if (environment->ExceptionCheck()) {
+            environment->ExceptionClear();
+        }
+    }
+    if (attached) g_vm->DetachCurrentThread();
+    return result.c_str();
+}
+
 extern "C" const char* clashflux_android_connections() noexcept {
     thread_local std::string result;
     result.clear();

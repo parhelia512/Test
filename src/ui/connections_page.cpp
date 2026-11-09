@@ -226,9 +226,8 @@ void ConfirmCloseConnection(huxerui::DialogHandle dialog, huxerui::TaskScope tas
     });
 }
 
-// Android 没有 /connections WS 通道（libbox 状态走 Java CommandClient），也没
-// 有人发布 StreamKind::Connections 通知：页面激活期间必须按固定节拍重读跨进
-// 程快照文件，否则挂载之后才启动代理时，页面会永远停在挂载时刻读到的空快照。
+// Android 通过后台 CommandClient 的 Binder 快照读取连接；页面激活期间按固定节拍
+// 重读跨进程内存快照，否则挂载之后才启动代理时，页面会永远停在挂载时刻的空快照。
 // Android 由后台状态推送驱动（SubscribeStreamUpdates），不轮询。条件编译留在文件作用
 // 域 helper，composable 函数体内不做条件编译。
 void StartSnapshotPoll(huxerui::TaskScope tasks, bool active,

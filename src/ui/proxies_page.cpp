@@ -200,20 +200,38 @@ huxerui::Color delayColor(const huxerui::ThemeSpec& theme, int delay, bool timeo
     return DelayLevelColor(theme, delay, timeout || delay <= 0);
 }
 
-// 单行截断（UTF-8 代码点安全）：超限截断加省略号。HuxerUI Text 默认按词
-// 换行且没有省略号能力，节点名撑成两行会让网格行高参差，这里统一单行化。
+// 单行截断（UTF-8 代码点安全）：超限截断加省略号。
 std::string truncateOneLine(const std::string& s, std::size_t maxCodePoints) {
     std::size_t count = 0;
     std::size_t i = 0;
     while (i < s.size()) {
         if (count == maxCodePoints) return s.substr(0, i) + "…";
         const unsigned char c = static_cast<unsigned char>(s[i]);
-        const std::size_t len =
-            c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
+        const std::size_t len = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
         i += std::min(len, s.size() - i);
         ++count;
     }
     return s;
+}
+
+// 两行截断（UTF-8 代码点安全）：名称按卡片预算拆成两行，超出第二行以省略号结束。
+// 代理卡片固定保留两行标题高度，避免短名与长名改变网格行节奏。
+std::string truncateTwoLines(const std::string& s, std::size_t lineLimit) {
+    if (lineLimit == 0 || s.empty()) return "\n ";
+    std::size_t count = 0;
+    std::size_t split = 0;
+    std::size_t i = 0;
+    while (i < s.size() && count < lineLimit) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        const std::size_t len = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
+        i += std::min(len, s.size() - i);
+        ++count;
+        split = i;
+    }
+    if (i == s.size()) return s + "\n ";
+    const std::string first = s.substr(0, split);
+    const std::string rest = s.substr(split);
+    return first + "\n" + truncateOneLine(rest, lineLimit);
 }
 
 // Windows' bundled emoji font displays regional-indicator pairs as country
@@ -221,12 +239,11 @@ std::string truncateOneLine(const std::string& s, std::size_t maxCodePoints) {
 // original UTF-8 name for proxy identity, search and accessibility.
 huxerui::View NodeTitle(const std::string& name, std::size_t limit,
                         huxerui::Color foreground) {
-    const auto plain = [&] {
-        return huxerui::View{huxerui::Text(truncateOneLine(name, limit))
-            .Style(huxerui::TextStyle{
-                huxerui::Font::System(font_size::kBodySmall), foreground})};
-    };
-    return plain();
+    return huxerui::Column {
+        huxerui::Text(truncateTwoLines(name, limit)).Style(huxerui::TextStyle{
+            huxerui::Font::System(font_size::kBodySmall), foreground}),
+    }.With(huxerui::Grow(1.0F),
+           huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch));
 }
 
 // 卡片第二行元数据：协议（大写）+ UDP 标记；组节点写「组 · 当前分支」。
@@ -281,7 +298,7 @@ huxerui::Task<std::map<std::string, int>> MeasureProxyGroupDelay(const std::stri
     });
 }
 
-// 节点矩形卡：内部左右对齐——左侧名称单行（溢出省略号），右侧写延迟
+// 节点矩形卡：名称占两行，底部元数据左侧可收缩，右侧固定为测速槽。
 // （组类型节点写「组·分支当前选中」），延迟按区间着色；选中态 primary 底。
 // 宽度由 VirtualGrid 均分，高度由 EstimatedRowExtent 提供估计。
 [[huxerui::composable]] huxerui::View NodeCard(
@@ -655,11 +672,10 @@ std::function<void()> NodeSelectAction(
 
     const bool compact =
         huxerui::UseViewportClass() == huxerui::ViewportClass::Compact;
-    // 节点名单行预算：定宽卡下留出右侧延迟与内边距后的可用字符数。
+    // 节点名单行预算：名称两行各使用同一预算，底部协议文本另行收窄。
     const std::size_t nodeNameLimit = compact ? 9 : 16;
-    // 第二行（协议/组类型）的字符预算：卡片宽度减去右侧固定延迟槽后的余量，
-    // 比名称行字号小、能多放几个字；超出截断成省略号。
-    const std::size_t detailLimit = compact ? 10 : 16;
+    // 第二行左侧必须给右侧固定测速槽留出空间，协议名过长时在此处截断。
+    const std::size_t detailLimit = compact ? 7 : 12;
 
     // 不可见时只保留本页 State/Lifecycle，不构建重子树：huxerui 的 Pager 会把
     // 四个一级页同时挂载，隐藏页即使不重组，其已挂载子树仍随每一帧被重新测量。
@@ -758,11 +774,9 @@ std::function<void()> NodeSelectAction(
                                               ? huxerui::GridColumns::Fixed(2)
                                               : huxerui::GridColumns::Adaptive(
                                                     kProxyNodeWidth))
-                                 // 行高**只给估算值**，真实高度由虚拟布局测量卡片内容
-                                 // 得到：卡片是「名称 + 元数据行 + 上下 8pt 内边距」的
-                                 // 自适应高度（字体缩放、系统字号变化都会改高度），
-                                 // 写死精确行高会在这些情况下裁切/错位。
-                                 .EstimatedRowExtent(52.0F)
+                                 // 行高**只给估算值**，两行名称 + 元数据行 + 上下 8pt 内边距，
+                                 // 真实高度仍由虚拟布局测量，避免字体缩放时裁切/错位。
+                                 .EstimatedRowExtent(68.0F)
                                  .ColumnSpacing(kSectionCardSpacing)
                                  .With(huxerui::Grow(1.0F),
                                        huxerui::ScrollBar())

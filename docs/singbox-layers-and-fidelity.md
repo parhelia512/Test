@@ -53,7 +53,9 @@ IP 规则集路由只提取目标 CIDR；PAC 由应用提供与接管，不伪�
   AAR 校验来源、版本、revision、ABI 与内容 SHA256；升级按固定源码逐项复核。
   本次切换不自动扩大 Clash 转换支持矩阵，fork 新增协议/字段仍须单独验证映射和保真度。
 - 移动内核由 libbox CommandServer/StartedService 托管，Android 经 CommandClient 和
-  Binder/JNI 控制与回读；不构建 Clash REST server，也不生成 `experimental.clash_api`。
+  Binder/JNI 控制与回读；组、出站和连接快照也通过 Binder 从后台内存传给 UI，不再写
+  `connections.json` 或 `outbound-groups.json` 文件。不构建 Clash REST server，也不生成
+  `experimental.clash_api`。
   模式和流量管理器由 libbox 的平台日志路径初始化，与 REST server 独立。
   完整配置仍需预备后交接，不能将运行时命令当作任意配置的无损补丁接口。
   下文涉及桌面鉴权 gRPC-Web、Clash REST 与外部进程的记录属于历史实现。

@@ -150,9 +150,8 @@ public final class ClashVpnService extends VpnService implements PlatformInterfa
     private static volatile long runtimeDownloadTotal;
     private static volatile int runtimeConnections;
     private static volatile String outboundGroupsJson = "{\"proxies\":{}}";
+    private static volatile String outboundsJson = "{\"outbounds\":[]}";
     private static volatile String pendingUrlTestGroup;
-    private static volatile String connectionsJson =
-            "{\"uploadTotal\":0,\"downloadTotal\":0,\"connections\":[]}";
     private static volatile long uploadTotal;
     private static volatile long downloadTotal;
     private static final Executor DNS_EXECUTOR = Executors.newCachedThreadPool(runnable -> {
@@ -1381,6 +1380,7 @@ public final class ClashVpnService extends VpnService implements PlatformInterfa
                 CommandClientOptions options = new CommandClientOptions();
                 options.addCommand(Libbox.CommandLog);
                 options.addCommand(Libbox.CommandGroup);
+                options.addCommand(Libbox.CommandOutbounds);
                 options.addCommand(Libbox.CommandStatus);
                 options.addCommand(Libbox.CommandClashMode);
                 options.addCommand(Libbox.CommandConnections);
@@ -1426,14 +1426,12 @@ public final class ClashVpnService extends VpnService implements PlatformInterfa
         started = false;
         BootReceiver.setVpnActive(this, false);
         outboundGroupsJson = "{\"proxies\":{}}";
-        connectionsJson = "{\"uploadTotal\":0,\"downloadTotal\":0,\"connections\":[]}";
+        outboundsJson = "{\"outbounds\":[]}";
         uploadTotal = 0;
         downloadTotal = 0;
         synchronized (connectionsLock) {
             connectionSnapshot = Libbox.newConnections();
         }
-        RuntimeSnapshotStore.writeAsync(this, "connections.json", connectionsJson);
-        RuntimeSnapshotStore.writeAsync(this, "outbound-groups.json", outboundGroupsJson);
         CommandClient activeClient;
         synchronized (clientLock) {
             activeClient = client;
@@ -1638,28 +1636,40 @@ public final class ClashVpnService extends VpnService implements PlatformInterfa
         }
     }
 
-    public static String proxyGroups() {
+    public static String groupsSnapshot() {
         ClashVpnService service = current;
-        if (service != null) {
-            try {
-                // 代理快照按需建立控制通道；首次进入代理页时也必须触发
-                // writeGroups，否则 outboundGroupsJson 仍是空对象。
-                service.controlClient();
-            } catch (Exception error) {
-                MainActivity.appLog("读取出站线路失败：" + error.getMessage(), true);
-            }
+        if (service == null) return null;
+        try {
+            service.writeGroups(service.controlClient().getGroups());
+            return outboundGroupsJson;
+        } catch (Exception error) {
+            Log.d(TAG, "Unable to pull outbound groups", error);
+            return outboundGroupsJson;
         }
-        return outboundGroupsJson;
+    }
+
+    public static String outboundsSnapshot() {
+        ClashVpnService service = current;
+        if (service == null) return null;
+        try {
+            service.writeOutbounds(service.controlClient().getOutbounds());
+            return outboundsJson;
+        } catch (Exception error) {
+            Log.d(TAG, "Unable to pull outbounds", error);
+            return outboundsJson;
+        }
     }
 
     public static String connectionsSnapshot() {
         ClashVpnService service = current;
-        return service == null ? connectionsJson : service.readConnectionsSnapshot();
-    }
-
-    private String readConnectionsSnapshot() {
-        synchronized (connectionsLock) {
-            return connectionsJson;
+        if (service == null) return null;
+        synchronized (service.connectionsLock) {
+            try {
+                return service.encodeConnectionsLocked();
+            } catch (Exception error) {
+                Log.w(TAG, "Unable to encode connection snapshot", error);
+                return null;
+            }
         }
     }
 
@@ -1771,9 +1781,7 @@ public final class ClashVpnService extends VpnService implements PlatformInterfa
                 connectionSnapshot.applyEvents(events);
                 connectionSnapshot.filterState((int) Libbox.ConnectionStateActive);
                 connectionSnapshot.sortByDate();
-                connectionsJson = encodeConnectionsLocked();
             }
-            RuntimeSnapshotStore.writeAsync(this, "connections.json", connectionsJson);
         } catch (Throwable error) {
             Log.w(TAG, "Unable to snapshot sing-box connections", error);
             MainActivity.appLog("读取 Android 连接失败：" + error.getMessage(), true);
@@ -1783,15 +1791,18 @@ public final class ClashVpnService extends VpnService implements PlatformInterfa
             LogEntry entry = logs.next();
             if (entry != null) MainActivity.coreLog(entry.getLevel(), entry.getMessage());
         }
-    } @Override public void writeOutbounds(OutboundGroupItemIterator outbounds){} @Override public void writeStatus(StatusMessage status){
+    } @Override public void writeOutbounds(OutboundGroupItemIterator outbounds){
+        try {
+            outboundsJson = encodeOutbounds(outbounds);
+        } catch (Throwable error) {
+            Log.w(TAG, "Unable to snapshot sing-box outbounds", error);
+            MainActivity.appLog("读取 Android 出站失败：" + error.getMessage(), true);
+        }
+    } @Override public void writeStatus(StatusMessage status){
         if (status == null || !status.getTrafficAvailable()) return;
         try {
             uploadTotal = status.getUplinkTotal();
             downloadTotal = status.getDownlinkTotal();
-            synchronized (connectionsLock) {
-            connectionsJson = encodeConnectionsLocked();
-            }
-            RuntimeSnapshotStore.writeAsync(this, "connections.json", connectionsJson);
             publishStats(status.getUplink(), status.getDownlink(),
                     status.getUplinkTotal(), status.getDownlinkTotal(),
                     status.getConnectionsIn() + status.getConnectionsOut());
@@ -1803,6 +1814,23 @@ public final class ClashVpnService extends VpnService implements PlatformInterfa
 
     // DNS query streaming is not subscribed by this application.
     @Override public void writeDNSQuery(DnsQuery query) {}
+
+    private String encodeOutbounds(OutboundGroupItemIterator outbounds) throws Exception {
+        JSONObject result = new JSONObject();
+        JSONArray items = new JSONArray();
+        while (outbounds != null && outbounds.hasNext()) {
+            OutboundGroupItem item = outbounds.next();
+            if (item == null) continue;
+            JSONObject value = new JSONObject();
+            value.put("tag", safe(item.getTag()));
+            value.put("type", safe(item.getType()));
+            value.put("urlTestTime", item.getURLTestTime());
+            value.put("urlTestDelay", item.getURLTestDelay());
+            items.put(value);
+        }
+        result.put("outbounds", items);
+        return result.toString();
+    }
 
     private String encodeConnectionsLocked() throws Exception {
         JSONObject result = new JSONObject();
@@ -1887,11 +1915,6 @@ public final class ClashVpnService extends VpnService implements PlatformInterfa
                 if (!proxies.has(tag)) proxies.put(tag, itemDetails.get(tag));
             }
             outboundGroupsJson = new JSONObject().put("proxies", proxies).toString();
-            ClashVpnService service = current;
-            if (service != null) {
-                RuntimeSnapshotStore.writeAsync(service, "outbound-groups.json",
-                        outboundGroupsJson);
-            }
             Log.i(TAG, "libbox 出站组快照已更新：" + groupCount + " 组，" + itemCount + " 节点");
         } catch (Throwable error) {
             Log.w(TAG, "Unable to snapshot outbound groups", error);

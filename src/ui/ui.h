@@ -158,6 +158,7 @@ inline AndroidVpnRuntime ReadAndroidVpnRuntime() noexcept {
     return result;
 }
 extern "C" const char* clashflux_android_proxy_groups() noexcept;
+extern "C" const char* clashflux_android_outbounds() noexcept;
 extern "C" const char* clashflux_android_connections() noexcept;
 extern "C" bool clashflux_android_close_connection(const char*) noexcept;
 extern "C" bool clashflux_android_close_all_connections() noexcept;
@@ -177,6 +178,7 @@ inline void AndroidOpenBatterySettings() noexcept {}
 inline bool AndroidIsIgnoringBattery() noexcept { return false; }
 inline int AndroidVpnState() noexcept { return 0; }
 inline AndroidVpnRuntime ReadAndroidVpnRuntime() noexcept { return {}; }
+inline const char* clashflux_android_outbounds() noexcept { return ""; }
 inline const char* clashflux_android_connections() noexcept { return ""; }
 inline bool clashflux_android_close_connection(const char*) noexcept { return false; }
 inline bool clashflux_android_close_all_connections() noexcept { return false; }

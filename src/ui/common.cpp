@@ -375,8 +375,8 @@ ProxiesSnapshot FetchProxiesSnapshot() {
     std::string body;
 #if defined(__ANDROID__)
     const char* raw = clashflux_android_proxy_groups();
-    // VPN 服务未启动时 Java 侧没有 libbox CommandClient，会返回空组对象；
-    // 此时回落到原生 store 的「停止内核」订阅预览，并标明这是预览而非实时。
+    // VPN 服务未启动或 Binder 尚未连接时没有实时 CommandClient 快照；此时回落到
+    // 原生 store 的「停止内核」订阅预览，并标明这是预览而非实时。
     if (raw != nullptr && *raw != '\0' &&
         std::string_view(raw) != "{\"proxies\":{}}") {
         body = raw;

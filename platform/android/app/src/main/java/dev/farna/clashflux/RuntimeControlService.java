@@ -38,6 +38,18 @@ public final class RuntimeControlService extends Service {
                     .putBoolean("tun_preference_reset_pending", false).commit();
         }
 
+        @Override public String groupsSnapshot() {
+            return ClashVpnService.groupsSnapshot();
+        }
+
+        @Override public String outboundsSnapshot() {
+            return ClashVpnService.outboundsSnapshot();
+        }
+
+        @Override public String connectionsSnapshot() {
+            return ClashVpnService.connectionsSnapshot();
+        }
+
         @Override public boolean selectOutbound(String group, String name) {
             return ClashVpnService.selectOutbound(group, name);
         }
@@ -48,11 +60,6 @@ public final class RuntimeControlService extends Service {
 
         @Override public boolean setClashMode(String mode) {
             return ClashVpnService.setClashMode(mode);
-        }
-
-        @Override public boolean refreshProxyGroups() {
-            ClashVpnService.proxyGroups();
-            return true;
         }
 
         @Override public boolean closeConnection(String id) {

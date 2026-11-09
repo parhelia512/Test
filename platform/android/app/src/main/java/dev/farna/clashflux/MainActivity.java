@@ -749,17 +749,32 @@ public final class MainActivity extends HuxerUIActivity {
 
     public static String proxyGroups() {
         IClashRuntime service = runtimeControl;
-        try { if (service != null) service.refreshProxyGroups(); }
-        catch (RemoteException | RuntimeException error) {
-            Log.w(TAG, "Unable to refresh outbound groups across runtime IPC", error);
+        try {
+            return service == null ? null : service.groupsSnapshot();
+        } catch (RemoteException | RuntimeException error) {
+            Log.w(TAG, "Unable to read outbound groups across runtime IPC", error);
+            return null;
         }
-        return RuntimeSnapshotStore.read(applicationContext, "outbound-groups.json",
-                "{\"proxies\":{}}");
+    }
+
+    public static String outboundsSnapshot() {
+        IClashRuntime service = runtimeControl;
+        try {
+            return service == null ? null : service.outboundsSnapshot();
+        } catch (RemoteException | RuntimeException error) {
+            Log.w(TAG, "Unable to read outbounds across runtime IPC", error);
+            return null;
+        }
     }
 
     public static String connectionsSnapshot() {
-        return RuntimeSnapshotStore.read(applicationContext, "connections.json",
-                "{\"uploadTotal\":0,\"downloadTotal\":0,\"connections\":[]}");
+        IClashRuntime service = runtimeControl;
+        try {
+            return service == null ? null : service.connectionsSnapshot();
+        } catch (RemoteException | RuntimeException error) {
+            Log.w(TAG, "Unable to read connections across runtime IPC", error);
+            return null;
+        }
     }
 
     public static boolean closeConnection(String id) {

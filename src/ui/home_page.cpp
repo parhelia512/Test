@@ -362,8 +362,8 @@ std::string FormatHomeUptime(std::int64_t seconds) {
     return std::format("{:02}:{:02}:{:02}", seconds / 3600, (seconds / 60) % 60, seconds % 60);
 }
 
-// VPN 状态卡：左侧只读状态/时长，右侧普通圆形按钮。启动停止仍走应用级
-// 单命令 CoreControl；卡片不做共享边界动画，也不把 UI 进程当作会话时钟。
+// VPN 状态卡：标题行复用普通卡片的图标/标题排版，右侧保留独立启停按钮。
+// 启停仍走应用级单命令 CoreControl；卡片不做共享边界动画，也不把 UI 进程当作会话时钟。
 [[huxerui::composable]] huxerui::View HomeVpnStatusCard(
     const CoreHomeView& home, bool canStart) {
     const huxerui::ThemeSpec& theme = huxerui::UseTheme();
@@ -391,24 +391,26 @@ std::string FormatHomeUptime(std::int64_t seconds) {
     const huxerui::StringVariant statusText = Localized(status.label);
     const huxerui::StringVariant actionLabel = status.connected
         ? Localized("停止 VPN") : Localized("启动 VPN");
-    const bool enabled = home.ready && canStart && !control.Busy();
+    const bool enabled = home.ready && !control.Busy() && !status.changing &&
+        (status.connected || canStart);
+    const huxerui::Color disabledActionForeground = theme.colors.on_surface_variant;
+    const huxerui::Color actionBackground = enabled
+        ? theme.colors.primary : theme.colors.surface_container_high;
     huxerui::IconButtonStyle actionStyle;
-    actionStyle.foreground = theme.colors.on_primary;
-    actionStyle.disabled_foreground = theme.colors.on_primary;
-    actionStyle.icon_size = 20.0F;
-    actionStyle.minimum_interactive_size = 44.0F;
-    actionStyle.state_layer_size = 40.0F;
-    actionStyle.corner_radius = 22.0F;
+    actionStyle.foreground = huxerui::Color::White();
+    actionStyle.disabled_foreground = disabledActionForeground;
+    actionStyle.icon_size = 40.0F;
+    actionStyle.minimum_interactive_size = 88.0F;
+    actionStyle.state_layer_size = 80.0F;
+    actionStyle.corner_radius = 44.0F;
     huxerui::ThemeDefinition actionTheme;
     actionTheme.Set(actionStyle);
 
     return huxerui::Row {
         huxerui::Column {
             huxerui::Row {
-                huxerui::Text(Localized("VPN 状态")).Style(huxerui::TextStyle{
-                    huxerui::Font::System(font_size::kBody)
-                        .WithWeight(huxerui::FontWeight::SemiBold),
-                    theme.colors.on_surface_variant}),
+                HomeCardHeading(app::images::website_test, Localized("状态")),
+                huxerui::Spacer(),
                 huxerui::Text(statusText).Style(huxerui::TextStyle{
                     huxerui::Font::System(font_size::kCaption)
                         .WithWeight(huxerui::FontWeight::SemiBold),
@@ -422,16 +424,16 @@ std::string FormatHomeUptime(std::int64_t seconds) {
         }.With(huxerui::Spacing(2.0F),
                huxerui::Grow(1.0F),
                huxerui::MainAlign(huxerui::MainAxisAlignment::Center),
-               huxerui::CrossAlign(huxerui::CrossAxisAlignment::Start)),
+               huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch)),
         huxerui::Theme(actionTheme,
             huxerui::IconButton(status.connected ? app::images::pause : app::images::play,
                                 actionLabel)
                 .OnClick([control, connected = status.connected] {
                     control.Run({.action = CoreAction::Tun, .enabled = !connected});
                 })
-                .With(huxerui::Frame{.width = 44.0F, .height = 44.0F},
-                      huxerui::Background(theme.colors.primary),
-                      huxerui::CornerRadius(22.0F),
+                .With(huxerui::Frame{.width = 88.0F, .height = 88.0F},
+                      huxerui::Background(actionBackground),
+                      huxerui::CornerRadius(44.0F),
                       huxerui::ClipChildren(),
                       huxerui::Enabled(enabled),
                       huxerui::Tooltip(actionLabel))),

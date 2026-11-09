@@ -55,8 +55,12 @@ inline huxerui::View ProxyNodeTile(huxerui::View title, huxerui::View detail,
         return SelectableTile(
             huxerui::Column{
                 title,
-                huxerui::Row{detail, huxerui::Spacer(), std::move(slot)}
-                    .With(huxerui::CrossAlign(huxerui::CrossAxisAlignment::End)),
+                huxerui::Row{
+                    std::move(detail).With(huxerui::Grow(1.0F),
+                        huxerui::Frame{.min_width = 0.0F}),
+                    huxerui::Spacer(),
+                    std::move(slot),
+                }.With(huxerui::CrossAlign(huxerui::CrossAxisAlignment::End)),
             }.With(huxerui::Spacing(2.0F),
                 huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch)),
             selected, label, activate, interaction)

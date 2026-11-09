@@ -145,8 +145,10 @@ Android Task Manager 停止或厂商禁用后台/自启动。`START_STICKY` 是�
 - `platform/android/app/src/main/java/dev/farna/clashflux/ClashVpnService.java`：唯一 libbox/VPN
   所有者、sticky 恢复、网络及唤醒恢复。
 - `platform/android/app/src/main/java/dev/farna/clashflux/RuntimeControlService.java` 和
-  `platform/android/app/src/main/aidl/dev/farna/clashflux/IClashRuntime.aidl`：跨进程控制面。
-- `platform/android/app/src/main/java/dev/farna/clashflux/RuntimeSnapshotStore.java`：共享原子快照。
+  `platform/android/app/src/main/aidl/dev/farna/clashflux/IClashRuntime.aidl`：UI 与后台的 Binder
+  控制及组、出站、连接内存快照边界。
+- `platform/android/app/src/main/java/dev/farna/clashflux/RuntimeSnapshotStore.java`：模式意图和
+  VPN 活动等需要跨生命周期恢复的原子文件；组/出站/连接不再写入 JSON 快照文件。
 - `platform/android/android_bridge.cpp`：JNI 运行状态写回和 UI 进程快照接收。
 
 ## 首页 VPN 运行时长

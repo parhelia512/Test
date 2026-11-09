@@ -281,7 +281,9 @@ AAR sidecar 与 Gradle 校验收敛为 version、revision、ABI、SHA256，不�
 - 共享编译器不再生成 `experimental.clash_api`，并移除原生 JSON 中继承的该对象；
   不再注入旧版 `clash-flux-control` 服务。用户原生 `services`、路由和缓存字段继续保留。
 - 固定 libbox 通过 `PlatformLogWriter` 初始化独立模式/流量管理器，不依赖 Clash REST。
-  Android 已有组、选择、组测速、连接、关闭连接、日志和状态流均使用 CommandClient。
+  Android 已有组、出站、选择、组测速、连接、关闭连接、日志和状态流均使用 CommandClient；
+  UI 通过 Binder 读取后台维护的组/出站/连接内存 JSON 快照，不再依赖 `connections.json` 或
+  `outbound-groups.json` 文件中转。
 - 启动目标模式由 UI 在交付配置前写入原子意图文件，后台各启动/恢复路径读取同一目标；
   模式只在 CommandClient 回调确认后视为生效。程序仍处于发布前调试阶段，不保留旧版
   `default_mode` 回退或后台旧配置清理，后台直接消费当前编译器输出。
