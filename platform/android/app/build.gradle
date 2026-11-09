@@ -1,0 +1,420 @@
+import com.android.build.api.artifact.SingleArtifact
+import com.android.build.api.variant.BuildConfigField
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+import java.security.MessageDigest
+import javax.inject.Inject
+
+plugins {
+    alias(libs.plugins.android.application)
+}
+
+abstract class StageHuxerUIAssets extends DefaultTask {
+    @InputFiles
+    @PathSensitive(PathSensitivity.RELATIVE)
+    abstract ConfigurableFileCollection getPackageDirectories()
+
+    @OutputDirectory
+    abstract DirectoryProperty getOutputDirectory()
+
+    @Inject
+    abstract FileSystemOperations getFileSystemOperations()
+
+    @TaskAction
+    void stage() {
+        def resourcePackage = packageDirectories.files.find { new File(it, "huxerui/resources.bin").isFile() }
+        if (resourcePackage == null) {
+            throw new GradleException("HuxerUI resource package is missing from the built Android ABIs")
+        }
+        fileSystemOperations.sync {
+            from resourcePackage
+            into outputDirectory
+        }
+    }
+}
+
+def singboxAar = layout.buildDirectory.file("libs/libbox-arm64.aar")
+def singboxAarMetadata = layout.buildDirectory.file("libs/libbox-arm64.aar.metadata.json")
+def singboxVersion = "1.14.4"
+def singboxRevision = "c005f35300ce76427dc285481ec5695f5b179cd2"
+def suppliedSingboxAar = providers.environmentVariable("CLASHFLUX_SINGBOX_AAR")
+def stageSingboxAar = tasks.register("stageSingboxAar") {
+    inputs.property("version", singboxVersion)
+    inputs.property("revision", singboxRevision)
+    // The AAR is deliberately supplied by the release/build script.  Mark the
+    // provider optional so Gradle reaches the task's actionable diagnostic
+    // below instead of failing configuration validation with an unnamed input.
+    inputs.file(suppliedSingboxAar).optional()
+    inputs.file(suppliedSingboxAar.map { it + ".metadata.json" }).optional()
+    outputs.file(singboxAar)
+    outputs.file(singboxAarMetadata)
+    doLast {
+        def target = singboxAar.get().asFile
+        def targetMetadata = singboxAarMetadata.get().asFile
+        def source = suppliedSingboxAar.orNull == null ? null : file(suppliedSingboxAar.get())
+        def validateArtifact = { File artifact, File metadata ->
+            if (!artifact.isFile() || !metadata.isFile()) {
+                throw new GradleException("Missing sing-box AAR or revision metadata; rebuild with platform/android/build-singbox-libbox.sh.")
+            }
+            def identity = new JsonSlurper().parse(metadata)
+            if (identity.version != singboxVersion || identity.revision != singboxRevision || identity.abi != "arm64-v8a") {
+                throw new GradleException("sing-box AAR source revision/ABI differs from the project pin; rebuild libbox.")
+            }
+            MessageDigest digest = MessageDigest.getInstance("SHA-256")
+            artifact.withInputStream { stream ->
+                byte[] buffer = new byte[16384]
+                for (int count = stream.read(buffer); count >= 0; count = stream.read(buffer)) {
+                    if (count > 0) digest.update(buffer, 0, count)
+                }
+            }
+            if (digest.digest().encodeHex().toString() != identity.sha256) {
+                throw new GradleException("sing-box AAR SHA256 differs from its build metadata; rebuild libbox.")
+            }
+        }
+        if (source == null || !source.isFile()) {
+            if (suppliedSingboxAar.orNull != null) {
+                throw new GradleException("CLASHFLUX_SINGBOX_AAR points to a missing AAR.")
+            }
+            validateArtifact(target, targetMetadata)
+            return
+        }
+        def sourceMetadata = file(source.path + ".metadata.json")
+        validateArtifact(source, sourceMetadata)
+        if (source.canonicalFile == target.canonicalFile) {
+            return
+        }
+        target.parentFile.mkdirs()
+        copy { from source; into target.parentFile; rename { target.name } }
+        copy { from sourceMetadata; into target.parentFile; rename { targetMetadata.name } }
+    }
+}
+
+// Android cannot fetch route rule-sets while the VpnService is still creating
+// its physical-network path.  Package the two China rule-sets needed by common
+// Clash subscriptions and let MainActivity install them before native config
+// generation.  The upstream revision and hashes are pinned for reproducible
+// APKs; a normal incremental build reuses these generated assets.
+def bundledRuleSetRevision = "74de9fd23e9bd07d3d2c42741472f61194a9a3d8"
+def bundledRuleSets = [
+        "geoip-cn.srs"  : [path: "geo/geoip/cn.srs",   sha256: "412585ab8d9f05701a11cf6b040e85719510696d0879389d5a8ef8d8764b04dd"],
+        "geosite-cn.srs": [path: "geo/geosite/cn.srs", sha256: "265b60680d291447ef98f80513c7ed350efe7047ae6cde77a7a9578b623cbd1b"],
+]
+def generatedRuleSetAssets = layout.buildDirectory.dir("generated/rule-set-assets")
+def stageBundledRuleSets = tasks.register("stageBundledRuleSets") {
+    inputs.property("revision", bundledRuleSetRevision)
+    inputs.properties(bundledRuleSets.collectEntries { name, details ->
+        [("sha256." + name): details.sha256]
+    })
+    outputs.dir(generatedRuleSetAssets)
+    doLast {
+        def rulesDirectory = new File(generatedRuleSetAssets.get().asFile, "rules")
+        rulesDirectory.mkdirs()
+        bundledRuleSets.each { name, details ->
+            def destination = new File(rulesDirectory, name)
+            def digest = { File input ->
+                MessageDigest md = MessageDigest.getInstance("SHA-256")
+                input.withInputStream { stream ->
+                    byte[] buffer = new byte[16384]
+                    for (int count = stream.read(buffer); count >= 0; count = stream.read(buffer)) {
+                        if (count > 0) md.update(buffer, 0, count)
+                    }
+                }
+                md.digest().encodeHex().toString()
+            }
+            if (destination.isFile() && digest(destination) == details.sha256) return
+            def temporary = new File(rulesDirectory, name + ".download")
+            temporary.delete()
+            def url = "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/${bundledRuleSetRevision}/${details.path}"
+            new URL(url).withInputStream { input ->
+                temporary.withOutputStream { output -> output << input }
+            }
+            def actual = digest(temporary)
+            if (actual != details.sha256) {
+                temporary.delete()
+                throw new GradleException("Rule-set checksum mismatch for ${name}: ${actual}")
+            }
+            if (destination.exists() && !destination.delete()) {
+                throw new GradleException("Unable to replace generated rule-set: ${destination}")
+            }
+            if (!temporary.renameTo(destination)) {
+                throw new GradleException("Unable to install generated rule-set: ${destination}")
+            }
+        }
+    }
+}
+
+def huxeruiProperty = { String name -> providers.gradleProperty(name).get() }
+def huxeruiHome = rootProject.gradle.ext.huxeruiHome
+def huxeruiLibraries = rootProject.gradle.ext.huxeruiLibraries
+def huxeruiCompileSdk = huxeruiProperty("huxeruiCompileSdk").toInteger()
+def huxeruiMinSdk = huxeruiProperty("huxeruiMinSdk").toInteger()
+def huxeruiTargetSdk = huxeruiProperty("huxeruiTargetSdk").toInteger()
+def huxeruiNdkVersion = huxeruiProperty("huxeruiNdkVersion")
+// The Android app is published for 64-bit ARM devices only. Keeping this
+// fixed also prevents transitive JNI binaries for emulator ABIs from being
+// included accidentally.
+def clashfluxTargetAbis = ["arm64-v8a"]
+def singboxAarAbis = ["arm64-v8a", "armeabi-v7a", "x86", "x86_64"]
+def huxeruiStl = huxeruiProperty("huxeruiStl")
+def releaseKeystoreFile = providers.gradleProperty("clashfluxReleaseKeystoreFile").orNull
+def releaseKeystorePassword = providers.gradleProperty("clashfluxReleaseKeystorePassword").orNull
+def releaseKeyAlias = providers.gradleProperty("clashfluxReleaseKeyAlias").orNull
+def releaseKeyPassword = providers.gradleProperty("clashfluxReleaseKeyPassword").orNull
+def requireReleaseSigning = providers.gradleProperty("clashfluxRequireReleaseSigning")
+        .map { it.toBoolean() }
+        .orElse(false)
+        .get()
+def hasReleaseSigning = [releaseKeystoreFile, releaseKeystorePassword, releaseKeyAlias,
+                         releaseKeyPassword].every { it != null && !it.isEmpty() }
+
+if (requireReleaseSigning && !hasReleaseSigning) {
+    throw new GradleException(
+            "Release signing is required; provide clashfluxReleaseKeystoreFile, " +
+                    "clashfluxReleaseKeystorePassword, clashfluxReleaseKeyAlias, " +
+                    "and clashfluxReleaseKeyPassword")
+}
+
+if (hasReleaseSigning && !file(releaseKeystoreFile).isFile()) {
+    throw new GradleException("Android release keystore does not exist: ${releaseKeystoreFile}")
+}
+
+android {
+    buildFeatures {
+        buildConfig = true
+        aidl = true
+    }
+
+    namespace = "dev.farna.clashflux"
+    compileSdk = huxeruiCompileSdk
+    ndkVersion = huxeruiNdkVersion
+
+    defaultConfig {
+        applicationId = "dev.farna.clashflux"
+        minSdk = huxeruiMinSdk
+        targetSdk = huxeruiTargetSdk
+        versionCode = 178
+        versionName = "0.3.100"
+
+        externalNativeBuild {
+            cmake {
+                arguments "-DANDROID_STL=${huxeruiStl}",
+                        "-DHUXERUI_HOME=${huxeruiHome.absolutePath}"
+            }
+        }
+
+        ndk {
+            abiFilters(*clashfluxTargetAbis)
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_1_8
+        targetCompatibility = JavaVersion.VERSION_1_8
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("../../../CMakeLists.txt")
+            version = "4.4.2"
+        }
+    }
+
+    signingConfigs {
+        // Include the traditional JAR signature files as well as APK Signature
+        // Scheme v2. Some OEM installers still reject v2-only APKs as unsigned.
+        debug {
+            enableV1Signing = true
+            enableV2Signing = true
+        }
+        release {
+            enableV1Signing = true
+            enableV2Signing = true
+            if (hasReleaseSigning) {
+                storeFile = file(releaseKeystoreFile)
+                storePassword = releaseKeystorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled = false
+            // Release builds use the stable release key. Developer debug builds
+            // keep using the generated debug key through the debug build type.
+            signingConfig = hasReleaseSigning ? signingConfigs.release : signingConfigs.debug
+            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
+        }
+    }
+
+    sourceSets {
+        main.assets.srcDir(generatedRuleSetAssets)
+    }
+
+    // Do not package a library for an ABI that this variant does not support.
+    // libbox must remain arm64-only even if an upstream build grows extra slices.
+    packaging {
+        jniLibs {
+            // gomobile JNI needs an extracted nativeLibraryDir entry.
+            useLegacyPackaging = true
+            excludes += singboxAarAbis.findAll { !clashfluxTargetAbis.contains(it) }
+                    .collect { "**/${it}/**" }
+        }
+    }
+
+    lintOptions {
+        checkReleaseBuilds = false
+        abortOnError = false
+    }
+}
+
+// A locally invoked Release build must never silently fall back to the debug
+// keystore. CI also sets clashfluxRequireReleaseSigning=true before Gradle
+// configuration so a missing key fails even earlier.
+tasks.configureEach { task ->
+    if (task.name == "packageRelease" || task.name == "bundleRelease") {
+        task.doFirst {
+            if (!hasReleaseSigning) {
+                throw new GradleException(
+                        "Android Release packaging requires the Clash-Flux release keystore")
+            }
+        }
+    }
+}
+
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") }.configureEach {
+    dependsOn(stageBundledRuleSets)
+}
+
+androidComponents.onVariants(androidComponents.selector().all()) { variant ->
+    def integrationRoot = layout.buildDirectory.dir("generated/huxerui/integration/${variant.name}").get().asFile
+    variant.externalNativeBuild.arguments.add("-DHUXERUI_ANDROID_APP_INTEGRATION_ROOT=${integrationRoot.absolutePath}")
+    def resourceRoot = layout.buildDirectory.dir("generated/huxerui/resources/${variant.name}").get().asFile
+    variant.externalNativeBuild.arguments.add("-DHUXERUI_ANDROID_RESOURCE_OUTPUT_ROOT=${resourceRoot.absolutePath}")
+    def nativeLibraries = variant.artifacts.get(SingleArtifact.MERGED_NATIVE_LIBS.INSTANCE)
+    def packagedAbis = nativeLibraries.map { directory ->
+        new File(directory.asFile, "lib").listFiles()?.findAll { it.isDirectory() }?.sort { it.name } ?: []
+    }
+    def libraryFile = layout.buildDirectory.file("generated/huxerui/app-library/${variant.name}.txt").get().asFile
+    def resolveLibrary = tasks.register("resolveHuxerUI${variant.name.capitalize()}AppLibrary") {
+        inputs.dir(nativeLibraries)
+        inputs.dir(integrationRoot)
+        outputs.file(libraryFile)
+        doLast {
+            def applications = packagedAbis.get().collect { abiDirectory ->
+                def planFile = new File(integrationRoot, "${abiDirectory.name}/app.json")
+                if (!planFile.isFile()) {
+                    throw new GradleException("HuxerUI application integration plan is missing: ${planFile}")
+                }
+                def plan = new JsonSlurper().parse(planFile)
+                if (plan.schema != 1 || !(plan.target instanceof String) || !(plan.artifact instanceof String)) {
+                    throw new GradleException("HuxerUI application integration plan is invalid: ${planFile}")
+                }
+                def fileName = new File(plan.artifact).name
+                if (!fileName.startsWith("lib") || !fileName.endsWith(".so") || fileName.length() <= 6) {
+                    throw new GradleException("HuxerUI application artifact must be a lib<name>.so file: ${plan.artifact}")
+                }
+                def libraryName = fileName.substring(3, fileName.length() - 3)
+                if (libraryName == "huxerui") {
+                    throw new GradleException("HuxerUI application library must not use the framework name huxerui")
+                }
+                if (!new File(abiDirectory, fileName).isFile()) {
+                    throw new GradleException("HuxerUI application library is missing for ${abiDirectory.name}: ${fileName}")
+                }
+                return [target: plan.target, library: libraryName]
+            }.unique()
+            if (applications.size() != 1) {
+                throw new GradleException("HuxerUI application target and library name must match across Android ABIs")
+            }
+            libraryFile.parentFile.mkdirs()
+            libraryFile.setText(applications[0].library, "UTF-8")
+        }
+    }
+    variant.buildConfigFields.put("HUXERUI_APP_LIBRARY", resolveLibrary.map { task ->
+        new BuildConfigField("String", JsonOutput.toJson(task.outputs.files.singleFile.getText("UTF-8")),
+                "Application library resolved from the CMake target.")
+    })
+
+    def stageAssets = tasks.register("stageHuxerUI${variant.name.capitalize()}Assets", StageHuxerUIAssets) {
+        packageDirectories.from(packagedAbis.map { directories ->
+            directories.collect { new File(resourceRoot, "${it.name}/package") }
+        })
+    }
+    variant.sources.assets.addGeneratedSourceDirectory(stageAssets) { it.outputDirectory }
+
+}
+
+dependencies {
+    implementation(files(singboxAar).builtBy(stageSingboxAar))
+    implementation("com.google.zxing:core:3.5.3")
+    if (rootProject.gradle.ext.huxeruiUsesSource) {
+        implementation project(":HuxerUI")
+    } else {
+        implementation files(rootProject.gradle.ext.huxeruiAndroidArchive)
+    }
+    huxeruiLibraries.each { library ->
+        implementation project(library.projectPath)
+    }
+}
+
+// Runs on the build JVM without a device or Android runtime; every APK build
+// keeps the same signature/version/cache-boundary gate as the native verifier.
+def compileAppUpdatePolicyTest = tasks.register("compileAppUpdatePolicyTest", JavaCompile) {
+    source files("src/main/java/dev/farna/clashflux/ApkUpdatePolicy.java",
+            "../../../tests/android/ApkUpdatePolicyTest.java")
+    destinationDirectory = layout.buildDirectory.dir("app-update-policy-test")
+    classpath = files()
+    options.encoding = "UTF-8"
+    options.release = 8
+}
+def testAppUpdatePolicy = tasks.register("testAppUpdatePolicy", JavaExec) {
+    dependsOn compileAppUpdatePolicyTest
+    classpath = files(compileAppUpdatePolicyTest.flatMap { it.destinationDirectory })
+    mainClass = "dev.farna.clashflux.ApkUpdatePolicyTest"
+}
+tasks.named("preBuild").configure { dependsOn testAppUpdatePolicy }
+
+def compileRuntimeStartPolicyTest = tasks.register("compileRuntimeStartPolicyTest", JavaCompile) {
+    source files("src/main/java/dev/farna/clashflux/RuntimeStartPolicy.java",
+            "src/main/java/dev/farna/clashflux/VpnUptime.java",
+            "src/main/java/dev/farna/clashflux/RuntimeModeReconciler.java",
+            "../../../tests/android/RuntimeStartPolicyTest.java",
+            "../../../tests/android/RuntimeModeReconcilerTest.java",
+            "../../../tests/android/VpnUptimeTest.java")
+    destinationDirectory = layout.buildDirectory.dir("runtime-start-policy-test")
+    classpath = files()
+    options.encoding = "UTF-8"
+    options.release = 8
+}
+def testRuntimeStartPolicy = tasks.register("testRuntimeStartPolicy", JavaExec) {
+    dependsOn compileRuntimeStartPolicyTest
+    classpath = files(compileRuntimeStartPolicyTest.flatMap { it.destinationDirectory })
+    mainClass = "dev.farna.clashflux.RuntimeStartPolicyTest"
+}
+def testRuntimeModeReconciler = tasks.register("testRuntimeModeReconciler", JavaExec) {
+    dependsOn compileRuntimeStartPolicyTest
+    classpath = files(compileRuntimeStartPolicyTest.flatMap { it.destinationDirectory })
+    mainClass = "dev.farna.clashflux.RuntimeModeReconcilerTest"
+}
+def testVpnUptime = tasks.register("testVpnUptime", JavaExec) {
+    dependsOn compileRuntimeStartPolicyTest
+    classpath = files(compileRuntimeStartPolicyTest.flatMap { it.destinationDirectory })
+    mainClass = "dev.farna.clashflux.VpnUptimeTest"
+}
+
+def compileProfileHttpPolicyTest = tasks.register("compileProfileHttpPolicyTest", JavaCompile) {
+    source files("src/main/java/dev/farna/clashflux/ProfileHttpPolicy.java",
+            "../../../tests/android/ProfileHttpPolicyTest.java")
+    destinationDirectory = layout.buildDirectory.dir("profile-http-policy-test")
+    classpath = files()
+    options.encoding = "UTF-8"
+    options.release = 8
+}
+def testProfileHttpPolicy = tasks.register("testProfileHttpPolicy", JavaExec) {
+    dependsOn compileProfileHttpPolicyTest
+    classpath = files(compileProfileHttpPolicyTest.flatMap { it.destinationDirectory })
+    mainClass = "dev.farna.clashflux.ProfileHttpPolicyTest"
+}
+tasks.named("preBuild").configure { dependsOn testProfileHttpPolicy }
+tasks.named("preBuild").configure { dependsOn testRuntimeStartPolicy, testRuntimeModeReconciler, testVpnUptime }

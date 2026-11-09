@@ -1,0 +1,197 @@
+#pragma once
+
+#include <algorithm>
+#include <limits>
+#include "ui.h"
+
+namespace clashflux::ui {
+
+inline constexpr float kPageHorizontalInset = 24.0F;
+inline constexpr float kPageLeadingInset = 8.0F;
+inline constexpr float kPageHeaderHeight = 48.0F;
+inline float PageScrollInset(const huxerui::ThemeSpec& theme, bool dense = false) {
+    const auto islands = ResolveIslandTheme(theme);
+    return dense ? islands.dense_radius : islands.nested_radius;
+}
+
+inline huxerui::View PageScrollContent(huxerui::View content, float inset, float horizontal = 0.0F) {
+    return huxerui::Column {content}.With(
+        huxerui::Padding(huxerui::EdgeInsets{
+            .top = inset, .right = horizontal, .bottom = inset, .left = horizontal}),
+        huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch));
+}
+
+inline huxerui::View PageScrollSpace(float height) {
+    // HuxerUI virtual metrics ignore a measured zero extent and keep the row
+    // estimate (a full card), so a spacer that collapses to zero becomes a
+    // phantom card-height blank. Keep a sub-pixel positive extent instead.
+    return huxerui::Row {}.With(huxerui::Frame{.height = std::max(0.5F, height)},
+        huxerui::Semantics{.hidden = true});
+}
+
+// Keep business factories and keys in their original index space. Only the
+// virtual source gains two non-interactive edge items; data remains virtual.
+template<class Factory>
+huxerui::VirtualList PageVirtualList(std::size_t count, Factory factory, float inset,
+    float bottomAvoidance = 0.0F) {
+    return huxerui::VirtualList(count + 2, [=](std::size_t index) -> huxerui::View {
+        if (index == 0) return PageScrollSpace(inset);
+        if (index == count + 1) return PageScrollSpace(inset + bottomAvoidance);
+        return factory(index - 1);
+    });
+}
+
+template<class Factory>
+huxerui::VirtualGrid PageVirtualGrid(std::size_t count, Factory factory, float inset,
+    float rowSpacing, float bottomAvoidance = 0.0F) {
+    const float gap = count == 0 ? 0.0F : rowSpacing;
+    std::vector<std::size_t> spans(count + 2, 1);
+    spans.front() = spans.back() = std::numeric_limits<std::size_t>::max();
+    return huxerui::VirtualGrid(count + 2, [=](std::size_t index) -> huxerui::View {
+        if (index == 0) return PageScrollSpace(inset - gap);
+        if (index == count + 1) return PageScrollSpace(inset + bottomAvoidance - gap);
+        return factory(index - 1);
+    }).ItemSpans(std::move(spans)).RowSpacing(gap);
+}
+
+// Put the inset around the full header slot rather than inside its min-height.
+inline huxerui::View PageHeaderWithInset(huxerui::View header, float inset) {
+    return huxerui::Column {header}.With(huxerui::Padding(huxerui::EdgeInsets{.top = inset}),
+        huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch));
+}
+
+struct PageScrollOffset {
+    float value = 0.0F;
+};
+
+// A scaffold can change hierarchy when the host viewport changes. Record real
+// scroll activity without observable writes, then seed a newly mounted scroll
+// container. A controller alone does not restore its offset after reattachment.
+struct RememberPageScroll {
+    class Extension;
+    std::shared_ptr<PageScrollOffset> offset;
+    bool operator==(const RememberPageScroll&) const = default;
+};
+class RememberPageScroll::Extension final : public huxerui::NodeExtension {
+public:
+    Extension(huxerui::ViewNode&, const RememberPageScroll& value) : offset_(value.offset) {}
+    void Update(huxerui::ViewNode&, const RememberPageScroll& value) { offset_ = value.offset; }
+    void OnScrollActivity(huxerui::ViewNode&, const huxerui::ScrollActivity& activity) override {
+        if (activity.phase != huxerui::ScrollPhase::Cancel &&
+            activity.source != huxerui::ScrollSource::Programmatic)
+            offset_->value = activity.metrics.offset;
+    }
+private:
+    std::shared_ptr<PageScrollOffset> offset_;
+};
+
+inline huxerui::View ScrollablePageContent(huxerui::View content,
+    std::shared_ptr<PageScrollOffset> offset) {
+    return huxerui::Scope([content, offset] {
+        const auto controller = huxerui::UseScrollController(offset->value);
+        return huxerui::ScrollView(PageScrollContent(content, PageScrollInset(huxerui::UseTheme())))
+            .Controller(controller)
+            .With(RememberPageScroll{offset}, huxerui::Grow(1.0F));
+    }).With(huxerui::Grow(1.0F));
+}
+
+inline huxerui::View ScrollablePageContent(huxerui::View content) {
+    return huxerui::Scope([content] {
+        const auto offset = huxerui::UseState(std::make_shared<PageScrollOffset>()).Get();
+        return ScrollablePageContent(content, offset);
+    }).With(huxerui::Grow(1.0F));
+}
+
+inline constexpr bool kPageTitlesInWindow = false;
+
+inline huxerui::View PageSearchFieldLayout(huxerui::View field, bool compact,
+    bool fullWidth = kPageTitlesInWindow) {
+    // Preserve the original mobile/compact hierarchy. A growing field inside
+    // an extra Column otherwise receives the whole page's available height.
+    if (!fullWidth || compact) return field;
+    return huxerui::Row {
+      huxerui::Spacer(),
+      huxerui::Column {field}.With(
+          huxerui::Frame{.height = kPageTitleBarSearchHeight,
+                         .max_width = kPageTitleBarSearchWidth},
+          huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch)),
+      huxerui::Spacer(),
+    }.With(huxerui::Frame{.height = kPageTitleBarHeight},
+           huxerui::Grow(1.0F),
+           huxerui::CrossAlign(huxerui::CrossAxisAlignment::Center));
+}
+
+inline huxerui::EdgeInsets PageContentInsets(const huxerui::ThemeSpec& theme,
+    bool compact, float horizontal) {
+    return {
+        .top = compact ? theme.spacing.medium : kPageTopContentGap,
+        .right = horizontal,
+        // 页面铺到窗口（Compact 含系统安全区）底边；桌面右下角悬浮按钮与
+        // Compact 悬浮导航的避让由可滚动内容尾部的 footer 提供，不缩短整页容器。
+        .bottom = 0.0F,
+        .left = horizontal,
+    };
+}
+
+inline huxerui::View PageTitleText(const huxerui::ThemeSpec& theme,
+    huxerui::StringVariant title) {
+    return huxerui::Text(std::move(title)).Style(huxerui::TextStyle{
+        huxerui::Font::System(font_size::kTitle).WithWeight(huxerui::FontWeight::Medium),
+        theme.colors.on_surface}).Key("page-title");
+}
+
+inline huxerui::View PageHeaderLayout(const huxerui::ThemeSpec& theme,
+    huxerui::View title, huxerui::View actions, bool stackedActions,
+    bool expandTitle = false) {
+    if (!title) {
+        if (!actions) return {};
+        return huxerui::Row{huxerui::Spacer(), std::move(actions)}
+            .With(huxerui::CrossAlign(huxerui::CrossAxisAlignment::Center))
+            .Key("page-actions");
+    }
+    if (expandTitle) title = std::move(title).With(huxerui::Grow(1.0F));
+    if (stackedActions) {
+        return huxerui::Column{
+            huxerui::Row{std::move(title)}.With(
+                huxerui::Frame{.min_height = kPageHeaderHeight},
+                huxerui::CrossAlign(huxerui::CrossAxisAlignment::Center)),
+            std::move(actions),
+        }.With(huxerui::Spacing(theme.spacing.small),
+               huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch))
+            .Key("page-header");
+    }
+    if (expandTitle) {
+        // Spacer 默认也会增长；搜索标题行不让它分走输入框的可用宽度。
+        return huxerui::Row{std::move(title), std::move(actions)}
+            .With(huxerui::Frame{.min_height = kPageHeaderHeight},
+                  huxerui::CrossAlign(huxerui::CrossAxisAlignment::Center))
+            .Key("page-header");
+    }
+    return huxerui::Row{
+        std::move(title), huxerui::Spacer(), std::move(actions),
+    }.With(huxerui::Frame{.min_height = kPageHeaderHeight},
+           huxerui::CrossAlign(huxerui::CrossAxisAlignment::Center))
+        .Key("page-header");
+}
+
+inline huxerui::View CenteredPageHeader(const huxerui::ThemeSpec& theme,
+    huxerui::View title, huxerui::View leading, huxerui::View trailing) {
+    const auto actionSlot = [](huxerui::View action) {
+        return huxerui::Row{std::move(action)}
+            .With(huxerui::Frame{.width = 40.0F, .height = 40.0F},
+                  huxerui::MainAlign(huxerui::MainAxisAlignment::Center),
+                  huxerui::CrossAlign(huxerui::CrossAxisAlignment::Center));
+    };
+    return huxerui::Row{
+        actionSlot(std::move(leading)),
+        huxerui::Row{std::move(title)}.With(huxerui::Grow(1.0F),
+            huxerui::MainAlign(huxerui::MainAxisAlignment::Center),
+            huxerui::CrossAlign(huxerui::CrossAxisAlignment::Center)),
+        actionSlot(std::move(trailing)),
+    }.With(huxerui::Frame{.min_height = kPageHeaderHeight},
+           huxerui::Spacing(theme.spacing.small),
+           huxerui::CrossAlign(huxerui::CrossAxisAlignment::Center))
+        .Key("centered-page-header");
+}
+
+} // namespace clashflux::ui

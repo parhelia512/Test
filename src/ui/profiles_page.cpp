@@ -1,0 +1,207 @@
+// profiles_page.cpp — 订阅页：矩形卡片网格（定高、宽度由网格轨道均分铺满，
+// 列数按窗口宽度自适应；内容单行 UTF-8 截断；Compact 视口退化为整宽列表）。
+// 卡片交互：右上角刷新图标更新
+// 订阅；桌面右键、Compact 的“更多”按钮共用上下文菜单（使用/更新/首页/
+// 分享二维码/编辑信息/编辑规则/编辑文件/删除）；点击卡片切换启用订阅。
+//
+// 订阅选项（类型/描述/HTTP 超时/更新间隔/自动更新；桌面额外提供代理/证书开关）
+// 在新建与编辑弹窗编辑，仅落库，下载行为在下次「更新」时生效；自动更新由
+// 壳层泵（app.cpp）按间隔扫描 refreshDue()。
+//
+// 性能（懒加载）：弹窗相关 State 全部收在页面级（每张卡零弹窗状态，只有
+// UseTheme；菜单句柄也由页面下发），卡片的组合成本与弹窗数量解耦；编辑
+// 文件的 YAML 经任务线程读取（加载指示），TextField 非受控——OnChanged
+// 只写 shared_ptr 指向的内容（无 State 写 → 无逐键重组），保存时取现值。
+//
+// 数据流：订阅列表来自应用级 ProfilesModel（见 profiles_model.h），页面拿到的
+// ProfilesCache 只是它的镜像；导入/更新/启用/删除/编辑保存都是阻塞活
+// （网络下载 / 内核重启），全部经 RunOnTaskThread。
+#include <huxerui/huxerui.h>
+
+#include <algorithm>
+#include <charconv>
+#include <chrono>
+#include <cctype>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <system_error>
+#include <utility>
+#include <vector>
+
+#include "ui.h"
+#include "empty_state.h"
+#include "page_loading.h"
+#include "search_text.h"
+#include "app_resources.h"
+#include "task_bridge.h"
+#include "profile_import_task.h"
+#include "profile_reorder_geometry.h"
+#include "profile_list_layout.h"
+#include "qrs_codec.h"
+
+import clashflux.core;
+import clashflux.db;
+import clashflux.pptp;
+import clashflux.singbox;
+import clashflux.store.core;
+import clashflux.store.profiles;
+import clashflux.store.vpn;
+import clashflux.utils;
+import clashflux.vpn;
+
+#include "profiles_cache.h"
+#include "profiles_model.h"
+#include "profiles_page_shared.h"
+#include "core_control.h"
+#include "vpn_model.h"
+
+namespace clashflux::ui {
+
+struct ProfileReorderSession {
+    std::int64_t activeId = 0;
+    std::int64_t previewTargetId = 0;
+    std::vector<std::int64_t> originalOrder;
+};
+
+[[huxerui::composable]] huxerui::View ProfilesPageCore(
+    huxerui::NavigationController navigation, bool navigation_enabled,
+    ProfilesCache profilesCache, bool active, bool group_by_type) {
+    const huxerui::ThemeSpec& theme = huxerui::UseTheme();
+    const bool compact =
+        huxerui::UseViewportClass() == huxerui::ViewportClass::Compact;
+    const auto navigationModel =
+        huxerui::UseEnvironment<MobileSettingsNavigation>().model;
+    auto tasks = huxerui::UseTaskScope();
+    auto applicationTasks = huxerui::UseApplicationTaskScope();
+    const auto coreControl = UseCoreControl();
+    auto toast = UseFluxToast();
+    // 应用级共享 HTTP 客户端；Android 订阅导入/刷新使用平台网络栈。
+    auto http = huxerui::UseService<AppHttpClient>();
+    auto dialog = huxerui::UseDialog();
+    // 订阅列表来自 ProfilesModel 的镜像（唯一来源与数据泵见
+    // profiles_model.h），本页不再自维护副本；乐观选中标记与模型共享。
+    const auto profiles = profilesCache.list;
+    const auto selectionPending = profilesCache.selection_pending;
+    auto reorderSession = huxerui::UseState(
+        std::make_shared<ProfileReorderSession>());
+    auto reorderTarget = huxerui::UseState<std::int64_t>(0);
+    auto gridGeometry = huxerui::UseState(std::make_shared<ProfileGridGeometry>());
+    auto pptpStates = huxerui::UseStateList<store::PptpState>();
+    // 当前选中的类型分区标签（remote/local/pptp/…）；无效或为空时
+    // 回落到第一个有订阅的类型。
+    auto activeType = huxerui::UseState<std::string>("");
+    auto profileSearch = huxerui::UseState(huxerui::TextEditingValue{});
+    auto sectionMotion = UseSectionTabMotion();
+    // ---- 新建订阅弹窗 ----
+    auto newName = huxerui::UseState(huxerui::TextEditingValue{""});
+    auto newUrl = huxerui::UseState(huxerui::TextEditingValue{""});
+    auto picker = huxerui::UseService<huxerui::FilePicker>();
+    auto newTypeIdx = huxerui::UseState<std::size_t>(0);
+    auto newDesc = huxerui::UseState(huxerui::TextEditingValue{""});
+    auto newTimeout = huxerui::UseState(huxerui::TextEditingValue{""});
+    auto newInterval = huxerui::UseState(huxerui::TextEditingValue{"1440"});
+    auto newAuto = huxerui::UseState(true);
+    auto newSys = huxerui::UseState(false);
+    auto newCore = huxerui::UseState(false);
+    auto newCert = huxerui::UseState(false);
+    auto newPptpServer = huxerui::UseState(huxerui::TextEditingValue{""});
+    auto newPptpUsername = huxerui::UseState(huxerui::TextEditingValue{""});
+    auto newPptpPassword = huxerui::UseState(huxerui::TextEditingValue{""});
+    auto newPptpTimeout = huxerui::UseState(huxerui::TextEditingValue{"30"});
+    auto newPptpRoutes = huxerui::UseState(huxerui::TextEditingValue{""});
+    auto newPptpMppe = huxerui::UseState(true);
+    auto newQrContent = huxerui::UseState(huxerui::TextEditingValue{""});
+    auto pickedPath = huxerui::UseState<std::string>("");
+    auto createPageOpen = huxerui::UseState(false);
+
+    // ---- 编辑订阅弹窗（页面级一份；卡片按 id 打开，避免 N 卡 × N 状态）----
+    auto editName = huxerui::UseState(huxerui::TextEditingValue{""});
+    auto editUrl = huxerui::UseState(huxerui::TextEditingValue{""});
+    auto editType = huxerui::UseState<std::string>("remote");
+    auto editDesc = huxerui::UseState(huxerui::TextEditingValue{""});
+    auto editTimeout = huxerui::UseState(huxerui::TextEditingValue{""});
+    auto editInterval = huxerui::UseState(huxerui::TextEditingValue{""});
+    auto editAuto = huxerui::UseState(false);
+    auto editSys = huxerui::UseState(false);
+    auto editCore = huxerui::UseState(false);
+    auto editCert = huxerui::UseState(false);
+    auto editPptpServer = huxerui::UseState(huxerui::TextEditingValue{""});
+    auto editPptpUsername = huxerui::UseState(huxerui::TextEditingValue{""});
+    auto editPptpPassword = huxerui::UseState(huxerui::TextEditingValue{""});
+    auto editPptpTimeout = huxerui::UseState(huxerui::TextEditingValue{"30"});
+    auto editPptpRoutes = huxerui::UseState(huxerui::TextEditingValue{""});
+    auto editPptpMppe = huxerui::UseState(true);
+
+    // ---- 编辑规则弹窗（工作 YAML + 规则行 + 输入行 + 脏标记）----
+
+    // ---- 编辑文件：懒加载，CodeEditor 文档只在保存/卸载时取全文 ----
+    auto fileContent = huxerui::UseState(TextDocumentHandle{});
+    auto fileLoading = huxerui::UseState(false);
+    // Android 编辑订阅时切换到页面；0 表示仍在订阅列表。
+    auto editPageId = huxerui::UseState<std::int64_t>(0);
+    auto filePageId = huxerui::UseState<std::int64_t>(0);
+
+    // Derive dock visibility from the page actually displayed, including back/save,
+    // primary-page changes and breakpoint changes; do not mutate route ownership.
+    UseCompactProfileFormNavigation(navigationModel,
+        active && !navigation_enabled &&
+        ResponsiveProfilePageIndex(compact, editPageId, createPageOpen, filePageId) != 0U);
+
+    // 原生连接状态：唯一来源是 VpnModel（见 vpn_model.h）。挂载时加载一次
+    // 持久化的连接配置并请模型立刻同步，之后由模型 State 驱动镜像。
+    const auto vpnModel = huxerui::UseService<VpnModel>();
+    const auto profilesModel = huxerui::UseService<ProfilesModel>();
+    const auto vpnOperation = vpnModel->operation.Get();
+    huxerui::Lifecycle(
+        [tasks, vpnModel, profilesModel, toast] {
+            LaunchHydratedVpnSnapshot(tasks, profilesModel->loaded.Get(), vpnModel,
+                [] { return RunOnTaskThread([] {
+                    store::vpnStore().init();
+                    return store::vpnStore().snapshot();
+                }); }, [toast](std::string error) { toast.Show(std::move(error)); });
+            return [] {};
+        },
+        profilesModel->loaded);
+    huxerui::Lifecycle(
+        [pptpStates, vpnModel] {
+            const auto& view = vpnModel->view.Get();
+            ReplaceStateList(pptpStates, view.pptp);
+            return [] {};
+        },
+        vpnModel->view);
+
+    // 不可见时只保留本页 State/Lifecycle，不构建重子树：huxerui 的 Pager 会把
+    // 四个一级页同时挂载，隐藏页即使不重组，其已挂载子树仍随每一帧被重新测量。
+    // 真机实测（代理页大分组）：四页同挂时每帧 1443 次测量请求 / ~20ms，
+    // 只留当前页后降到 28 次 / ~0ms；因此不可见页必须返回空占位。
+    auto linkEffects = ProfileLinkImportEffects(profilesModel, navigation,
+                                                navigation_enabled, active);
+    if (!active) return huxerui::Column{linkEffects, huxerui::Row{}}
+        .With(huxerui::Grow(1.0F), huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch))
+        .Key("profiles-page");
+
+    const auto buildContent = [&]() -> huxerui::View {
+#include "ui/profiles_page_actions.inc"
+#include "ui/profiles_page_layout.inc"
+    };
+    return huxerui::Column{linkEffects, buildContent()}
+        .With(huxerui::Grow(1.0F), huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch))
+        .Key("profiles-page");
+}
+
+[[huxerui::composable]] huxerui::View ProfilesPage(
+    ProfilesCache profilesCache, bool active) {
+    return ProfilesPageCore(huxerui::UseNavigation(), true,
+                            profilesCache, active, /*group_by_type=*/true);
+}
+
+#if defined(__ANDROID__)
+[[huxerui::composable]] huxerui::View AndroidProfilesPage(
+    huxerui::NavigationController navigation, ProfilesCache profilesCache,
+    bool active) {
+    return ProfilesPageCore(navigation, true, profilesCache, active, /*group_by_type=*/false);
+}
+#endif
+
+} // namespace clashflux::ui

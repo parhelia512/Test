@@ -1,0 +1,591 @@
+# UI 开发约定
+
+领域模块与普通 UI 头文件的 inline 规则、优化配置和实际验证案例见
+[C++ 模块开发与内联性能](cpp-modules-development.md)。UI composable 不因该规则添加 inline。
+
+## 响应式与平台边界
+
+- 桌面 Medium/Expanded 一级导航直接切到目标页，不作左右滑动，也不接收一级页横滑。
+  `DesktopPageSwitcher` 保留同一个 Pager 与页面挂载身份，仅在容器边界关闭运动，
+  每页恢复真实主题，避免影响页内标签、控件动画与系统 reduced motion。桌面 Compact
+  保留原点击翻页；手机一级 Pager、二级标签与 push/pop 交互不变。
+- 首页直接挂载真实固定卡片；其它页面按真实首份数据状态显示 `page_loading.h/.cpp` 的卡片/列表骨架。已经就绪的数据直接显示，
+  不加固定延时或最短展示时间，后台刷新保留可用内容。订阅以 hydrate 后发布的快照
+  （含合法空列表）为就绪条件；规则等待该快照及自身读取完成，连接首份读取为空也结束加载。
+  日志历史同步就绪时直接显示。回归覆盖首帧定位、快速反向、宽窄断点状态保留与加载中切走。
+- 手动更新订阅按 ID 共享忙态与完成版本；更新 A 只让 A 的订阅规则列表显示骨架，来源选择器、其它订阅缓存、全局规则和规则集仍可用。切页不取消更新，失败保留旧规则并允许重试；规则页各分区独立加载，不用全局规则的首份读取挡住整页。下载在独占暂存中等待网络，不持有运行计划锁；提交前重新核对来源配置与内容，并保留期间发生的主订阅选择。
+- 首页不使用加载骨架，未就绪字段显示 `—`，数据到达后原位更新，控件继续遵守真实 ready/busy 状态。`home_grid.h/.cpp` 管理固定基础卡：桌面 7 张、移动端 5 张，88pt 行高、12pt 间距，两行高 188pt，流量卡占两列；桌面运行控制卡按真实状态追加。数据更新保留卡片 Key、网格、滚动容器与内容留白。出站模式、系统代理、TUN 三个开关不做跨命令禁用：切换其中一个时其余控件保持原状态，避免联动闪烁；并发命令仍由 `CoreOperations` 的单命令槽拒绝。
+- 其它页面的骨架使用统一卡片底色、14pt 圆角与 `kCardOutlineWidth` 描边，内部占位条由同一页面坐标下的柔和斜向亮带从左向右扫过，周期 1.4 秒。网格、列表及移动/Compact 代理骨架共用流光组件；只使保留绘制失效，不逐帧写 State 或改变测量。页面退出加载即卸载流光，后台、不可见缓存行和 reduced motion 停止请求动画帧。验证慢加载只在测试中模拟，不向生产加入等待时间。
+- 页面结构由视口等级决定，不由操作系统决定。Compact 使用移动式页面导航，Medium/Expanded 使用桌面布局或多字段弹窗。
+- 导航入口收纳：宽屏侧栏中未由窄屏底部导航承载的入口，窄屏统一直接列入设置页顶部的“更多”分组，例如规则、连接、日志；顺序与宽屏侧栏一致，不再按业务分散到设置页其它分组，也不额外增加一层“更多”页面。宽屏保留侧栏入口，设置页不重复列出。普通二级页面入口（如系统代理、虚拟网卡、外部资源、运行诊断、关于）继续按用途正常分组，不因进入二级页而收进“更多”。平台能力仍按下述平台边界决定，不能为匹配侧栏而在手机增加桌面专属能力。
+- 平台判断只用于能力和内容差异，例如 Android VPN、桌面系统代理、PPTP/OpenVPN 支持情况。
+- 多订阅编排是桌面能力，手机保留单活动代理订阅；桌面窄窗口与手机宽布局不改变
+  该限制。开发目标见[桌面订阅编排](desktop-subscription-orchestration.md)，状态、
+  诊断与能力门控交互参考[官方 GUI 研究](singbox-official-gui-review.md)。
+- 多字段编辑在 Compact 视口进入独立页面；简单确认操作（例如删除确认）继续使用对话框。
+- 添加订阅在 Medium/Expanded 视口使用弹窗，二维码、文件、URL 和平台支持的 PPTP 入口共用原有导入流程；弹窗内部使用独立导航栈承载子表单，页头只显示返回/关闭与表单动作。Compact 保留独立页面。订阅信息表单的 HTTP 超时、更新间隔各占一行。
+- `ProvideEnvironment` / `Theme` 的结果只负责作用域，不能直接添加布局、绘制或输入修饰。`DialogCard` 使用自己的 Column 承载表面、圆角和内边距，允许内容根为环境节点；环境与独立导航栈的真实弹窗挂载、返回和关闭由 page_transition 回归覆盖。
+- Android 在 `AppOptions::window.content_mode` 启用 `EdgeToEdge`，由 `AndroidAppContent`
+  用 `IslandTheme::base` 绘制完整视口并统一消费 `SafeAreaPadding`。系统栏的
+  `SystemBarsAppearance` 使用同一底色，图标明暗自动跟随；一级页、二级页和底部导航
+  不重复增加安全区留白，不在 Java 或各页硬编码状态栏高度与颜色。
+
+## 操作控件
+
+首页系统代理/虚拟网卡设置的字段、保存时机、MTU/严格路由、原生 JSON 覆盖及平台边界统一见[首页网络设置](home-network-settings.md)。虚拟网卡保存等待生命周期锁在应用任务线程执行，所有视口共用校验、设置模型和提交路径。
+
+- 设置页依次排列外观、代理与网络、规则与资源、启动与后台、工具与维护、关于；需要“更多”的布局将该组置顶，入口范围遵守上文侧栏收纳规则。外观集中主题/语言；网络集中系统代理（Android 为本地代理）、虚拟网卡及桌面环境变量；资源入口显示“外部资源”；启动与后台集中桌面自启动/自动连接/托盘或 Android 保活；诊断与内核/服务维护同组。托盘相关子选项随启用托盘展示，关闭不清除已存偏好。桌面非 Compact 内容单列、最大 720pt 居中，手机与桌面 Compact 保留全宽结构。网络编辑器的标签和字段分组只在[首页网络设置](home-network-settings.md#内容分组与编辑交互)维护。
+
+- 新建订阅的类型选择（远程订阅 / 本地文件 / PPTP 内网）在弹窗和页面共用局部 SegmentedButtonStyle：选中项不常驻填色，以主题 primary 文字和细描边标识，选中交互状态层同样使用 primary；继承原有几何、键盘焦点与切换语义。
+- 浅色中性表面采用微冷白：外框/标题/侧栏 `#FAFAFB`，内容区 `#F1F2F4`，卡片 `#FEFEFF`，文字与轮廓使用配套冷中性色，统一在 `FluxLightColors` 定义；深色及用户强调色沿用原配置。
+- 桌面公共标题栏的返回按钮左侧留白统一为 `kDesktopPageLeadingInset=8pt`，无返回按钮的标题继续使用正文 24pt 缩进。关于入口、检查更新、仓库和 Release 行不显示右侧箭头。
+- 宽屏二级页与一级页共用 `WindowTitleBar` 和 `DesktopTitleBarBody`：返回按钮、页面标题、右侧动作、拖动区和窗口控件在同一标题栏，分隔线与内容区起点一致；Compact 继续使用页内返回栏。所有二级页统一走 `SecondaryPageScaffold`，不得自行画无窗口控件的头部。
+- 设置及关于滚动位置由页面保留的 `PageScrollOffset` 记录，`RememberPageScroll` 仅在实际滚动活动中更新普通内存，不逐帧写可观察 State；跨响应式层级重建时用保存偏移初始化新控制器，几何收敛不覆盖原位置。更新检查的 busy/result 通过 `UseState` 保留，不能在 composable 中直接构造临时 State。
+- 首页彩蛋切换只对卡片内容使用保留的缩放/透明度动画，不捕获整卡 SharedBounds 快照；多卡与二级页返回首页仍保留生产组件回归。
+
+- 页面留白先按下文“滚动与留白的归属”判断；设置、关于、首页及网站测试共用普通卡片的首尾留白标准，卡片内部网格间距由各自网格维护。
+- 设置页末尾只保留图标与「关于」入口，使用统一 NavigationStack 二级页。关于内容宽度上限 640pt，显示正式主题 Logo、名称、实际版本、简介、更新入口、项目/框架/所用 fork/内核仓库和免责声明；GitHub 仓库及 Release 使用 GitHub 标记。桌面非 Compact 复用 PageScaffold 的 WindowTitleBar，与一级页的背景、分隔线、拖动和窗口控件一致；窄屏沿用公共二级页标题。更新使用 GitHub latest stable Release，应用模型与应用任务域单飞、10 秒检查超时及 2MiB 响应限制；请求期间刷新图标旋转，完成或失败立即停止，reduced motion 不旋转。Windows/Linux/Android arm64 可下载匹配的安装包，显示进度、取消、校验与重试；下载及结果在同一 Runtime 跨页面/窗口重建保留。SHA-256 校验成功后需用户确认并保存配置、停核；桌面退出后由独立助手启动安装或 Polkit 授权，Android 校验正式签名/版本后请求系统授权与安装确认，安装期间禁用应用内容，取消可重试。其它平台保留经校验的 Release 链接。详见[应用升级](app-updates.md)。
+
+- 设置页所有分组标题位于卡片外，与卡片内第一列图标的左边缘对齐。`SettingsSectionCard` 统一外部标题、标题间距和零内边距卡片，内容通过 `SettingsRowInsets` 下发水平留白、10pt 行内垂直留白与 48pt 最小行高；首行贴顶、末行贴底，无组级上下空白带，由整组卡片裁切四角。单项组四角同样裁切，圆角外点击不命中。主题、语言、入站端口、运行诊断及「更多」整行入口承接全宽点击和 Indication；开关、单选、下拉框、复制及维护按钮保留各自控件的操作语义。共享 SettingRow/SettingSwitchRow 在表单中的默认 Insets 为零，不改变订阅表单几何。
+
+- Toast 统一使用窗口级 `toast_stack.h` / `UseFluxToast()`，在 Notification 层复用当前 `ToastStyle`；同时最多 3 条，底部居中纵向排列、间距 8pt。第 4 条淘汰最早一条，保留旧条目的位置直到退场完成再补入新条目；突发消息只保留最新 3 条目标，不积累旧提示。每条可点击、触摸或键盘激活关闭，无全屏遮罩或焦点陷阱，空白区域可操作原页面。计时由窗口任务域从实际入列时开始，到期/主动关闭走同一退场路径：下移 8pt、缩到 98%、200ms EaseIn 淡出，完成后才卸载；reduced motion 直接定位。窗口级订阅错误/更新失败与页面消息共用同一个栈；关窗清除定时器和待显示条目，旧句柄不能向重建窗口投递。通过公开 LayerController、主题和 Transition 组合实现应用的有界可交互通知策略，不修改框架。
+- MD3 反馈颜色在强调色写入后调用 `ApplyFluxInteractionTheme` 重建；`theme_colors.h` 的 `ResolveFluxIndication` 和 `kInteraction*Opacity` 统一拥有颜色与透明度（hover 8%，focus/press/ripple 12%）。普通反馈取 primary，实心主按钮/选中分段使用 on_primary；图标按钮、Chip、Tabs 的拥有型 Indication 经 `FluxInteractionStyles` 统一替换，保留 Material 几何。单选、复选、开关的选中颜色继续由 Material 从当前主题 tokens 生成。首页规则/全局/直连使用 `HomeModeChoices` 的框架 RadioButton，与语言单选同一交互；整行可点击，反馈集中在 32pt 圆形状态层，控件本体 18pt，不再手绘整行 hover/press。
+
+- 桌面非 Compact 的顶部搜索胶囊聚焦时，高亮描边以 250ms 从左向右展开，上下边同步显现。
+  `WithSearchFocusOutline` 只推进保留绘制的裁剪，不逐帧重组或改变布局；完成后停止请求帧，
+  失焦立即恢复普通描边。后台及 reduced motion 直接定位最终状态，手机与 Compact 保留原行为。
+
+- 订阅新增、删除和切换完成后，在 UI 线程调用 `ProfilesModel::PublishCached()`，
+  只读取持久化层的内存缓存，先发布权威列表再反馈或返回页面；不得用空 `reload`
+  或只增加 `syncTick` 代替完成时的更新。删除与切换任务使用应用任务域，避免页面
+  卸载取消结果回传或永久保留 `selectionPending`。文件选择器仍使用页面任务域，
+  选取完成后的实际导入与 URL/二维码导入共用应用任务域及异常收尾。
+  `profile_list_model.h` 的后台泵只在快照成功发布后确认内容版本；切换/拖动阻止
+  发布时保留重读义务，动作发布使在途旧快照失效。列表镜像同时依赖列表与切换/拖动
+  状态，操作结束后补齐曾被推迟的镜像，切换失败时也从权威列表恢复选中态。
+  拖放落点经 `ProfileListModel::PublishOrder` 把新顺序写透权威模型，解除
+  `reorderPending` 时镜像直接同步目标顺序，不被旧列表覆盖回弹。`test_page_transition` 覆盖即时增删、
+  在途旧快照和无额外数据库写入时的延迟重读，持久化保护另由 `persistence` 回归。
+  普通订阅切换同一卡片重复点击合并；应用级队列只执行一份准备并保留最后一个待切目标。
+  改选会取消旧准备，旧结果按请求号（含 ABA）拒绝发布；编译在条目/阶段边界检查取消，
+  已开始的内核交接仍须安全收尾。候选、代理组预览与成功提示复用同份产物，不能为反馈再次编译。
+
+- 代理测速的批次状态与按运行 tag 保存的节点状态归 `ProxiesModel::tests`（`proxy_test_model.h`），
+  组请求、节点请求及原生结果等待使用应用任务域；节点卡片只观察状态，切页、宽窄变化和虚拟回收不取消测速。
+  点击时快照整组非组类型成员，不依赖可见卡片注册；桌面所有组走 `/group/{name}/delay`，
+  由内核按自身并发数（10）批量测速并保留订阅 `url-test.url`，排队节点也保留测速中状态。
+  原生组测速按共享快照时间戳确认结果，30 秒兜底结束无结果项。完成发布核对批次代次与实际运行计划，
+  停止/切换运行计划清除旧进度及缓存，旧结果不能覆盖新请求；失败、完成后可再次测速。
+  桌面非组节点通过 `ProxyNodeTile` 在鼠标 hover 时把右下角延迟文字替换为 refresh 刷新图标，
+  离开恢复结果，测速时持续旋转；未测过时延迟留空，仍保留按钮槽位并响应整卡 hover。
+  槽位固定 62×16pt，最右端用 16pt 方形 IconButton，14pt 图标、圆形反馈与点击区域同心；
+  左侧空白仍归整卡选线，不把 62pt 槽整体设为按钮。按钮保持挂载，隐藏时只改透明度，
+  与关于页检查更新共用 `RefreshIconRotation` 的 0.9 秒线性循环，结束立即复位，reduced motion 不旋转。
+  切页后仍在测速的按钮先建立零角度再恢复循环，不在首次挂载时直接停于 360 度。
+  按钮提示及无障碍名称包含测速语义；点击只请求该运行 tag 的 delay API，
+  不触发整卡选线。单节点请求同样归应用任务域，同节点单飞、不同节点独立，单测与整组扫描互斥，
+  失败可重试，旧计划的卡片句柄及结果不得占用或覆盖新请求。Android 当前原生入口仍只支持整组测速。
+
+- 文件选择器的筛选名称等本地化字符串在组合期解析，再通过拥有型 DTO 传给点击回调和异步任务。
+  不在协程中调用 `UseString()`；选取取消或失败保留原表单与订阅，恢复导入状态，异常用 toast 反馈。
+
+- 日志标题栏只提供竖向三点菜单：级别子菜单标记当前选择，导出子菜单提供剪贴板与系统文件导出，
+  清空统一日志存储及待消费队列。导出使用当前搜索与级别的可见日志快照，
+  保留时间戳与顺序；文件准备在任务线程完成，独占临时文件由 RAII 清理。日志专用弹出菜单通过
+  `ViewEvents::Hover` 的 Enter 事件展开子菜单，保留点击展开与取消关闭，不修改框架。
+  所有面板使用 `ClipChildren` 按面板圆角裁剪菜单项绘制及命中，避免 hover 填充越界；
+  每个菜单项也使用菜单主题的圆角，使各项 hover 高亮各自圆角化；
+  面板四边在主题原有内边距上增加 `spacing.extra_small`（默认 4pt），项间增加其一半（默认 2pt）；
+  清空菜单项使用项目统一的 `theme.colors.error` 危险文字色。
+
+- 语言入口使用共享 `ResponsiveLanguageSetting`：Compact 通过 `LanguageRoutePage` 进入独立选择页，其它宽度使用弹窗，不按桌面/手机区分；两种形式共用 `LanguageChoices`。页面返回走 NavigationStack Pop；桌面胶囊和渐隐层属于 `CompactRootPageSurface` 的导航首页，二级页直接覆盖，Pop 从开始即露出同一已挂载胶囊，不由语言/主题/报告/规则编辑页维护显隐 State。切换一级页由 `UsePrimaryPageNavigation` 清理逻辑二级路径。打开后调整窗口保留页面身份。具体语言显示固定原名（简体中文、English），不随当前界面语言翻译；自动选项跟随界面语言。主题使用自动、深色、浅色三个图标选项，并保留无障碍标签。
+- 桌面“启用托盘”统一控制关闭按钮：启用且系统托盘可用时隐藏到托盘，否则询问是否退出；
+  确认框只有关闭与取消。旧 `tray.close_behavior` 设置不再读取，不删除用户持久化数据。
+  最小化使用系统原生行为，Windows 保留任务栏入口，不拦截最小化。普通托盘模式隐藏并保留窗口，轻量模式让原生关闭流程销毁窗口/UI，唤出时 OpenWindow 重建；应用不再调用 fork 的 Retire。桌面固定 quit_on_last_window_closed=false，后台协程使用 UseApplicationTaskScope，保留同一 Runtime、托盘与应用模型；显式退出仍完成收尾后 Quit。此 AppOptions 是初始化配置，当前公共 API 没有动态 setter；轻量开关仅动态选择关闭策略。
+
+- 桌面 Medium/Expanded 使用平面布局和分层底色，左侧 Logo 与导航组成完整一栏，右侧为标题与内容一栏；竖线贯穿两栏，
+  横线只分隔右侧标题栏与内容。页内区块、订阅和代理条目恢复卡片底色、圆角与
+  选中填色，不增加条目底部或分区标题分隔线。手机保留现有卡片；按钮、输入框和浮层仍使用各自控件样式。
+
+- 桌面 Medium/Expanded 的 `PageScaffold` 直接承载本页的 `WindowTitleBar`：页名在左、动作按钮在右，
+  动作紧邻原生最小化按钮左侧，保留平台窗口控件预留区。内容不再保留重复标题或动作行；
+  页内动作仍在原页面的组合状态作用域中挂载。左侧 Logo 栏与标题栏共用
+  `kDesktopTitleBarHeight`，右侧标题与内容之间保留横线。手机标题与二级页返回栏不变。
+- 顶部内容留白与一级侧栏在 Logo 栏下方的留白共用 `kDesktopTopContentGap`；
+  标题水平留白共用 `kDesktopPageHorizontalInset`。修改共用量，不给各页单独加偏移。
+
+- 页面命令优先使用带语义标签的 `IconButton`；桌面悬停必须提供说明操作含义的 `Tooltip`。
+- 表达状态或模式的选项（例如“规则 / 全局 / 直连”）保留文字。
+- 所有 Switch 设置项统一由三部分组成：主名称、小字描述、Switch。主名称和小字描述放在左侧列，Switch 固定在右侧并与文字列垂直居中对齐。设置页统一使用 `SettingSwitchRow`，不得在 Compact 视口改成上下堆叠。
+- 小字描述允许自然换行；左侧文字列使用 Grow 保留 Switch 的固定右侧位置，不得因长描述把 Switch 挤到下一行。
+
+网站测试采用卡片式自适应网格，Compact 单列；宽屏侧栏与窄屏顶部“更多”的入口顺序一致。
+批量/取消操作使用页面动作区，单卡测试位于卡内；测试状态、输入和临时网站归应用模型，
+跨切页/宽窄变化保留，真实请求边界及 Android 应用网络限制见[网站测试](website-tests.md)。
+
+## 滚动与留白的归属
+
+判断留白属于哪个区域，以及是否应沿当前方向移动；数值固定或使用 `Padding` 本身不是缺陷。
+
+| 场景 | 归属与实现 |
+| --- | --- |
+| 滚动正文的装饰性首尾留白 | 归滚动内容。视口延伸到固定标题/标签栏下沿与正文底边；普通正文用内部 Padding，虚拟列表/网格用首尾空白项，随内容滚走。 |
+| 静态区域、固定标题/标签栏、弹窗动作区 | 保留区域自己的边距、间距和完整控件高度；没有实际内容的提示区不保留空条。 |
+| 卡片内部、表单字段与业务条目之间 | 用所属容器的 Padding/Spacing 或网格行距，保留主题、文字布局与触控语义，不改成无关占位行。 |
+| 非滚动方向的对齐 | 允许骨架提供边距；横向 Pager 的留白归每页内容，不缩短翻页步长。 |
+| 悬浮导航、悬浮按钮 | 尾部正文额外提供公共组件定义的覆盖区避让，末项可滚到浮层上方；不缩小整个视口。 |
+| 系统栏、系统返回手势区和软键盘 | 由框架安全区及实际视口处理，根与页面不重复补偿；表单正文应能在短屏和键盘缩短后滚动。 |
+
+普通卡片页面的首尾视觉留白取 `IslandTheme::nested_radius`，密集列表取 `dense_radius`，
+首页/网站测试的左右缩进也取对应卡片圆角。表单字段间距、文字排版、触控尺寸及浮层
+避让仍取各自语义尺寸，不由页面圆角代替。固定标题的内边距不占用其完整内容槽高度。
+
+实现复用 `page_layout.h` 的正文和虚拟列表留白组件。首尾空白不使用空 Text，不改变
+业务工厂收到的索引或稳定 ID；网格空白跨完整行，并将相邻行距只计一次。禁止为放空白
+而把虚拟列表改成一次性展开的 ScrollView，或在现有同向滚动容器外再套一层滚动。
+加载骨架和真实内容使用同一首尾规则，切换不增加额外空带。
+
+验收包括：短/长内容、顶部/底部及滚动中裁切边缘、末项避让、宽窄重挂后的实际偏移、
+键盘缩短和恢复、固定标题/操作位置；代码编辑器保留自身滚动与文本内边距。
+编译和首帧截图不能代替滚动验证。
+
+## 弹窗与平铺表单
+
+- 自定义弹窗只由 `DialogCard` 提供一层主题 overlay 表面、圆角、描边与阴影；其 `DialogSurfaceContext` 使复用的 Card/DenseCard 列表行透底、无描边，保留列表密度与命中几何，内部表单不再套 Card/DenseCard、亮色区块或独立阴影。输入、下拉、开关和代码编辑器保留原生控件表面；二维码/颜色预览仍可表达自身内容。
+- 确认/选择、表单编辑、查看/任务共用 `DialogHeader`、`DialogActions` 和 `DialogScaffold`。小/普通/大弹窗内容宽度统一 360/520/720pt，由父级视口约束收缩；长内容高度上限 620pt，短表单自然高度。标题、标签和动作不随正文滚动，不在多个位置重复放同一提交按钮。
+- 多步骤导入在同一弹窗的独立导航栈内换页，URL/PPTP 子表单不再叠加第二层编辑弹窗；返回保留本次草稿，成功导入退出整个流程。
+- 表单在宽屏弹窗与窄屏独立二级页共用平铺字段；设置首页的导航分组卡片保留。标签已表达分类时不再重复分区标题；同类字段用正常行距，不同内容用较大留白，只有确实需要时才加轻标题，不逐块增加分隔线。
+- 短值/模式使用名称加控件，窄屏空间不足时上下排列；URL、路径和长文本用上方标签与全宽输入。HTTP 超时和更新间隔各一行。说明与校验紧贴字段，详细解释按需展开；高级折叠项展开后继续平铺，不套卡片。
+- 操作统一靠右并允许窄窗换行，次级按钮使用透明底、主题描边的 outline 样式，保留 hover/press/ripple/focus 与禁用反馈，主要提交按钮实心；保存并应用可用时仅它为主操作，普通保存为次级。危险确认沿用 error/on-error 配色。Compact 主操作使用标题栏右侧的 FormHeaderAction 图标，不放底部提交按钮；忙态以同尺寸进度指示和 busy/disabled 语义反馈。
+- 弹窗标题栏不显示右上角关闭叉号，退出统一放在固定底部的描边“取消/关闭”按钮；多步骤导入保留左侧返回箭头，右侧仅保留复制/添加等内容动作。页面导航和系统窗口关闭按钮不受此规则影响。
+- 编辑器取消/关闭/Esc/遮罩/返回共用 `UseEditorClose` 和 `ShowEditorDialog` 的关闭路由：保存忙态通常拒绝关闭，有草稿先确认放弃，成功提交直接关闭，失败保留输入。已提交订阅导入归应用任务域，例外允许返回并抑制旧页面的完成跳转，见[二维码与配置导入](qr-scanning.md#添加配置的识别与返回)。立即生效的选择不附加保存或草稿提示。长文本只在显式保存/关闭时快照，不逐键复制。
+- 回归短/长表单、矮窗、宽窄屏、深浅主题、滚动期间固定动作、无重复触发、忙态关闭、继续编辑/放弃，以及原生控件命中和完整行反馈。
+
+## 长条操作行的交互范围
+
+设置、弹窗及二级页的长条入口、折叠标题和整行操作共用 `settings_group_layout.h`
+的 `SettingsActionRow`。hover、焦点、按压、点击波纹和命中使用同一个完整行边界，
+包括行内留白；不沿文字/图标单独缩小，也不沿用圆形或固定尺寸的控件反馈几何。
+分组卡片的内容无外层内边距和行间空白带，通过 `SettingsRowInsets` 把留白交给各行，
+`SettingsContentRow` 承载普通表单内容，`SettingsActionRow` 承载整行动作。
+行内部不再套胶囊或独立圆角；首末行的绘制与命中统一由外层卡片圆角裁切。
+说明文字和留白不增加动作，独立开关、复选框、下拉和输入框保留各自操作边界，避免双重响应。
+回归宽窄屏、深浅主题的行首/中间/行尾与边缘命中、hover/按压/键盘焦点、圆角外点击、
+禁用态及子控件单次响应；不要只检查标题文字附近。
+
+## 大文本查看与编辑
+
+- 订阅原文、规则集 JSON、编译 JSON 与诊断报告统一使用 `text_document.h/.cpp` 的
+  `TextDocument` / `DocumentTextView`，底层为固定 fork 的 `HuxerUI::CodeEditor`。
+  名称、地址、搜索等单行输入保留 `TextField`；结构化规则和实时日志保留虚拟列表。
+- 文件读取、转换和 `PrepareEditorDocument` 的 UTF-8 拆行在任务线程完成；文档准备由应用任务
+  持有并单飞，重复挂载不并行准备同一文档。文档交给编辑器后只在 UI 线程访问，不同时挂到两个编辑器。
+- 使用 `initial_document` 传入预构建文档，不把全文放进可重组的 `EditorOptions::initial_text`
+  或表单 `TextEditingValue`。规则集列表及表单共享不可变资源句柄，复制资源库与提交组装放工作线程。
+- 编辑器自行滚动、选择、输入法与撤销；关闭自动换行，不启用整篇高亮或 diff，视口保持有界。
+  文档句柄跨卸载保留编辑内容；普通重组不重新加载，输入事件只记脏，不逐键复制全文或写页面 State。
+- 保存/复制时显式 `Snapshot()`，未再次编辑则复用同一个不可变字符串。剪贴板仍在 UI 线程调用；
+  文件候选校验、写入和运行配置交接继续走 store。保存单飞，失败保留编辑器及未保存内容。
+- 查看和编辑共用搜索、全选、复制/复制全部菜单，编辑模式额外提供剪切/粘贴。
+  首次视口布局和平台字体测量仍在 UI 线程；大文件/超长单行的实机性能需独立验证。
+
+## 页内标签与导航图标
+
+手机订阅页将远程、本地及已有其它来源按权威列表顺序放在同一个单列虚拟网格，搜索跨类型匹配，不挂类型标签或单页 Pager；横屏/宽视口继续使用统一列表，保持原有内容边距。桌面（含 Compact 窄窗）保留类型分页与原有类型顺序。两种展示共用卡片、搜索和拖放逻辑，平台包装显式指定是否按类型分组，不用视口宽度推断平台。代理页与托盘线路菜单统一按当前运行或预览对象目录的实际来源数量判断：多个不同 source ID 才附来源名称，单来源显示原始 objectId，忽略无来源的内置对象，不以已保存订阅数量或同来源对象数量判断。显示逻辑不区分平台或视口；手机由已有单活动订阅约束自然保持无后缀。来源数量变化时随快照更新标签，保持运行 tag、选择/测速目标、默认出口和稳定 Key 不变。
+
+- 应用 Logo 统一从 `assets/branding/logo.svg` 生成，沿用独立 demo 的完整出箱造型。界面使用透明的 `clash_flux_logo_vector_{dark,light}_current.svg`，按主题选择且不加 Tint；Linux/Windows/macOS 原生图标使用透明背景，Windows 安装器和 Android legacy launcher 保留白底。托盘保留默认、TUN 和系统代理三种状态色及 32/64/96 像素资源；Android 快捷磁贴继续使用独立猫爪。生成和预览方式见 [Logo 资源说明](branding/README.md)。
+- 首页猫咪动画由 `src/ui/box_cat.cpp` 提供，桌面按钮和运行卡片只映射共享 `CoreControl` 的真实内核命令/快照，Android 只映射 VPN 后台快照，不能将 core-only 当作 VPN 已连接。等待可持续轻抚，成功后才起身；失败 wink 每次进入失败态只播放一次，重开窗口或切页不重播已稳定姿势。帧时钟限频 30fps，不逐帧写 State；窗口后台、隐藏首页、SharedBounds 转场和 reduced-motion 下暂停或落到静态姿势。独立 Demo 仅用于隔离预览，不向主程序引入模拟进度。
+- 移动端与桌面 Compact 首页共用 `home_header_control.cpp` 的固定 48pt 页内标题槽位：未运行时显示“首页”和右下角猫咪；真实内核（桌面）/VPN（移动端）成功且出箱动作完成后，猫咪按桌面同款 0.64 秒轨迹先移动到标题中心再展开为“运行中 + HH:MM:SS”，运行态使用 36pt 猫咪。点击运行栏停止，先原地收拢为实际 48pt 姿势（0.28 秒），再返回悬浮位置（0.36 秒）；不照搬网格卡片的固定缩放系数。`PageScaffold` 的可选 `inlineHeader` 保持标题和滚动内容为稳定兄弟节点，替换不改变内容视口或滚动位置；移除旧的移动端全宽 VPN 状态卡。首次读到已运行快照、切页返回、宽窄切换和后台恢复直接同步，动画序号淘汰已退役任务，减少动态效果直接切换。桌面宽屏仍用窗口标题与网格运行卡，桌面窄窗保留独立系统窗口标题栏；所有运行操作共用 `CoreControl`，桌面系统代理/TUN 卡片与移动平台能力边界保持原样。
+- 运行文案统一为“运行中 / 正在启动 / 正在停止”，桌面主动作使用“连接/断开连接”，托盘另保留“启动/停止内核”；手机使用“启动/停止 VPN”。桌面从代理监听就绪的 `connectedSince` 计算时长，内核待命不计时，完整语义见[桌面代理生命周期](desktop-proxy-lifecycle.md)；Android `VpnUptime` 在后台 VPN 真正连接成功后记录 `SystemClock.elapsedRealtime()`，同一 Binder 快照成对传递状态与已运行毫秒数，经 MainActivity/JNI → `CoreModel` 显示。首份后台快照未就绪前不把默认值当成断开状态；core-only 不开始 VPN 计时。锁屏、切页和 UI 重建不重置后台会话，重复 connected 不重置，真正断开后重新连接开始新会话；Binder 暂时不可用保留最后快照。UI 不用逐秒累加计数器，也不跨 Java/C++ 比较不同时间基准。`test_page_transition` 直接挂载生产标题/悬浮组件回归，`tests/android/VpnUptimeTest.java` 验证后台会话计时。
+- 桌面与移动端共用设置页主题选项，三个标签统一为“自动 / 深色 / 浅色”；“自动”按系统深浅模式选择主题。
+
+- 二级标签共用 `src/ui/section_tabs.cpp` 的 `SectionTabBar` 与 `SectionTabPages`，代理、规则页及桌面订阅页接入；手机订阅页使用统一列表，不挂分类标签或类型 Pager。标签栏固定在 Pager 外，点击、溢出菜单与内容横滑写回同一受控选择。
+- 对照 ACGU 首页 `FeedTabs` + `SwipePages`：内容使用框架 Pager 的完整出入场、跟手拖动与取消回弹；内层首尾向外滑由框架滚动事务交给外层 Pager。不要再添加 PointerIntercept 或逐页入场过渡。
+- 标签保留独立警示色角标和溢出菜单，因此继续使用现有标签结构；一条由实际布局驱动的保留指示线连续移动并调整宽度。每对标签栏/内容页在所有 hook 区域调用一次 `UseSectionTabMotion()`，将同一 handle 传给 `SectionTabBar` 和 `SectionTabPages`；它从 Pager 与参与显示的页的最终呈现几何读取进度，拖动、提交与取消回弹时下划线同步跟随。两端分别使用正弦的加速/减速插值，形成前端延伸、后端收拢的效果；标签文字的普通色与主色也按同一实际进度线性混合：离场标签逐渐淡出，目标标签逐渐增强，取消或反向拖动沿原进度恢复；警示角标保持语义警示色。文字仍由普通 Text 测量并提供语义，保留扩展只绘制渐变颜色。动画只更新保留几何与标签前景绘制，不逐帧写 State 或使布局失效。首次显示直接定位，reduced motion 保留线性跟手但关闭伸缩。
+- 页面根用稳定语义 Key 与有界 Column，Pager 只测量显示轨道中的页。代理组仅声明轻量 VirtualGrid，卡片按视口构建，避免无界 IndexedPages 让大组节点全量构建；切回分区保留各页滚动位置。
+- 分页视口占满页面骨架可用宽度，水平内容边距放进每个分页，与内容一起移动。对照 [FlClash 的代理分组实现](https://github.com/chen08209/FlClash/blob/main/lib/views/proxies/tab.dart)：`TabBarView` 占满宽度，每页网格设置左右 16 的 padding，卡片间距另由网格设置。我们的四种二级标签页启用骨架的 `fullWidthSections`：骨架通过 `SectionTabContentInsets` 提供边距，标题和标签条也用相同值；`SectionTabPages` 将其一半应用在每个稳定页根上。代理网格与宽屏订阅网格的行列间距、分页边距均由 `kSectionCardSpacing`（8pt）计算；窄屏订阅卡行距见下文紧凑卡片约定，分页边距不变，页面每侧留 4pt，滑动中的两页边距合成 8pt，恰好等于卡片间距。Pager 外侧不加水平 Padding，翻页步长始终是完整视口宽度，形成连续的卡片节奏。
+- 标签栏用实际标签几何计算各项居中偏移，先限制到滚动范围，再按 Pager 呈现进度在两端偏移间插值（与 Flutter TabBar 相同）。内容拖动期间提前揭示目标，松手收敛、反向和取消回弹时标签条同步跟随；选择变化、标签尺寸变化与窗口缩放重新尽量居中。首尾标签按滚动边界对齐，手动滚动保持浏览位置。滚动请求在保留扩展的帧更新中执行，不逐帧写页面 State；溢出菜单的显隐不能重挂载 ScrollView。
+- Pager 反向切换修复已合入 HuxerUI fork 的 `farna/main`：清除过期 drag target，保留跨标签反向动画的离场页 slot。应用使用固定集成 SHA，不再在 CMake 或 CI 打框架补丁。
+- 隐藏虚拟页布局修复同样由 `farna/main` 维护：viewport dirty 留在隐藏子树，重新显示时恢复测量，避免逐帧使可见祖先失效。
+- `tests/test_page_transition.cpp` 直接调用生产组件，验证分页全宽、拖动中的相邻内容间距、方向、跟手与取消、嵌套边界、自动揭示、窗口缩放、滚动保留、快速反向、reduced motion 和万节点虚拟化。
+- 所有一级导航共用 `src/ui/app.cpp` 的 `kNavigationEntries`，每个条目只定义一个线条图标。桌面侧栏与手机底栏选中时保持同一轮廓与线宽，仅改变内容颜色和选中指示器，不配置填充版选中图标。
+- 代理导航使用地球网络图标 `proxies.svg`，连接导航使用链环图标 `connections.svg`；日志使用纸张图标 `logs.svg`，规则使用分流路径图标 `route.svg`。
+
+## Windows 后台操作与托盘菜单
+
+- Windows CI 使用 runner 预装的 OpenSSL（`Program Files/OpenSSL`），配置 CMake 前验证可执行文件与开发头文件；打包时从相同安装目录复制运行时 DLL。
+- 启动、轮询和退出清理中的系统操作不能闪出命令行窗口。优先使用 Win32 API；确实需要子进程时，用 `CreateProcessW` 的 `CREATE_NO_WINDOW` 并重定向标准句柄。不要在后台 Windows 路径使用 `std::system` 或 `_popen`。
+- 只有需要用户明确授权的流程可以显示系统交互提示，例如 UAC 提权。普通后台操作、失败清理和状态探测都保持安静执行。
+- HuxerUI 的 Windows 系统托盘菜单是原生菜单，`SystemTrayOptions` 不提供 `MenuStyle` 参数。桌面托盘生命周期按当前应用 `ThemeSpec` 同步 Windows 原生菜单主题；Windows 10 build 17763 及以上支持此同步，旧系统保留系统原生菜单主题。修改 HuxerUI 或 Windows 平台适配时，保持托盘菜单与应用深浅模式一致。
+- Linux 启动隐藏时先使用不依赖窗口的简版托盘菜单；主窗口挂载后切换到完整菜单，先让 StatusNotifier 菜单空一轮再发布，避免 Plasma 在两种菜单结构间保留旧动作。内核停止后的路由清理不碰 sing-box 的 `pref 9000`，仅由 root 服务清理能凭保留哨兵确认属于 Clash-Flux 的补偿路由。
+- 托盘隐藏时同时清空呈现缓存，停用后重开或宿主恢复时必须重新发布；简版菜单缓存包含实际内核与接管状态，图标使用实际状态，开关使用配置意图。完整菜单和无窗菜单统一调用应用级退出收尾。Linux 原生回归可在图形会话运行 `dbus-run-session -- /usr/bin/python3 tests/test_tray_runtime.py build/clash-flux`（需要 Gio/PyGObject 与 bubblewrap）：使用独立 D-Bus、临时数据及屏蔽已安装服务的沙箱，覆盖宿主失联/恢复、无窗唤回、菜单角色及退出；此检查单独运行，不替代 18 项桌面 CTest 门禁。
+
+## 可拖动仪表盘卡片
+
+- 拖动反馈层保持卡片原尺寸，并持续跟随按下时的抓取点；不要复用会在视口边缘翻转或夹位的弹出层放置规则。
+- 排序由卡片布局几何决定，原位置保留半透明占位；滚动视口注册宽域拖放目标，让卡片间隙和视口边缘仍能接收拖动并触发边缘自动滚动。
+- HuxerUI 通用拖动预览、Linux 窗口帧生命周期和 Objective-C++ 聚合初始化兼容修复已合入 `farna/main`，由同一固定 SHA 覆盖所有平台。维护与升级见 [HuxerUI fork](huxerui-fork.md)。
+- Camera 的 ApplicationContext/UiWindow 兼容、Charts 的 `PieChartData` / `PieChart` 与 96pt 绘图面高度、SQLite 的启动只读查询均由各自 `FarnaHerry` fork 的 `farna/main` 维护。应用原生构建与 Android 库图共用 CMake 固定的 URL/COMMIT，不再在配置时修改依赖源码。升级记录与固定版本见 [HuxerUI fork](huxerui-fork.md)。
+- 饼图通过 `PieChartData` 保存稳定 key、标签和值，`PieChart` 使用显式帧约束；标签与数值放在普通 HuxerUI Views 中，图形本身提供图像语义摘要。
+- iOS CI 使用固定 HuxerUI revision 构建未签名 Simulator app/Packet Tunnel，并用与 Android 相同的固定 sing-box revision 生成 iOS device/Simulator `Libbox.xcframework`。它不生成 IPA 或 Release 资产；订阅下载由 Clash-Flux iOS `URLSession` 桥接，默认校验证书，按订阅选项显式允许无效证书。签名设备包和真机 VPN 生命周期验证完成前，iOS Release 仍不纳入门禁。
+
+HuxerUI 更新先在独立维护仓库 merge 官方 main 到 `farna/main`，审查差异并验证框架与应用后再更新应用固定 SHA；官方 main 保留为对照基线。Lib-Charts、Lib-SQLite、Lib-Camera 在各自 fork 中采用同一流程，各平台和 Android Java/native 共用固定 SHA。
+
+## 改动后的构建验证
+
+每次修改完成后，无论改动大小、涉及何种文件（代码、UI、脚本还是配置），先重新
+编译，再运行版本命令验证：
+
+```bash
+cmake --build build --target clash-flux
+./run.sh --version
+```
+
+不得跳过本地编译，也不得只依赖旧的可执行文件判断改动有效。使用其他构建目录时，
+用 `CLASHFLUX_BIN` 显式指定对应产物；需要确认 GUI 启动或交互时，再执行 `./run.sh`。
+
+## 启动设置快照
+
+`persistence::readStartupSettings` 同步读取必须先于设置 hydrate 确定的
+`ui.theme_mode`、`ui.theme_color`、`ui.language`、`tray.enabled` 与 `tray.start_minimized`。
+它们控制首窗外观、初始语言和托盘启动策略，避免加载设置前短暂呈现错误状态。
+快照只读取一次，重组不重复磁盘 IO；SettingsModel 就绪后以模型值接管运行期行为。
+桌面始终以无初始窗口模式初始化，在 Runtime 进入 Running 后按启动快照决定是否创建主窗口。
+托盘启用且 `tray.start_minimized` 为 true 时，先启动无窗应用任务，等待最多两秒获取异步托盘可用性；
+可用且图标发布成功则保持隐藏，托盘激活后再创建主窗口；不可用或发布失败则打开主窗口，
+后续托盘刷新失败时也保留可见窗口。设置页仅在托盘启用时显示该开关；
+托盘停用时运行值与启动快照都为 false，只读查询不改数据库，重新启用托盘后恢复历史值。
+该 API 使用临时只读 SQLite 查询，兼容迁移前旧库；不存在的数据库不创建，损坏或无法读取的数据库明确
+报告失败并停止启动。其它设置仍按原异步流程 hydrate；启动内核等操作等待 SettingsModel ready，
+不为它们扩大同步读取范围。
+Lib-SQLite 的同步只读 API 已合入 `FarnaHerry/Lib-SQLite` 的 `farna/main`，
+各平台通过 CMake 获取同一固定 SHA，不能只改本地第三方源码。回归覆盖三种模式、首次启动、旧库、
+损坏库保留与原有多订阅迁移/重开保护；构建和自动化回归不代表真机首帧验收。
+
+主题页「模式」使用三个 48pt 高的横向矩形卡片（自动/深色/浅色），图标在左、文字在右；
+沿可用宽度共用一行，选中使用主色描边与淡染容器底色。
+「主题色」使用迷你界面预览卡，按当前深浅模式应用候选颜色的真实主题 tokens，展示背景、内容区、
+选中条目与主色按钮，选中对钩放在预览右上角；不显示颜色名称或 HEX，仅保留无障碍名称，预览内部不处理输入。
+预览与添加卡共用 160pt 宽、0.8 倍宽度的高度，Compact 宽 128pt；Flow 自动换行，
+右键编辑/删除、无障碍名称和即时写透沿用原入口。几何与表面集中在 `theme_color_card.h`。
+间距、圆角、图标尺寸、选中描边与切换时长取 ThemeSpec，页面特有尺寸集中为命名常量。`ui.theme_color` 使用稳定的 blue/purple/green/orange/pink/teal ID，
+自定义颜色使用规范化的 `#RRGGBB` 作为 ID，`ui.custom_theme_colors` 按换行保存完整列表；
+输入校验、去重和 HSB/HEX 转换集中在 `theme_colors.h`，缺省或未知值显示品牌蓝色。
+主题色卡片用 Flow 自动换行，添加/编辑共用 HSB（色相/饱和度/亮度）滑块、HEX 输入与实时预览；保存后即时选中。
+颜色值使用全局 MD3 Outlined 输入框，继承统一圆角、悬浮标签、焦点与校验样式，不局部覆盖 TextFieldStyle。
+Compact 的添加及右键编辑入口通过 NavigationStack 进入二级页面，覆盖底部导航，顶部返回/系统返回/手势共用 Pop，
+返回直接到主题页；表单独立滚动，添加/保存用标题栏右侧 FormHeaderAction 图标，FormPageContent 仅避让正文的底部系统安全区。
+页面进入后跨宽窄变化保留输入与页面身份，返回不提交；非 Compact 入口继续使用弹窗，两种形式共用编辑状态与保存逻辑。
+自定义颜色按深浅模式调整亮度，并选择对比度足够的按钮文字色。预设配对色集中在 `theme_colors.h`，切换通过 SettingsModel
+即时写透；主题色更新 primary/容器前景与焦点颜色，深浅模式共用选择且保留中性背景层级。
+
+## 通用操作菜单
+
+应用内同类弹出操作菜单统一使用 [action_menu.h](../src/ui/action_menu.h)，当前日志菜单、
+二级标签溢出菜单、订阅卡片操作菜单、主题色块右键菜单已接入。菜单项圆角、hover/press、禁用、勾选、图标、
+危险色、面板裁剪和留白都在该控件维护。长菜单使用框架 ScrollView，在浮层约束内滚动。
+
+```cpp
+auto menu = UseActionMenu(); // 每个独立入口各持有一个 handle
+Button("操作").With(menu.Anchor()).OnClick([menu] {
+    menu.Show({
+        ActionMenuItem("更新", [] { /* 更新 */ }),
+        ActionMenuSection{},
+        ActionMenuItem("删除", [] { /* 进入确认流程 */ }).Danger(),
+    });
+});
+```
+
+`Show()` 使用稳定入口锚点，右键坐标入口使用 `ShowAt(windowPoint, entries)`。点击菜单项
+先关闭面板，再调用操作；危险标记仅控制视觉，删除确认由调用方处理。描述可在事件中构建，
+所有样式及本地化解析在面板 Scope 内完成，不能在事件或任务中调用组合期 API。
+
+自定义多级 hover 菜单（日志级别/导出）直接共用 `ActionMenuItemView` 和
+`ActionMenuSurface`，子面板的生命周期和关闭动作由调用方管理；不要复制容器与菜单项样式。
+系统托盘是平台原生菜单，继续使用框架 MenuItem；Select 等框架输入控件不替换为这个组件。
+回归使用生产控件，覆盖日志 hover 子菜单、取消/外部关闭、标签选择，以及通用菜单禁用、
+勾选、锚点/坐标打开和长菜单末项滚动执行。
+
+## 代理分组抽屉
+
+代理页传入 `SectionTabPickerMode::ResponsiveGroups`，标签溢出时的箭头打开分组抽屉。
+方向使用框架响应式分类：Compact 从底部打开（框架 BottomSheet），Medium/Expanded 从右侧
+打开（窗口级 LayerController，360pt 宽、内容区高度）；不以编译平台决定方向。其它页面的标签选择
+仍使用通用操作菜单。窗口安装 `InstallSectionPickerLayers`，不要在组合期重复注册层服务。
+
+交互参考 [FlClash 分组选项](https://github.com/chen08209/FlClash/blob/main/lib/views/proxies/tab.dart)
+与 [响应式 sheet](https://github.com/chen08209/FlClash/blob/main/lib/widgets/sheet.dart)：分组使用可换行
+卡片，选中高亮，选择后关闭并写回同一受控分页索引。我们的保真度角标保持警示色。长内容
+由框架 ScrollView 滚动；关闭按钮、透明外部点击区域、Escape/系统返回都关闭当前抽屉，减少动态效果时
+关闭进入/退出运动。右侧运动使用保留 Offset 补间，不逐帧更新 State 或内容布局。
+
+自动化回归覆盖宽屏右侧几何、窄屏底部几何、窗口缩窄后改变方向、选择与标签同步、角标、
+外部点击关闭、标题栏仍可点击、取消键、右侧进入中间帧及矮窗口滚动至末项；这些检查不代表手机真机返回键验收。
+
+代理分组抽屉不叠加遮罩颜色；右侧抽屉通过 `SectionTabPickerInsets` 从桌面标题栏分割线下方开始，标题栏不被抽屉覆盖。底部抽屉仅局部覆盖 `BottomSheetStyle.scrim` 为透明，保留其它模态组件的样式。
+
+桌面窗口最小尺寸为 320 × 480 逻辑像素（`src/app.cpp` 的 `minimum_size`），默认启动尺寸仍为 1080 × 720。允许缩到手机竖屏尺寸并进入 Compact 视口；平台能力仍由平台判定，不能通过窗口宽度改变订阅编排权限。
+
+桌面 Compact（宽度小于 600）由 `responsive_shell.h` 切换为四项底部导航与页内标题；独立 40pt 窗口标题栏保留拖动和系统窗口控件。规则/连接/日志通过设置「更多」进入，返回设置时恢复底部导航。桌面窄窗打开新建订阅、编辑信息或编辑文件页时隐藏底部导航及渐隐层，返回或保存成功后恢复；显示状态由当前实际显示的订阅表单统一派生，窗口跨断点或切换一级页时同步更新，与 NavigationStack 的 push/pop 路径独立；内容容器 Key 与树路径保持稳定，越过断点不重挂载页面。桌面订阅编排、系统代理等能力不因窗口缩窄改变。
+
+订阅页在 Compact（手机与桌面窄窗）将「新建订阅」加号放在 `PillSearchField` 胶囊内部最右侧；有搜索内容时，清空按钮位于加号左侧。搜索框的外层 Scope 显式声明 Grow，Compact 搜索标题行不放 Spacer，避免两者平分剩余宽度；搜索表面在 Compact 下占满标题行可用宽度，保留骨架统一的两侧留白。仅桌面非 Compact 的 PillSearchField 通过 PageSearchFieldLayout 共用 320pt 宽度上限，外层高度固定 40pt，胶囊高度 34pt、上下各留 3pt；在非 Grow 内层限制宽度，外层 Grow 槽位预留标题与动作后随空间收缩，搜索条在槽位内居中，两侧空白留作窗口拖动。桌面宽屏搜索框聚焦时使用 Color::Transparent() 透出所在区域的真实背景，描边改用 primary；失焦后恢复 surface_container_highest 和 outline，不改变控件尺寸。该桌面规则同时覆盖一级页和二级页；移动平台（含宽视口）和桌面 Compact 直接返回原搜索控件，不添加居中容器，移动端保留 48pt 高度。PPTP 卡片移除批量勾选与页顶批量操作，卡片底部保留一个图标按钮：打开使用现有 play，关闭使用 pause，加载中使用 ProgressCircle；保留对应 Tooltip 和无障碍标签。连接或断开期间禁用，失败后允许重试，状态读取应用级 VpnModel，动作使用应用任务域。OpenVPN 统一作为普通来源，移除旧独立连接的勾选、批量动作和专用编辑器；Medium/Expanded 的加号继续位于窗口标题栏。入口复用同一个新建操作，不改变平台订阅能力或导入流程。新建订阅与各添加方式的配置表单复用二级页面骨架，紧凑页顶行保留返回与居中标题，创建/保存动作使用标题栏右侧 FormHeaderAction 图标，命中范围为 40×40pt；忙碌时保持位置与尺寸，禁用重复提交并提供忙碌语义。桌面窄屏新建页隐藏底部导航；移动端保留按添加方式进入的页面流程，FormPageContent 避让正文的系统导航区。返回键与标题栏返回使用同一动作。`test_page_transition` 的生产标题布局回归检查 320/420/600/960/1600pt 搜索表面的实际宽度、操作按钮避让与宽窄往返，以及普通/加载状态的标题中心；另检查移动端 48pt 高度、下方内容区域、输入/清空/添加及宽窄往返。
+
+Compact 胶囊导航共用 `CompactNavigationDock` 悬浮于页面内容之上，桌面窄窗与手机保持相同的最大宽度、圆角和边距。表面以 Telegram Android 的纯色回退为基准：`CompactNavigationSurfaceColor` 使用独立的导航目标色，深色取 `surface_container_highest`，浅色取 `surface_container_high`，Alpha 为 1。不透出未经模糊的卡片内容，不对整个导航施加 Opacity。HuxerUI 当前没有背景模糊/折射，本实现不声称完整玻璃效果。`CompactNavigationDock` 唯一维护底色、32pt 圆角、0.4pt 单色细描边与轻阴影（模糊半径 2.667pt、向下偏移 0.85pt）；描边强度取 Telegram 上下边缘的平均值，阴影色遵守项目的 `ThemeShadowColor` 约定。选中指示底板由 `CompactNavigationIndicatorColor` 使用 0.16 Alpha 的主题 `primary`，选中文字与图标也使用 `primary`，参考 hui-test 的淡主色选中态。导航最大宽度为 352pt，四个槽位等分可用宽度；选中胶囊宽度为槽位宽度减 12pt、最多 76pt，高度 50pt，垂直居中于 64pt 导航行。窗口缩放直接重新定位，首帧不播放入场动画。图标与文字保留普通色底层，选中色覆盖层通过框架 Opacity 在 0.2 秒内渐变；点击导航时选中胶囊使用与 hui-test 相同的弹簧（stiffness 240、damping_ratio 0.78）轻微越过目标后回弹，横滑翻页提交后使用 0.2 秒缓出配合 Pager 收敛。反向改选由保留的 MotionController 从当前位移与速度继续，减少动态效果时直接切换。各导航项显式使用空 `Indication` 覆盖 `OnClick` 默认指示层，不显示悬停、按压或点击波纹，点击仍切页并移动选中胶囊。页面容器延伸到视口底边（Compact 含系统安全区，桌面也不保留骨架底部间距）；滚动内容通过 `CompactFloatingNavigationFooter` 留出导航避让，末项可滚到胶囊上方；首页启动按钮在窄窗避开导航，代理页桌面网格尾部为悬浮测速按钮保留 80pt 净空。
+
+
+胶囊下方的全宽渐隐层使用页面 base（`surface_container_low`）颜色，从 64pt 导航行的水平中线向下开始，上半部与胶囊上方不覆盖内容；默认渐隐高度为 40pt，并通过与导航相同的 `SafeAreaPadding` 加入底部安全区。覆盖从透明缓慢增加，到视口底边为 0.68，不进行模糊或滚动状态采样。渐隐层与导航同时显示/隐藏，位于内容之上、导航之下且无输入修饰符。生产壳层回归检查宽窄切换及 0/24/48pt 底部安全区下的实际起点与底边。
+
+紧凑编辑/添加页共用 `FormHeaderAction` 和 `FormPageContent`：主操作固定在标题栏右上角，正文独占剩余高度并独立滚动，只对正文避让底部系统安全区，不再放底部提交按钮。软件键盘缩短平台视口时，正文随可用高度调整，标题与操作图标保持顶部位置。订阅、个人/全局规则、规则集、网站测试、颜色及网络表单使用同一约定；网络设置有「保存并应用」时，保存图标打开两项动作菜单。共享表单不声明 PageTransition；动画仅由真正进入 NavigationStack 的 route 页面声明。生产布局回归覆盖短/长表单、滚动末项、320/390/420pt 宽度、键盘视口缩短/恢复、0/24/48pt 底部安全区、图标点击与忙态禁止重复提交。
+
+## 空状态占位
+
+页面、分区与列表编辑区域无内容时统一使用 `src/ui/empty_state.h` 的
+`EmptyState(message, icon)`，不自行拼接 Text/Column 或套空卡片。
+组件在可用内容区域内水平、垂直居中：48pt 语义图标、12pt 图文间距、统一 Body 字号和
+`on_surface_variant` 颜色；四边留白 24pt，文字内容最大宽度 360pt、居中且自然换行。
+窄屏遵循实际可用宽度，有界区域使用 Grow，滚动内容或弹窗可由调用方指定高度。
+现有提示文字及页面动作入口保留；首页卡片中的字段缺省值、选择器帮助说明和菜单禁用项
+不属于空页面占位。组件用 Scope 延迟读取主题，供弹窗与懒加载工厂安全复用。
+
+## 文件拖入选区
+
+「拖入或点击选择文件」的输入区域统一使用 `src/ui/file_drop_zone.h` 的
+`FileDropZone(icon, title, picked_path, tasks, toast, picker, filter, key)`，
+定义在 `common.cpp`，不自行拼接 Column/FileDropTarget。外观跟控件族：
+圆角 `theme.shapes.small`、常态 `surface_container_high` 底加 `outline_soft`
+描边，拖入悬停切换 `primary_container` 底、`primary` 强调描边与
+`on_primary_container` 文字；未选择时副行显示 `filter.name`，选中后主行显示
+文件名、副行显示完整路径。交互契约：`FileDropTarget` 按扩展名整批校验外部拖入
+（要么全收要么拒绝，失败 toast），点击仍走 FilePicker 并复用
+`PickProfileConfigFile` 的错误反馈——键盘、触摸与不支持拖入的宿主依赖该等价
+入口。`picked_path` 由调用方持有并回写，导入与解析不在控件内进行。
+
+## 运行诊断与按钮可读性
+
+全局按钮样式通过 `ResolveFluxButtonStyle` 同时设置正常态与禁用态；禁用底色和文字
+从当前主题 `on_surface` 派生，不沿用 `ButtonStyle` 默认的深色标签。
+辅助操作使用 `ResolveFluxSecondaryButtonStyle` 的中性表面，主操作保留品牌色。
+运行诊断入口在 Compact（含桌面窄窗）通过统一 NavigationStack 进入二级页，覆盖底部导航，标题返回、系统返回和手势共用 Pop；宽屏仍使用弹窗。页面内容填满可用区域，不沿用弹窗的固定宽度和高度上限，也不重复显示标题或关闭按钮；输入状态由页面保留，进入后跨宽窄变化保持页面身份，报告、采集和导出由原应用级模型/任务域持有。诊断未生成报告时只显示说明，采集中显示进度，结果使用等宽文字和有界滚动区；
+外层可滚动以适应较矮窗口。导出与运行操作分组，通过 Flow 在窄屏和英文下换行。
+取消仅在采集中出现；无报告、采集中或不支持保存时相应导出操作禁用；
+保存中显示状态并阻止重复保存，复制成功或失败通过 toast 反馈。
+
+## 圆角阶梯与密集卡片
+
+订阅卡片在 Compact 使用 `profile_card_layout.h` 的 `kCompactProfileCardHeight`（108pt）与 `kCompactProfileCardSpacing`（6pt），宽屏继续 180pt；宽屏地址行只显示域名或 IP 及显式端口（IPv6 保留方括号），省略协议、用户信息、路径、查询参数和片段，卡片与拖动预览共用格式化；异常地址显示「—」，原始订阅地址保持原样用于编辑/下载。实际卡片、VirtualGrid 行高估算与拖动预览共用 `ProfileCardHeight`；预览宽度取来源槽位。窄屏保留名称、进度条下方左对齐的最后更新相对时间（如「更新于 5分钟前」「更新于 2小时前」，缺失显示「未拉取」）、简写参与状态、更多菜单、流量/到期文字与 3pt 进度条，隐藏链接、刷新按钮、描述和自动更新频率；更新入口仍在共用菜单，忙态用小型指示器表达。宽窄卡片的更新时间均在进度条下方左对齐，独占底部 16pt 槽位，拖动预览和骨架同步；宽屏保留参与状态，移除自动更新间隔提示，自动更新设置与调度照常生效。流量和到期文字各占固定槽位，缺失留空，无流量总额时进度条按宽屏逻辑满格。名称按分配宽度省略并保留完整语义/提示，空文字不创建 Tooltip。PPTP 同高，保留服务器、连接状态与开关；路由及 Windows 单连接说明在编辑表单查看。宽窄切换保留平台能力、菜单、拖放与虚拟滚动。
+
+订阅首份快照未就绪时使用 `ProfileLoadingSkeleton`，与实际列表共用 `ProfileGridColumns`、`ProfileCardHeight`、`ProfileCardRowSpacing` 和分页半间距；桌面宽屏以 340pt 最小列宽自适应，Compact 单列高 108pt、行距 6pt，手机宽视口继续单列。骨架按实际卡片的 10pt/8pt 内边距组织标题、流量和进度条，Compact 保留悬浮导航尾部避让；加载与就绪状态沿用同一搜索标题和页面骨架，不显示临时空状态。
+
+订阅响应头 `subscription-userinfo` 明确包含空的 `expire=`、`expire=0` 或 `expire=-1` 时，使用现有有符号 `expire_at` 列的 -1 表示长期有效；宽窄卡片及拖动预览在到期槽显示「长期有效」。正数仍显示到期日期；缺失或畸形值保持 0（未知），不推断永久有效。旧记录在下一次成功刷新时识别，保留现有数据、文件和 SQLite schema，不把历史 0 批量改成长期有效。
+
+策略组下拉选择器的条目直接复用 `selectable_tile.cpp` 的 `SelectableTile`，与代理节点/订阅卡片共用选中底色、前景色、主色描边、圆角及交互；右侧抽屉与底部抽屉使用同一内容，保留紧凑 Flow 排布、角标和选后关闭行为。
+
+所有页面的卡片描边线宽集中在 `src/ui/theme_colors.h`：
+`kCardOutlineWidth` 用于普通卡片和对话框卡片；
+`kCardSelectedOutlineWidth` 用于可选条目的选中描边；
+`kCardEmphasisOutlineWidth` 用于文件拖入悬停与订阅拖动预览；
+`kCardStrongOutlineWidth` 用于订阅放置目标与主题色选中卡片。
+桌面普通与悬停/拖动预览为 0.5pt，选中与强强调为 1pt，并结合描边颜色与底色表达状态；
+手机保留原来的 1/1.5/2pt 档位。订阅大卡片单独使用 `kSubscriptionSelectedOutlineWidth=2pt`，
+通过 `SelectableTileStyle::Subscription` 应用于实际卡片与拖动预览；其它可选条目仍为 1pt。页面不单独指定卡片线宽，
+`Card` 只允许用 `outlined=false` 关闭描边。无描边的 `DenseCard` 和未选中条目
+继续靠底色区分；按钮、输入框、单选圈和键盘焦点环使用各自控件样式。
+
+首页网格及桌面运行状态卡共用 `HomeCardSurface`：raised 底色、nested 圆角、无描边。
+手机与桌面窄窗标题栏的猫咪运行卡同样无描边，保留固定 48pt 标题槽和既有切换动画。
+鼠标悬停以 5% primary 色在内容下方淡入，移出淡出；使用框架 Indication，不占布局、
+不添加整卡点击动作，卡内开关和按钮维持独立命中。按下时缩至 98.5% 并下移 1pt，
+松开或取消后用弹簧回到原位；只观察指针，不夺取子控件/滚动所有权，reduced motion 关闭位移动画。
+
+首页普通卡片支持鼠标双击/触控双击显示彩蛋，再双击返回；`home_card.h` 的 `HomeCardSurface` 使用框架 MultiTapGesture 和 `Transition` 对实时内容做 200ms、0.96→1 的轻缩放淡入，卡片外框与 HomeGrid 占位不动。移除整卡 SharedBounds 快照、侧边收窄和光照层，不逐帧写 State，快速反向直接从当前进度转向最新目标。正反面子树保留挂载，以透明度控制绘制；隐藏面禁用输入并退出无障碍树，彩蛋面另有输入隔离层，防止正面子控件重新启用后穿透。减少动态效果直接切换，结束后停止额外帧。每次从正面进入彩蛋时，从 `home_easter_eggs.h` 的公共池抽取并保留当前卡片选择；返回不重抽、不持久化。目前池中仅有 HuxerUI 官方作者 `FinalScave` 的 GitHub 主页（https://github.com/FinalScave），只在用户点击入口时打开；旧的按卡片类型跳转连接/日志/订阅/设置菜单不再作为彩蛋。启动/运行猫咪控制卡显式关闭此能力。
+
+圆角自上而下共用一套阶梯（`IslandTheme` + 主题 ShapeScheme）：一级岛
+`island_radius` 22pt → 卡片/二级岛 `nested_radius` 14pt → 控件
+`theme.shapes.small` 8pt → **密集内容卡 `dense_radius` 4pt**（日志行等
+高密度表面）→ 同心下限 4pt。高密度列表（日志页等）统一使用 `DenseCard`
+（`common.cpp`，声明见 `ui.h`）：dense 圆角 + 减半内边距（island_padding/2）
++ raised 表面、无描边；不要再为密集场景单独手拼圆角或把 `Card` 的
+`nested_radius` 调小。
+
+密集卡圆角与每卡底部外边距共用 4pt 密度档；调整时必须同步修改间距及
+`VirtualList::EstimatedItemExtent`，估算包含减半内边距×2、单行文本和底部外边距。
+日志与连接列表都保留这一联动，不能只改圆角。
+
+内容与外框统一使用主题层级：标题栏、一级侧栏与窗口外框用 `colors.background`，
+`PageScaffold` / `SecondaryPageScaffold` 的内容区域用 `IslandTheme::base`
+（`surface_container_low`），页内卡片沿用 `raised`（`surface_container`）。
+深浅模式都遵循「外框较亮 → 内容区较暗 → 卡片再次提亮」；Compact、宽屏和二级页共用此规则，
+不在页面分别硬编码颜色，不新增外层卡片或阴影。
+
+浅色层级：外框 `#FAFAFB`、内容 `#F1F2F4`、普通卡片 `#FEFEFF`、未选中可选卡片 `#FAFAFB`。深色层级：外框 `#1A1B1C`、内容 `#141516`、普通卡片 `#1E1F20`、未选中可选卡片 `#242526`。选中卡片保留品牌色。
+
+输入框（TextField）经窗口根部的 `WithUnifiedFieldStyle`（`app.cpp`）全局对齐下拉
+触发框：圆角与高度 `theme.shapes.small` + 48pt、文字 `body_medium`、垂直内边距置零
+（占位符/文字/光标在完整框内居中，悬浮标签骑在边框上）。不要在页面单独覆盖
+`TextFieldStyle`；搜索胶囊 `PillSearchField` 的局部覆盖（去描边/透明底）在该全局
+样式之上生效。
+
+## 界面文案与字符串资源
+
+`Localized()` / `LocalizedFormat()` 把源文案按 FNV-1a-64 哈希到
+`resources/strings/{default,en,zh}.properties`（default/en 为英文、zh 为中文，按
+msg id 排序）。**新增或修改界面文案必须同步这三张表**：漏了不在编译期报错，而是
+文案首次组合时（含 tooltip、占位符、悬浮标签等懒渲染路径）直接抛 `std::logic_error`
+终止进程。排查：对 src/ui 全部字符串字面量按同算法哈希对照资源表，三元表达式与
+数组间接来源（`Localized(kXxx[i])`）也要核对；源码里相邻字面量拼接按拼接后的
+完整串核对。
+
+## 主题颜色审查（2026-10-04）
+
+颜色集中配置入口为 `src/ui/theme_colors.h`：`FluxDarkColors()` / `FluxLightColors()`
+定义 ColorScheme，成功/警告语义色也集中在该文件。首页流量与流量统计共用
+`ResolveTrafficColors()` 的上传橙/下载蓝，分别适配深浅模式，独立于强调色与警告语义色；
+曲线、圆环、方向标识及速率/占比文字共用方向色，下载面积填充从下载色派生透明度。
+`FluxThemed` 只将角色色映射到组件样式，
+页面从 `UseTheme()` 读取角色色；阴影统一通过 `ThemeShadowColor(theme, opacity)`
+读取当前主题 scrim 色相，删除按钮文字用 `OnErrorColor(theme)`，危险按钮继承当前 ButtonStyle。
+Logo 容器底色使用 surface，不再固定白色。页面代码不再直接写 RGB/白色/黑色。
+
+明确保留的例外是 `profiles_page_support.cpp` 的二维码绘制：固定白底、近黑模块用于扫描对比，
+属于编码图像而非界面主题。订阅卡片右键新增独立的「通过 QRS 码分享」：把完整订阅配置按
+QiFi/QRS 的 LT 帧格式编码为循环播放的多帧二维码，分享弹窗只显示二维码，不显示名称、URL
+或操作按钮；Android 扫码页连续取帧并重组，也支持从相册选择图片，共用同一 QRS 累积器，
+普通单帧二维码仍走即时识别，交互与取消边界见[二维码扫描](qr-scanning.md)。PNG/SVG Logo、
+托盘及启动图标是资源素材，遵循各自平台图标约定。
+布局尺寸、动画时长、交互透明度及文字角色仍是控件参数；本次没有将所有几何常量改成颜色变量。
+主题选择由 SettingsModel 写透驱动，首帧同步读取保存的模式与强调色。
+自动模式在组合期通过 HuxerUI `UseSystemThemeBrightness()` 观察当前窗口宿主，系统变化触发重组；
+手动深浅模式使用显式调色板，不随宿主变化。主题设置页在组合期读取宿主亮度并按值捕获，
+点击回调不得调用组合期 hook。`IsDarkTheme()` 使用 `ThemeSpec::brightness`，不从背景色反推；
+自定义调色板从对应的 Material 深浅 ThemeSpec 工厂派生，测试夹具也必须保持颜色与语义一致。
+主程序和 Windows 安装器共用框架的系统外观渠道，不再自行读注册表、执行 defaults/gsettings 或维护 Android JNI 主题缓存。
+Linux portal 首次异步结果到达前按框架契约回落浅色；Android 的宿主配置变化与 Force Dark 处理由框架负责。
+
+普通单色 SVG 由 Image.Tint 或 IconButton/NavigationPane 的主题前景色着色；源码中黑色路径不等于运行时固定黑色。回归 `page_transition` 增加已挂载 EmptyState 的浅色→深色→浅色点击切换，检查实际文字绘制颜色。
+
+## 正式 Logo（出箱 demo 造型）
+
+当前界面采用 `clash_flux_logo_vector_dark_current.svg` / `light_current.svg`，保持 32pt、
+透明背景和相同几何。单中线与前盖相连，补全后盖透视和箱内壁，尾巴根部位于箱内。
+母版为 `assets/branding/logo.svg`；派生 PNG、托盘及平台图标通过
+`python3 scripts/generate-branding.py` 统一生成，`--check` 核对生成结果。
+`./demos/box-cat-demo/run-demo.sh --brand-preview` 在独立 HuxerUI 窗口挂载正式资源的
+深浅版本与小尺寸预览，不启动主程序。旧主 PNG 备份位于 `docs/branding/legacy/`。
+Windows 原生预览使用 `./demos/box-cat-demo/run-demo.ps1 -DemoArguments '--brand-preview'`；
+只编译使用 `-BuildOnly`，不依赖 WSL。具体命令见 demo README。
+
+## 界面 Logo 历史试验（资源保留）
+
+界面 Logo 按当前 ThemeSpec 切换：浅色继续使用原 `resources/images/clash_flux_logo.png`，
+深色使用新增 `resources/images/clash_flux_logo_dark.png`（浅灰透明 PNG）。移除 Logo
+后面的表面色底板，保留相同尺寸、布局与原图。深色图由 imagegen 基于原图生成，
+提示为仅将黑猫/盒子形状改为浅灰、保留透明眼孔和轮廓；它是独立资源，不覆盖原图。
+两张方案预览继续保留在生成目录；应用/启动图标与托盘资源不跟随此次 UI 切换修改。
+
+历史方案 3：浅色使用 `resources/images/clash_flux_logo_outline.png`，
+黑猫/盒子保持暗色，边缘加浅灰描边、背景透明。该资源由 imagegen 基于原图生成，
+提示为仅增加细浅灰描边、保留形状和透明间隙。原 `clash_flux_logo.png`、方案 2 的
+`clash_flux_logo_dark.png` 和两个预览均保留，不覆盖应用图标、启动图标或托盘素材。
+
+深色内部填色试验资源 `resources/images/clash_flux_logo_outline_dark.png` 保留，但不再用于
+界面：实际小尺寸截图显示生成描边含杂点，细线缩小后难以辨认；白猫与白色圆形底托
+也未采用。深色模式试用手工绘制的 `clash_flux_logo_vector_dark_refined.svg`：黑猫与盒子为
+暗色实心路径、连续浅色轮廓与不透明浅色眼睛，没有底托。路径简化以适配 32pt 小尺寸，
+不是原 PNG 的逐像素描摹；SVG 保留多色填充，不使用整体 Tint。浅色使用相同路径的
+`clash_flux_logo_vector_light_refined.svg`：黑猫、盒子与接近浅色背景的轮廓及浅色眼睛。
+深浅模式均为透明背景 SVG、32pt，相同 viewBox 和路径保证切换时形状与大小一致。
+随 ThemeSpec 自动切换，原图、生成试验与方案 2 资源均保留。
+
+矢量初版 `clash_flux_logo_vector_dark.svg` 保留用于对比。精细版调整耳尖、脸颊和尾巴的
+贝塞尔曲线、盒子面板的真实折叠边缘与微圆角，描边从 3.2 缩至 2.6 个坐标单位，
+减少中心接缝拥挤；各路径有独立 ID，便于在矢量编辑器内继续调整。
+
+HuxerUI 的 `Image.Tint` 仅支持矢量图，PNG 调用会在启动时抛出异常。
+位图 Logo 通过选择对应资源适配主题，不能套用单色 SVG 的 Tint 路径；必须实际启动 GUI 验证。
+
+2026-10-04：订阅 URL 导入结果不能由表单所属的短生命周期 TaskScope 持有。
+`profile_import_task.h` 的 `LaunchProfileImport` 使用应用任务域，让后台已完成的持久化
+导入在页面重建/卸载后仍有结果回传；先统一清除 busy，再调用成功或失败回调，异常
+转为失败结果，重复点击不会创建第二个任务。桌面导入弹窗、独立 URL 表单及 URL
+快捷入口使用该生产封装。选文件/相机/导航动画保持原页面生命周期。
+`test_page_transition` 增加视图卸载后的完成、异常结束 loading 和失败后重试回归。
+本次根据正在运行的 GUI 成功订阅行与后台线程空闲定位完成阶段；没有删除或重导入
+用户已有订阅。正在运行的旧 GUI 需要重启才会使用重编译后的回调。
+
+日志页不再按应用/内核分区，两类历史与推送增量合并为一个按 Unix 秒排序的列表，同秒按 UI 接收顺序排列（不声称跨来源精确事件顺序），仅保留最新 800 行。stdout/stderr 使用接收时间排序并保留原文。搜索、级别筛选、剪贴板与文件导出共用列表，文件默认名为 `clash-flux.log`；清空统一缓存及 `core/logs.log` 文件。两种写入口共用同一日志存储，直接启用新文件，不迁移或读取旧 `app.log` / `kernel-ui.log`；内核进程自己的 stdout/stderr 文件仍供生命周期诊断使用。页面直接使用单个 VirtualList，保留 Compact 滚动尾部避让。
+
+配置保真度使用独立二级页面 `fidelity_page.cpp`，从每个配置卡片的右键菜单进入，Compact/手机的卡片「更多」菜单共用同一入口，设置页不再提供入口。菜单传入稳定 profile ID，页面任务在线程池只读该文件并独立编译报告，不启用配置、不下载、不发布运行/预览映射。标题显示配置名称，读取/编译错误明确显示并保留部分保真度记录；PPTP 明确提示暂不提供此报告，OpenVPN 普通来源使用同一编译器报告。内容使用 VirtualList 展示完整明细，空记录不声称全部能力保真；左右留白和桌面宽窗标题栏/返回按钮都交给 `SecondaryPageScaffold`，页面不再单独画头部或加水平偏移。Compact/手机覆盖底部导航，返回直接父级配置列表；桌面切换一级页时由导航栈统一清理二级路径。
+
+新建订阅的桌面弹窗与桌面窄屏页面共用 `ProfileCreatePage`；窄屏页隐藏底部导航，表单滚动区下方固定全宽创建按钮并使用保存图标。移动端按添加方式继续进入
+`ProfileCreateMethodPage`，创建按钮同样固定在二级页底部；保留移动端的方法选择流程。两者均通过普通来源入口导入 JSON/YAML/.ovpn。
+OpenVPN 不再拥有创建类型/单独创建字段，直接配置的专用 VPN 表单仅保留 PPTP。
+文件选择器支持 `json/yaml/yml/ovpn`，名称在组合期解析为拥有型 DTO。
+旧 OpenVPN 独立连接兼容已移除，不进行记录迁移或数据库清理；只有 PPTP 保留独立连接界面。
+Clash YAML 的规则编辑能力由应用级订阅泵在任务线程按内容识别，卡片只读能力快照；
+订阅卡片右键的「编辑规则」在 Medium/Expanded 打开规则弹窗，Compact 进入该订阅的独立
+二级编辑页；编辑信息、编辑文件、编译 JSON 预览同样按视口分派：宽屏弹窗、窄屏二级页，
+两种形式共用字段、快照和保存逻辑。Clash YAML / 原生 JSON 的个人规则
+独立持久化并直接编译 JSON，不再由订阅编辑器回写 rules 文本。规则页只读：仅保留
+「订阅规则 / 全局规则」两个分区，展示当前主订阅的实际规则和已保存全局规则，不提供搜索、
+原始/生效/个人视图切换、规则集分区或行内编辑；全局规则从页头进入独立管理二级页。
+全局策略读取等待订阅模型 loaded；保存使用应用任务域，离开规则页不取消在途提交。
+订阅页的原生连接初始化同样以 loaded 为 Lifecycle 依赖：首帧不提前调用 VpnStore，
+hydrate 后再初始化；worker 异常转成反馈，不能逃逸到顶层 Task 而终止 Runtime。
+工作线程将错误作为拥有型结果返回，连续编辑沿单飞/待保存机制提交最新列表。
+实际 SQLite 存储与 hydrate 重试契约见[订阅编排](desktop-subscription-orchestration.md#当前-sqlite-存储与加载)。
+订阅规则在所有视口共用紧凑的一行来源/查看模式/更多工具栏，以及主要字段一行、状态一行的规则条目；
+不再保留固定宽度状态列。长字段按真实分配宽度省略，缩放保留来源、模式与虚拟列表滚动；
+JSON 预览在 Compact 进入独立二级页，文档填满剩余高度。具体行为见下方「订阅个人规则」专题。
+2026-11-03 按新的产品决定增加「设置 → 资源」二级页，复用旧 `rules.resources`，
+保留 ID 与所有引用。支持原生 JSON/SRS 的添加/导入、详情/引用、编辑、删除保护；
+全局/订阅个人规则编辑器可选择规则集。宽屏表单弹窗，Compact push 独立编辑页，
+返回直接父级；桌面非 Compact 的资源列表限宽居中。原生远程更新仍归 sing-box，
+手动强制下载只在桌面提供，未运行/未引用时明确报告下次引用下载，不伪造进度。
+订阅卡片的「外部资源」按实际 kind 显示规则集/代理提供者/Geo；不显示订阅名、
+底部识别数量及宽窄标题栏刷新。行尾为单项刷新/进度；受支持 Geo DAT/MMDB 可刷新并显示缓存状态；应用模型维护在途身份，
+离页不取消提交，同资源防重复。下载与候选检查在任务线程，来源被修改拒绝过期响应，
+失败保留旧缓存。完整所有权、原生更新与平台边界见[资源契约](subscription-personal-rules.md)。
+复杂原规则只读，支持的简单条件可替换/禁用/恢复；高级文件编辑继续修改原文，并提示远程更新会覆盖改动。
+
+规则页订阅大表由任务线程构建不可变 shared_ptr 快照，回 UI 只发布一次，不逐条 PushBack。只读页面不再维护搜索/视图筛选索引；虚拟行 factory 直接消费最终 effective 规则。运行态投影位于独立挂载的轻量副作用 Scope，仅参与来源或目录真的变化时通知行，流量统计不触发规则整页重建。全局规则由应用级 `GlobalRulesModel` 共享已接受版本与编辑草稿，离页保留未保存修改，过期加载/保存不得覆盖新编辑；回归覆盖实际规则列表、滚动保留、规则二级编辑页返回及 ABA/在途保存。
+
+深层 Row/Column 的 Grow 子树在主轴有界、拉伸交叉轴已确定时，不应先做一次无用的松约束测量；这会随嵌套深度重复整个虚拟列表的测量路径。该修复维护在 HuxerUI fork 的 farna/main，应用仅升级固定 SHA，不在页面或 CMake 打框架补丁。框架 stretch_layout.cpp 覆盖 Row/Column 深层测量次数、窗口缩放、固定项与加权 Grow、松约束自然尺寸和大虚拟列表滚动。
+
+2026-10-19：运行控制由 `core_control.h` 的 `UseCoreControl()` / `CoreControl::Run()`
+统一接入 `CoreModel`。首页、设置页和托盘共用命令目标、单飞状态、应用任务域、权限
+提示和操作后回读；模式切换不再等页面轮询，启动/停止/重启检查真实结果。桌面自启在
+服务同步后调用同一启动动作；服务维护和退出清理仍有各自的生命周期。
+
+`CoreView` 区分 TUN/模式/系统代理意图和实际数据面/系统状态。Android VPN 状态与
+电池豁免由应用泵采集，页面不再分别轮询，授权等待保留在应用任务。版本检查先于
+轮询发布，拒绝跨操作/同步设置修改的旧结果，包括命令前后值相同的 ABA 情况。
+网络表单统一经 `ParseInboundPorts` / `CoreStore::saveNetworkSettings` 校验与提交，
+SettingsModel 发布完整网络快照，LAN/IPv6 不再即时写入；环境 shell 保留独立模型入口。
+系统代理和复制变量使用真实运行端口；保存与保存并应用的语义见[首页网络设置](home-network-settings.md)。
+
+回归使用 `test_page_transition` 中的生产操作门禁与端口校验：跨入口互斥、旧结果与
+ABA 拒绝、发起控件实际卸载/窗口缩放后的应用任务完成、失败释放 pending 与重试。
+这些无窗口测试不代替 Android 授权/后台恢复或 Windows 服务的实机验证。
+首页布局按用户要求单独回退：恢复原有卡片顺序、默认跨度与从左上空位紧凑
+填充的网格；桌面窄屏也保留系统代理/TUN 两张独立卡片，取消订阅/统计卡片
+在 Compact 的整行扩展。共享运行控制与新版圆角饼图继续保留。
+桌面系统代理/TUN 卡片用齿轮 IconButton 取代原说明文字槽，Medium/Expanded 打开
+对应设置弹窗，Compact 经统一 NavigationStack 进入二级页。系统代理共用入站端口
+及高级监听表单，TUN 共用统一网络表单；原接管开关与 CoreControl 命令不变，
+宽窄切换保留二级页身份，标题返回、系统返回和手势共用 Pop。
+手机保留只读隧道状态和 VPN 悬浮按钮。步骤 5 的其它调整保留：设置页移除日常模式、代理/TUN/VPN、
+普通启停入口，按通用、网络、运行与维护（Android 为后台运行）、关于分区；
+网络保留端口/LAN/IPv6/桌面环境变量，维护保留版本、运行中重启与服务管理。
+所有动作继续走同一模型。配置页只负责来源与规则，不写全局接管状态。
+
+首页圆环使用 Lib-Charts `5fcdc5a` 的 `rounded_caps`，中心百分比与悬停动画由库
+统一绘制，应用不覆盖静态中心文字；桌面/Android 共用 Lock.cmake 的固定提交。
+连接列表改为 DenseCard：4pt 底部间距，估算高度含内外留白，仍按稳定连接 ID
+虚拟化并在挂载后的 Scope 中解析资源。
+
+步骤 5 验证（2026-10-19）：Linux 目标/HCG 与 `./run.sh --version` 通过；
+17 项 `clashflux-required` 回归通过。独占测试数据下实际打开首页/设置页，检查
+中英文、320/390pt 窄窗、宽窗、宽窄往返及滚动；空流量圆环正常绘制。另启动
+sing-box 1.14.2，保持两条真实 HTTP 代理连接，在连接卡片页执行
+320→900→390pt 缩放，无崩溃且条目仍展示。未开启系统代理/TUN或安装服务。
+Android 仅验证 arm64-v8a native 编译，未据此声称 APK/真机验收完成。

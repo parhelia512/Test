@@ -1,0 +1,990 @@
+package dev.farna.clashflux;
+
+import android.Manifest;
+import android.content.ActivityNotFoundException;
+import android.content.ComponentName;
+import android.content.Context;
+import android.content.Intent;
+import android.content.ServiceConnection;
+import android.content.pm.PackageManager;
+import android.net.Uri;
+import android.net.VpnService;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.IBinder;
+import android.os.Looper;
+import android.os.PowerManager;
+import android.os.RemoteException;
+import android.provider.Settings;
+import android.util.Log;
+
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.RandomAccessFile;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLConnection;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
+import java.security.SecureRandom;
+import java.security.cert.X509Certificate;
+
+import org.json.JSONObject;
+
+import org.huxerui.HuxerUIActivity;
+
+
+public final class MainActivity extends HuxerUIActivity {
+    private static final String TAG = "ClashFlux";
+    private static final int REQUEST_VPN_CONSENT = 4001;
+    static {
+        Log.i(TAG, "Loading application native library: " + BuildConfig.HUXERUI_APP_LIBRARY);
+        System.loadLibrary(BuildConfig.HUXERUI_APP_LIBRARY);
+        Log.i(TAG, "Application native library loaded");
+        installCrashLogger();
+    }
+
+    private static volatile MainActivity current;
+    private static volatile Context applicationContext;
+    private static volatile IClashRuntime runtimeControl;
+    private static volatile boolean runtimeProcess;
+    private static volatile int runtimeCoreState;
+    private static volatile int runtimeVpnState;
+    private static volatile String runtimeMessage = "";
+
+    private static native void nativeInit(String filesDirectory, String nativeLibraryDirectory);
+    private static native void nativeStartCore();
+    private static native void nativeVpnStartCancelled();
+    private static native void nativeVpnStartFailed(String message);
+    private static native void nativeAppLog(int level, String message);
+    private static native void nativeCoreLog(int level, String message);
+    private static native void nativeUpdateRuntimeState(
+            int coreState, int vpnState, long vpnElapsedMs, long uploadRate, long downloadRate,
+            long uploadTotal, long downloadTotal, int connections, String message, String clashMode);
+    private static native void nativeClearTunPreference();
+    private static native void nativeUpdateRuntimeHealth(long epoch, long generation, long sequence,
+            long age, int repairs, boolean connected, boolean available, String state);
+    private static native void nativeRuntimeBinderAvailable(boolean available);
+
+    /**
+     * Fetch a remote subscription on a worker thread. The optional trust
+     * override is applied only to this request's HTTPS connections; it never
+     * mutates Android's process-wide TLS defaults.
+     */
+    public static Bundle fetchProfile(String address, int timeoutSeconds,
+                                      boolean allowInvalidCertificate) {
+        return fetchProfile(address, timeoutSeconds, allowInvalidCertificate, 0L, false);
+    }
+
+    public static Bundle fetchProfile(String address, int timeoutSeconds,
+                                      boolean allowInvalidCertificate, long maxBytes,
+                                      boolean forceDirect) {
+        return fetchProfile(address, timeoutSeconds, allowInvalidCertificate,
+                maxBytes, forceDirect, new String[0]);
+    }
+
+    public static Bundle fetchProfile(String address, int timeoutSeconds,
+                                      boolean allowInvalidCertificate, long maxBytes,
+                                      boolean forceDirect, String[] requestHeaders) {
+        Bundle result = fetchProfileWithUserAgent(address, timeoutSeconds,
+                allowInvalidCertificate, maxBytes, forceDirect, requestHeaders,
+                ProfileHttpPolicy.DEFAULT_USER_AGENT);
+        if (ProfileHttpPolicy.shouldRetryWithClashMeta(
+                result.getInt("status", 0), maxBytes, requestHeaders)) {
+            return fetchProfileWithUserAgent(address, timeoutSeconds,
+                    allowInvalidCertificate, maxBytes, forceDirect, requestHeaders,
+                    ProfileHttpPolicy.CLASH_META_USER_AGENT);
+        }
+        return result;
+    }
+
+    private static Bundle fetchProfileWithUserAgent(
+            String address, int timeoutSeconds, boolean allowInvalidCertificate,
+            long maxBytes, boolean forceDirect, String[] requestHeaders,
+            String userAgent) {
+        Bundle result = new Bundle();
+        HttpURLConnection connection = null;
+        try {
+            if (requestHeaders == null || requestHeaders.length % 2 != 0) {
+                throw new IOException("下载请求头格式无效");
+            }
+            URL target = new URL(address);
+            int timeoutMillis = (int) Math.min(Integer.MAX_VALUE,
+                    Math.max(1L, (long) timeoutSeconds) * 1000L);
+            long deadlineNanos = System.nanoTime()
+                    + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+            SSLContext permissiveTls = null;
+            if (allowInvalidCertificate) {
+                permissiveTls = SSLContext.getInstance("TLS");
+                permissiveTls.init(null, new TrustManager[]{new X509TrustManager() {
+                    @Override public void checkClientTrusted(
+                            X509Certificate[] chain, String authType) {}
+                    @Override public void checkServerTrusted(
+                            X509Certificate[] chain, String authType) {}
+                    @Override public X509Certificate[] getAcceptedIssuers() {
+                        return new X509Certificate[0];
+                    }
+                }}, new SecureRandom());
+            }
+
+            for (int redirects = 0; ; redirects++) {
+                String protocol = target.getProtocol().toLowerCase(Locale.ROOT);
+                if (!"http".equals(protocol) && !"https".equals(protocol)) {
+                    throw new IOException("订阅下载仅支持 HTTP 或 HTTPS URL");
+                }
+                URLConnection opened = forceDirect ? target.openConnection(java.net.Proxy.NO_PROXY)
+                                                  : target.openConnection();
+                if (!(opened instanceof HttpURLConnection)) {
+                    throw new IOException("订阅 URL 不是 HTTP 连接");
+                }
+                connection = (HttpURLConnection) opened;
+                connection.setInstanceFollowRedirects(false);
+                connection.setUseCaches(false);
+                connection.setRequestProperty("User-Agent", userAgent);
+                connection.setRequestProperty("Accept-Encoding", "identity");
+                // Compiler/JNI validate the common subset before this call.
+                for (int i = 0; i < requestHeaders.length; i += 2) {
+                    connection.setRequestProperty(requestHeaders[i], requestHeaders[i + 1]);
+                }
+                int remainingMillis = remainingTimeoutMillis(deadlineNanos);
+                connection.setConnectTimeout(remainingMillis);
+                connection.setReadTimeout(remainingMillis);
+                if (allowInvalidCertificate
+                        && connection instanceof HttpsURLConnection) {
+                    HttpsURLConnection https = (HttpsURLConnection) connection;
+                    https.setSSLSocketFactory(permissiveTls.getSocketFactory());
+                    https.setHostnameVerifier((host, session) -> true);
+                }
+
+                int status = connection.getResponseCode();
+                result.putInt("status", status);
+                String location = connection.getHeaderField("Location");
+                if (isRedirect(status) && location != null && !location.isEmpty()) {
+                    if (requestHeaders.length != 0) {
+                        throw new IOException("带请求头的规则集下载不支持重定向");
+                    }
+                    if (redirects >= 10) {
+                        throw new IOException("订阅下载重定向次数过多");
+                    }
+                    URL redirected = new URL(target, location);
+                    String redirectedProtocol =
+                            redirected.getProtocol().toLowerCase(Locale.ROOT);
+                    if (!"http".equals(redirectedProtocol)
+                            && !"https".equals(redirectedProtocol)) {
+                        throw new IOException("订阅重定向仅支持 HTTP 或 HTTPS URL");
+                    }
+                    connection.disconnect();
+                    connection = null;
+                    target = redirected;
+                    continue;
+                }
+
+                result.putInt("status", status);
+                JSONObject headers = new JSONObject();
+                for (Map.Entry<String, List<String>> entry
+                        : connection.getHeaderFields().entrySet()) {
+                    String name = entry.getKey();
+                    List<String> values = entry.getValue();
+                    if (name == null || values == null || values.isEmpty()) continue;
+                    StringBuilder value = new StringBuilder();
+                    for (String part : values) {
+                        if (part == null) continue;
+                        if (value.length() > 0) value.append(", ");
+                        value.append(part);
+                    }
+                    headers.put(name.toLowerCase(Locale.ROOT), value.toString());
+                }
+                result.putString("headers_json", headers.toString());
+
+                if (status == HttpURLConnection.HTTP_NOT_MODIFIED) {
+                    result.putByteArray("body", new byte[0]);
+                    result.putString("error", "");
+                    return result;
+                }
+
+                long expectedBodyLength = connection.getContentLengthLong();
+                ByteArrayOutputStream body = new ByteArrayOutputStream();
+                connection.setReadTimeout(remainingTimeoutMillis(deadlineNanos));
+                InputStream input = status >= 400
+                        ? connection.getErrorStream() : connection.getInputStream();
+                if (input != null) {
+                    try (InputStream stream = input) {
+                        byte[] buffer = new byte[16 * 1024];
+                        while (true) {
+                            int count;
+                            try {
+                                connection.setReadTimeout(
+                                        remainingTimeoutMillis(deadlineNanos));
+                                count = stream.read(buffer);
+                            } catch (IOException readError) {
+                                result.putBoolean("retryable", true);
+                                throw readError;
+                            }
+                            if (count == -1) break;
+                            if (maxBytes > 0 && count > maxBytes - body.size()) {
+                                throw new IOException("规则集下载超过大小上限");
+                            }
+                            body.write(buffer, 0, count);
+                        }
+                    }
+                }
+                if (expectedBodyLength >= 0 && body.size() != expectedBodyLength) {
+                    result.putBoolean("retryable", true);
+                    throw new IOException("下载不完整（收到 " + body.size()
+                            + "/" + expectedBodyLength + " 字节）");
+                }
+                result.putByteArray("body", body.toByteArray());
+                result.putString("error", "");
+                return result;
+            }
+        } catch (Exception error) {
+            String message = error.getMessage();
+            result.putString("error", message == null || message.isEmpty()
+                    ? error.getClass().getSimpleName() : message);
+            return result;
+        } finally {
+            if (connection != null) connection.disconnect();
+        }
+    }
+
+    private static int remainingTimeoutMillis(long deadlineNanos)
+            throws java.net.SocketTimeoutException {
+        long remainingNanos = deadlineNanos - System.nanoTime();
+        if (remainingNanos <= 0) {
+            throw new java.net.SocketTimeoutException("订阅下载超时");
+        }
+        long millis = TimeUnit.NANOSECONDS.toMillis(remainingNanos);
+        return (int) Math.max(1L, Math.min(Integer.MAX_VALUE, millis));
+    }
+
+    private static boolean isRedirect(int status) {
+        return status == HttpURLConnection.HTTP_MOVED_PERM
+                || status == HttpURLConnection.HTTP_MOVED_TEMP
+                || status == HttpURLConnection.HTTP_SEE_OTHER
+                || status == 307 || status == 308;
+    }
+
+    private final Handler runtimeHandler = new Handler(Looper.getMainLooper());
+    private volatile boolean runtimeServiceBound;
+    private volatile long runtimeBindingEpoch;
+    private final Object runtimeObservationLock = new Object();
+    private final java.util.concurrent.atomic.AtomicBoolean runtimePollBusy = new java.util.concurrent.atomic.AtomicBoolean();
+    private final java.util.concurrent.ExecutorService runtimeReader = java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+        Thread thread = new Thread(r, "clashflux-runtime-reader"); thread.setDaemon(true); return thread;
+    });
+    private static volatile long runtimeLogCursor;
+    private final Runnable runtimePoll = new Runnable() {
+        @Override public void run() {
+            if (runtimePollBusy.compareAndSet(false, true)) {
+                final long epoch = runtimeBindingEpoch;
+                runtimeReader.execute(() -> {
+                    try { pollRuntimeProcess(epoch); }
+                    finally { runtimePollBusy.set(false); }
+                });
+            }
+            if (runtimeServiceBound) runtimeHandler.postDelayed(this, 1000);
+        }
+    };
+    private final ServiceConnection runtimeConnection = new ServiceConnection() {
+        @Override public void onServiceConnected(ComponentName name, IBinder binder) {
+            synchronized (runtimeObservationLock) {
+                ++runtimeBindingEpoch;
+                runtimeControl = IClashRuntime.Stub.asInterface(binder);
+            }
+            runtimeHandler.removeCallbacks(runtimePoll);
+            runtimeHandler.post(runtimePoll);
+        }
+
+        @Override public void onServiceDisconnected(ComponentName name) {
+            synchronized (runtimeObservationLock) {
+                ++runtimeBindingEpoch;
+                nativeRuntimeBinderAvailable(false);
+                runtimeControl = null;
+            }
+        }
+    };
+
+    private static void installCrashLogger() {
+        final Thread.UncaughtExceptionHandler delegate =
+                Thread.getDefaultUncaughtExceptionHandler();
+        Thread.setDefaultUncaughtExceptionHandler((thread, error) -> {
+            try {
+                appLog("线程 " + thread.getName() + " 发生未捕获异常：\n"
+                        + Log.getStackTraceString(error), true);
+            } catch (Throwable ignored) {
+                // The process is already terminating; never mask the original
+                // crash with a diagnostic failure.
+            }
+            if (delegate != null) delegate.uncaughtException(thread, error);
+        });
+    }
+
+    static void appLog(String message, boolean error) {
+        if (message == null || message.isEmpty()) return;
+        Log.println(error ? Log.ERROR : Log.INFO, TAG, message);
+        if (runtimeProcess) RuntimeLogStore.append("app", error ? 3 : 1, message);
+        try {
+            nativeAppLog(error ? 3 : 1, message);
+        } catch (RuntimeException | LinkageError ignored) {
+            // Diagnostics must not affect permissions or service startup.
+        }
+    }
+
+    static void coreLog(int level, String message) {
+        if (message == null || message.isEmpty()) return;
+        if (runtimeProcess) RuntimeLogStore.append("core", level, message);
+        try {
+            nativeCoreLog(level, message);
+        } catch (RuntimeException | LinkageError ignored) {
+            // Kernel diagnostics must not affect the VPN data plane.
+        }
+    }
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        Log.i(TAG, "MainActivity.onCreate entered");
+        current = this;
+        applicationContext = getApplicationContext();
+        installBundledRuleSets(this);
+        // Initialize the native bridge before HuxerUI composes the first frame.
+        // Android settings and VPN callbacks can be queried during composition;
+        // waiting until after super.onCreate leaves that first frame without a
+        // valid Activity class and data-directory bridge.
+        nativeInit(getFilesDir().getAbsolutePath(), getApplicationInfo().nativeLibraryDir);
+        reportPreviousNativeCrash(this);
+        Log.i(TAG, "Native bridge initialized");
+        appLog("主 Activity 已初始化 native bridge", false);
+        Log.i(TAG, "Calling HuxerUIActivity.onCreate");
+        super.onCreate(savedInstanceState);
+        Log.i(TAG, "HuxerUIActivity.onCreate returned");
+        nativeStartCore();
+        requestNotificationPermission();
+        Log.i(TAG, "Android UI process initialized; sing-box runtime is isolated in :background");
+        appLog("Android 界面进程已初始化，sing-box 运行时由独立后台进程托管", false);
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        Intent intent = new Intent(this, RuntimeControlService.class);
+        runtimeServiceBound = bindService(intent, runtimeConnection, Context.BIND_AUTO_CREATE);
+        if (!runtimeServiceBound) appLog("无法连接 sing-box 后台控制服务", true);
+    }
+
+    @Override
+    protected void onStop() {
+        synchronized (runtimeObservationLock) {
+            ++runtimeBindingEpoch;
+            nativeRuntimeBinderAvailable(false);
+            runtimeControl = null;
+        }
+        runtimeHandler.removeCallbacks(runtimePoll);
+        if (runtimeServiceBound) {
+            unbindService(runtimeConnection);
+            runtimeServiceBound = false;
+        }
+        runtimeControl = null;
+        super.onStop();
+    }
+
+    private void pollRuntimeProcess(long bindingEpoch) {
+        IClashRuntime service = runtimeControl;
+        if (service == null) return;
+        try {
+            Bundle snapshot = service.snapshot();
+            synchronized (runtimeObservationLock) {
+            if (bindingEpoch != runtimeBindingEpoch || service != runtimeControl || !runtimeServiceBound) return;
+            nativeUpdateRuntimeHealth(snapshot.getLong("runtimeEpoch"), snapshot.getLong("clientGeneration"),
+                    snapshot.getLong("statusSequence"), snapshot.getLong("statusAgeMs", -1),
+                    snapshot.getInt("statusRepairs"), snapshot.getBoolean("clientConnected"),
+                    snapshot.getBoolean("trafficAvailable"), snapshot.getString("statusHealth", "unknown"));
+            runtimeCoreState = snapshot.getInt("coreState");
+            runtimeVpnState = snapshot.getInt("vpnState");
+            runtimeMessage = snapshot.getString("message", "");
+            nativeUpdateRuntimeState(runtimeCoreState, runtimeVpnState, snapshot.getLong("vpnElapsedMs"),
+                    snapshot.getLong("uploadRate"), snapshot.getLong("downloadRate"),
+                    snapshot.getLong("uploadTotal"), snapshot.getLong("downloadTotal"),
+                    snapshot.getInt("connections"), runtimeMessage,
+                    snapshot.getString("clashMode", ""));
+            }
+            if (bindingEpoch != runtimeBindingEpoch || service != runtimeControl) return;
+            if (snapshot.getBoolean("tunResetPending")) {
+                nativeClearTunPreference();
+                service.acknowledgeTunReset();
+            }
+
+            Bundle logs = service.logsAfter(runtimeLogCursor);
+            if (bindingEpoch != runtimeBindingEpoch || service != runtimeControl) return;
+            runtimeLogCursor = logs.getLong("sequence", runtimeLogCursor);
+            ArrayList<String> entries = logs.getStringArrayList("entries");
+            if (entries == null) return;
+            for (String entry : entries) {
+                String[] fields = entry.split("\\|", 4);
+                if (fields.length != 4) continue;
+                int level;
+                try {
+                    level = Integer.parseInt(fields[2]);
+                } catch (NumberFormatException ignored) {
+                    continue;
+                }
+                if ("core".equals(fields[1])) nativeCoreLog(level, fields[3]);
+                else nativeAppLog(level, fields[3]);
+            }
+        } catch (RemoteException | RuntimeException error) {
+            synchronized (runtimeObservationLock) {
+                if (bindingEpoch == runtimeBindingEpoch) nativeRuntimeBinderAvailable(false);
+            }
+            Log.w(TAG, "Unable to read sing-box runtime state", error);
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        runtimeReader.shutdownNow();
+        if (current == this) {
+            current = null;
+        }
+        super.onDestroy();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        appLog("Activity 已回到前台，刷新系统权限状态", false);
+    }
+
+    public static void openUrl(String url) {
+        MainActivity activity = current;
+        if (activity == null || url == null || url.isEmpty()) {
+            return;
+        }
+        activity.runOnUiThread(() -> {
+            try {
+                activity.startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
+            } catch (ActivityNotFoundException ignored) {
+                // No browser is installed; the native caller has no recovery action.
+            }
+        });
+    }
+
+    // Package visibility is limited to launchable/otherwise visible apps. No
+    // QUERY_ALL_PACKAGES permission; manually entered package IDs are retained.
+    public static String visibleNetworkApplications() {
+        MainActivity activity = current;
+        if (activity == null) return "";
+        android.content.pm.PackageManager manager = activity.getPackageManager();
+        java.util.ArrayList<String> rows = new java.util.ArrayList<>();
+        for (android.content.pm.ApplicationInfo info : manager.getInstalledApplications(0)) {
+            if (info.packageName.equals(activity.getPackageName())) continue;
+            String label = String.valueOf(manager.getApplicationLabel(info)).replace('\n', ' ').replace('\t', ' ');
+            rows.add(info.packageName + "\t" + label);
+        }
+        java.util.Collections.sort(rows);
+        return String.join("\n", rows);
+    }
+
+    // ---- VPN（C++ 设置页 VPN 开关经 JNI 调用）----
+
+    private static final int REQUEST_NOTIFICATIONS = 4002;
+
+    /** Initializes the native store when no Activity UI ran (boot restore). */
+    public static void bootstrapNative(Context context) {
+        applicationContext = context.getApplicationContext();
+        runtimeProcess = isBackgroundRuntimeProcess(context);
+        installBundledRuleSets(context);
+        nativeInit(context.getFilesDir().getAbsolutePath(),
+                context.getApplicationInfo().nativeLibraryDir);
+        reportPreviousNativeCrash(context);
+    }
+
+    private static boolean isBackgroundRuntimeProcess(Context context) {
+        String processName = "";
+        if (Build.VERSION.SDK_INT >= 28) {
+            processName = android.app.Application.getProcessName();
+        } else {
+            int pid = android.os.Process.myPid();
+            android.app.ActivityManager manager =
+                    (android.app.ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE);
+            if (manager != null) {
+                for (android.app.ActivityManager.RunningAppProcessInfo process
+                        : manager.getRunningAppProcesses()) {
+                    if (process.pid == pid) {
+                        processName = process.processName;
+                        break;
+                    }
+                }
+            }
+        }
+        return processName.endsWith(":background");
+    }
+
+    private static void installBundledRuleSets(Context context) {
+        File directory = new File(context.getFilesDir(), "clash-flux/core");
+        if (!directory.isDirectory() && !directory.mkdirs()) {
+            appLog("无法创建内置分流规则目录", true);
+            return;
+        }
+        for (String name : new String[]{"geoip-cn.srs", "geosite-cn.srs"}) {
+            File destination = new File(directory, name);
+            File temporary = new File(directory, name + ".asset");
+            try (InputStream input = context.getAssets().open("rules/" + name);
+                 FileOutputStream output = new FileOutputStream(temporary)) {
+                byte[] buffer = new byte[16384];
+                for (int count = input.read(buffer); count >= 0; count = input.read(buffer)) {
+                    if (count > 0) output.write(buffer, 0, count);
+                }
+                output.getFD().sync();
+                if (destination.exists() && !destination.delete()) {
+                    throw new IOException("无法替换旧规则集");
+                }
+                if (!temporary.renameTo(destination)) {
+                    throw new IOException("无法安装规则集");
+                }
+            } catch (IOException error) {
+                temporary.delete();
+                appLog("安装内置分流规则 " + name + " 失败：" + error.getMessage(), true);
+            }
+        }
+    }
+
+    /**
+     * libbox redirects Go/native fatal output to CrashReport-*.log. Surface
+     * the previous report in the app log after a process restart; otherwise a
+     * native crash looks like a silent return to the launcher.
+     */
+    private static void reportPreviousNativeCrash(Context context) {
+        try {
+            File report = new File(context.getFilesDir(), "CrashReport-ClashFlux.log");
+            if (!report.isFile() || report.length() == 0) return;
+            long signature = report.lastModified() ^ report.length();
+            android.content.SharedPreferences prefs = context.getSharedPreferences(
+                    "clashflux", Context.MODE_PRIVATE);
+            if (prefs.getLong("last_crash_report_signature", Long.MIN_VALUE) == signature) {
+                return;
+            }
+            // A Go fatal report is usually much larger than the application
+            // log card because it contains every goroutine.  Showing only its
+            // tail hides the fatal/panic headline and leaves only an innocent
+            // worker frame (for example sing-tun's NAT cleanup loop).  Read a
+            // bounded head and tail so the UI remains responsive while the
+            // cause and the relevant shutdown frames are both preserved.
+            appLog("上一次 libbox 崩溃报告：\n" + readCrashReportExcerpt(report), true);
+            prefs.edit().putLong("last_crash_report_signature", signature).apply();
+        } catch (Throwable error) {
+            Log.w(TAG, "Unable to read previous libbox crash report", error);
+        }
+    }
+
+    private static String readCrashReportExcerpt(File report) throws IOException {
+        final int headBytes = 8192;
+        final int tailBytes = 12000;
+        try (RandomAccessFile input = new RandomAccessFile(report, "r")) {
+            long length = input.length();
+            if (length <= headBytes + tailBytes) {
+                byte[] all = new byte[(int) length];
+                input.readFully(all);
+                return new String(all, StandardCharsets.UTF_8);
+            }
+            byte[] head = new byte[headBytes];
+            input.readFully(head);
+            input.seek(length - tailBytes);
+            byte[] tail = new byte[tailBytes];
+            input.readFully(tail);
+            return new String(head, StandardCharsets.UTF_8)
+                    + "\n...（崩溃报告中间内容已省略）...\n"
+                    + new String(tail, StandardCharsets.UTF_8);
+        }
+    }
+
+    public static void startVpn() {
+        MainActivity activity = current;
+        if (activity == null) {
+            return;
+        }
+        activity.runOnUiThread(activity::beginVpnStart);
+    }
+
+    public static boolean stopVpn() {
+        MainActivity activity = current;
+        Context context = activity != null ? activity : applicationContext;
+        if (context == null) {
+            appLog("无法关闭 Android VPN：Activity 尚未就绪", true);
+            return false;
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            appLog("Android VPN 停止操作不能在界面线程执行", true);
+            return false;
+        }
+        IClashRuntime service = runtimeControl;
+        if (service != null) {
+            try { return service.stopRuntime(); }
+            catch (RemoteException | RuntimeException error) {
+                Log.w(TAG, "Runtime stop IPC failed; reconnecting", error);
+            }
+        }
+        CountDownLatch connected = new CountDownLatch(1);
+        AtomicReference<IClashRuntime> connection = new AtomicReference<>();
+        ServiceConnection temporary = new ServiceConnection() {
+            @Override public void onServiceConnected(ComponentName name, IBinder binder) {
+                connection.set(IClashRuntime.Stub.asInterface(binder));
+                connected.countDown();
+            }
+            @Override public void onServiceDisconnected(ComponentName name) {
+                connection.set(null);
+            }
+        };
+        boolean bound = false;
+        try {
+            bound = context.bindService(new Intent(context, RuntimeControlService.class),
+                    temporary, Context.BIND_AUTO_CREATE);
+            if (!bound || !connected.await(5, TimeUnit.SECONDS)) return false;
+            service = connection.get();
+            return service != null && service.stopRuntime();
+        } catch (RemoteException | RuntimeException | InterruptedException error) {
+            if (error instanceof InterruptedException) Thread.currentThread().interrupt();
+            Log.e(TAG, "Unable to confirm sing-box runtime stop", error);
+            return false;
+        } finally {
+            if (bound) context.unbindService(temporary);
+        }
+    }
+
+    /** Starts libbox without requesting VPN consent for proxy-page speed tests. */
+    public static void startSpeedTestService() {
+        Context context = applicationContext;
+        MainActivity activity = current;
+        if (activity != null) context = activity.getApplicationContext();
+        if (context == null) {
+            appLog("无法启动测速内核：Activity 尚未就绪", true);
+            return;
+        }
+        final Context serviceContext = context;
+        Runnable start = () -> {
+            try {
+                Intent intent = new Intent(serviceContext, ClashVpnService.class);
+                intent.putExtra(ClashVpnService.EXTRA_SPEED_TEST_ONLY, true);
+                if (Build.VERSION.SDK_INT >= 26) {
+                    serviceContext.startForegroundService(intent);
+                } else {
+                    serviceContext.startService(intent);
+                }
+                appLog("已请求启动无 VPN 的测速内核", false);
+            } catch (RuntimeException error) {
+                Log.e(TAG, "Unable to start speed-test service", error);
+                appLog("测速内核启动失败：" + error.getMessage(), true);
+            }
+        };
+        if (activity != null) activity.runOnUiThread(start);
+        else start.run();
+    }
+
+    /** Starts the resident libbox core without requesting VPN consent or TUN. */
+    public static boolean startCoreOnly() {
+        Context context = applicationContext;
+        MainActivity activity = current;
+        if (activity != null) context = activity.getApplicationContext();
+        if (context == null) {
+            appLog("无法启动 Android 内核：Activity 尚未就绪", true);
+            return false;
+        }
+        final Context serviceContext = context;
+        Runnable start = () -> {
+            try {
+                Intent intent = new Intent(serviceContext, ClashVpnService.class);
+                intent.putExtra(ClashVpnService.EXTRA_CORE_ONLY, true);
+                if (Build.VERSION.SDK_INT >= 26) {
+                    serviceContext.startForegroundService(intent);
+                } else {
+                    serviceContext.startService(intent);
+                }
+                appLog("已请求启动无 TUN 的常驻 sing-box 内核", false);
+            } catch (RuntimeException error) {
+                Log.e(TAG, "Unable to start the resident libbox core", error);
+                appLog("Android 内核启动失败：" + error.getMessage(), true);
+            }
+        };
+        if (activity != null) activity.runOnUiThread(start);
+        else start.run();
+        return true;
+    }
+
+    public static boolean selectOutbound(String group, String name) {
+        IClashRuntime service = runtimeControl;
+        try { return service != null && service.selectOutbound(group, name); }
+        catch (RemoteException | RuntimeException error) {
+            Log.w(TAG, "Unable to select outbound across runtime IPC", error);
+            return false;
+        }
+    }
+
+    public static boolean urlTest(String group) {
+        IClashRuntime service = runtimeControl;
+        try { return service != null && service.urlTest(group); }
+        catch (RemoteException | RuntimeException error) {
+            Log.w(TAG, "Unable to start outbound URL test across runtime IPC", error);
+            return false;
+        }
+    }
+
+    public static boolean setClashMode(String mode) {
+        IClashRuntime service = runtimeControl;
+        try { return service != null && service.setClashMode(mode); }
+        catch (RemoteException | RuntimeException error) {
+            Log.w(TAG, "Unable to set sing-box mode across runtime IPC", error);
+            return false;
+        }
+    }
+
+    public static String proxyGroups() {
+        IClashRuntime service = runtimeControl;
+        try { if (service != null) service.refreshProxyGroups(); }
+        catch (RemoteException | RuntimeException error) {
+            Log.w(TAG, "Unable to refresh outbound groups across runtime IPC", error);
+        }
+        return RuntimeSnapshotStore.read(applicationContext, "outbound-groups.json",
+                "{\"proxies\":{}}");
+    }
+
+    public static String connectionsSnapshot() {
+        return RuntimeSnapshotStore.read(applicationContext, "connections.json",
+                "{\"uploadTotal\":0,\"downloadTotal\":0,\"connections\":[]}");
+    }
+
+    public static boolean closeConnection(String id) {
+        IClashRuntime service = runtimeControl;
+        try { return service != null && service.closeConnection(id); }
+        catch (RemoteException | RuntimeException error) {
+            Log.w(TAG, "Unable to close connection across runtime IPC", error);
+            return false;
+        }
+    }
+
+    public static boolean closeAllConnections() {
+        IClashRuntime service = runtimeControl;
+        try { return service != null && service.closeAllConnections(); }
+        catch (RemoteException | RuntimeException error) {
+            Log.w(TAG, "Unable to close connections across runtime IPC", error);
+            return false;
+        }
+    }
+
+    public static boolean isIgnoringBatteryOptimizations() {
+        MainActivity activity = current;
+        Context context = activity != null ? activity : applicationContext;
+        if (context == null) return false;
+        PowerManager power = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+        return power != null
+                && power.isIgnoringBatteryOptimizations(context.getPackageName());
+    }
+
+    public static void requestIgnoreBatteryOptimizations() {
+        MainActivity activity = current;
+        if (activity == null) return;
+        // JNI 可能从 HuxerUI 的渲染线程进入；Activity 跳转必须在 Android
+        // 主线程执行，否则部分设备会无提示地忽略这次请求。
+        activity.runOnUiThread(() -> {
+            activity.requestBatteryOptimization();
+        });
+    }
+
+    /** Opens the system management page so the user can revoke the exemption. */
+    public static void openBatteryOptimizationSettings() {
+        MainActivity activity = current;
+        if (activity == null) return;
+        activity.runOnUiThread(activity::openBatteryOptimizationManagement);
+    }
+
+    // ---- 后台保活 ----------------------------------------------------------
+
+    public static void requestBackgroundKeepAlive() {
+        MainActivity activity = current;
+        if (activity == null) return;
+        appLog("请求后台保活：常驻服务和电池优化豁免", false);
+        activity.runOnUiThread(() ->
+                activity.requestNotificationAction(PENDING_CORE_SERVICE | PENDING_BATTERY));
+    }
+
+    private static final int PENDING_CORE_SERVICE = 1;
+    private static final int PENDING_VPN = 2;
+    private static final int PENDING_BATTERY = 4;
+    private static boolean notificationRequestInFlight = false;
+
+    private void requestNotificationAction(int actions) {
+        // Notification permission is optional on Android 13+. Never hold a
+        // service or VPN start behind its dialog.
+        drainNotificationActions(actions);
+    }
+
+    private void requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(
+                Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+            if (!notificationRequestInFlight) {
+                notificationRequestInFlight = true;
+                appLog("正在请求 Android 通知权限", false);
+                requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS},
+                        REQUEST_NOTIFICATIONS);
+            }
+        }
+    }
+
+    private void drainNotificationActions(int actions) {
+        if ((actions & (PENDING_CORE_SERVICE | PENDING_BATTERY)) != 0) {
+            startResidentCoreService();
+        }
+        if ((actions & PENDING_BATTERY) != 0) {
+            requestBatteryOptimization();
+        }
+        if ((actions & PENDING_VPN) != 0) {
+            continueVpnStart();
+        }
+    }
+
+    private void startResidentCoreService() {
+        if (!startCoreOnly()) appLog("无法启动 sing-box 常驻服务", true);
+    }
+
+    private void requestBatteryOptimization() {
+        PowerManager power =
+                (PowerManager) getSystemService(Context.POWER_SERVICE);
+        if (power == null || power.isIgnoringBatteryOptimizations(getPackageName())) {
+            appLog("电池优化已处于豁免状态", false);
+            return;
+        }
+        try {
+            startActivity(new Intent(
+                    Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    Uri.parse("package:" + getPackageName())));
+            appLog("已呼出系统电池优化豁免确认", false);
+            return;
+        } catch (ActivityNotFoundException | SecurityException error) {
+            // Some OEM ROMs do not expose the package-specific action; still
+            // open the generic list so the user has a real system action.
+            appLog("厂商系统不支持专用电池优化请求，改开管理页面", false);
+            openBatteryOptimizationManagement();
+        }
+    }
+
+    private void openBatteryOptimizationManagement() {
+        try {
+            startActivity(new Intent(
+                    Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+            appLog("已打开系统电池优化管理页面", false);
+            return;
+        } catch (ActivityNotFoundException | SecurityException error) {
+            // A few ROMs do not expose the generic list. Opening the app
+            // details page is still actionable and avoids a silent no-op.
+            try {
+                startActivity(new Intent(
+                        Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.parse("package:" + getPackageName())));
+                appLog("系统电池优化列表不可用，已打开应用详情页", false);
+                return;
+            } catch (ActivityNotFoundException | SecurityException fallbackError) {
+                Log.w(TAG, "Battery optimization settings unavailable", fallbackError);
+                appLog("无法打开系统电池优化管理页面：" + fallbackError.getMessage(), true);
+            }
+            Log.w(TAG, "Battery optimization management unavailable", error);
+        }
+    }
+
+    // ---- VPN（VpnService.prepare 授权 + 前台服务）--------------------------
+
+    private void beginVpnStart() {
+        requestNotificationAction(PENDING_VPN);
+    }
+
+    private void continueVpnStart() {
+        try {
+            String conflict = VpnConflict.find(this);
+            if (!conflict.isEmpty()) {
+                reportVpnStartFailure(conflict, new IllegalStateException(conflict));
+                return;
+            }
+            appLog("开始请求系统 VPN 授权", false);
+            Intent consent = VpnService.prepare(this);
+            if (consent != null) {
+                appLog("系统 VPN 尚未授权，正在显示授权页面", false);
+                startActivityForResult(consent, REQUEST_VPN_CONSENT);
+            } else {
+                appLog("系统 VPN 已授权，正在启动 VPN 前台服务", false);
+                startVpnService();
+            }
+        } catch (RuntimeException error) {
+            reportVpnStartFailure("无法请求系统 VPN 授权：" + error.getMessage(), error);
+        }
+    }
+
+    private void startVpnService() {
+        try {
+            String conflict = VpnConflict.find(this);
+            if (!conflict.isEmpty()) {
+                reportVpnStartFailure(conflict, new IllegalStateException(conflict));
+                return;
+            }
+            Intent intent = new Intent(this, ClashVpnService.class);
+            if (Build.VERSION.SDK_INT >= 26) {
+                startForegroundService(intent);
+            } else {
+                startService(intent);
+            }
+            appLog("VPN 前台服务已请求启动", false);
+        } catch (RuntimeException error) {
+            reportVpnStartFailure("无法启动 VPN 服务：" + error.getMessage(), error);
+        }
+    }
+
+    private void reportVpnStartFailure(String message, RuntimeException error) {
+        Log.e(TAG, message, error);
+        appLog(message, true);
+        try {
+            nativeVpnStartFailed(message);
+        } catch (RuntimeException bridgeError) {
+            Log.e(TAG, "Unable to report VPN startup failure", bridgeError);
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions,
+                                           int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQUEST_NOTIFICATIONS) {
+            notificationRequestInFlight = false;
+            appLog("通知权限结果：" +
+                    (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED
+                            ? "已允许" : "未允许"),
+                    false);
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQUEST_VPN_CONSENT) {
+            if (resultCode == RESULT_OK) {
+                appLog("用户已允许系统 VPN，继续启动服务", false);
+                startVpnService();
+            } else {
+                // 用户取消系统授权时回滚 C++ 持久化状态，设置页的受控开关会
+                // 在下一次状态校准中恢复为关闭。
+                nativeVpnStartCancelled();
+                appLog("用户取消系统 VPN 授权", true);
+            }
+        }
+    }
+}

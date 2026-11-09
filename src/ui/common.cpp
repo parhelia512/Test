@@ -1,0 +1,1248 @@
+// common.cpp — 岛屿原语（ResolveIslandTheme/IslandSurface/IslandSection）、
+// 页面骨架（一级岛）/ 卡片（二级岛）等跨页通用部件。
+#include <huxerui/huxerui.h>
+#include <huxerui/file_drop.h>
+#include "../tun_settings.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <fstream>
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <stop_token>
+#include <thread>
+#include <tuple>
+#include <vector>
+
+#include "app_resources.h"
+#include "proxies_model.h"
+#include "website_test_model.h"
+#include "task_bridge.h"
+#include "ui.h"
+#include "page_layout.h"
+#include "responsive_shell.h"
+#include "app.h"
+#include "file_drop_zone.h"
+#include "profile_file_picker.h"
+#include "proxy_display_name.h"
+#include "settings_group_layout.h"
+
+#include "wire_codec.h"
+import clashflux.config;
+import clashflux.core;
+import clashflux.db;
+import clashflux.persistence;
+import clashflux.singbox;
+import clashflux.stream;
+import clashflux.store.core;
+import clashflux.store.profiles;
+import clashflux.store.vpn;
+import clashflux.vpn;
+
+// CoreView 含 store::CoreSnapshot、ProfilesModel 含 db::Profile，必须放在模块
+// 导入之后（同 profiles_cache.h）。
+#include "core_model.h"
+#include "core_control.h"
+#include "profiles_model.h"
+#include "settings_model.h"
+#include "app_runtime_services.h"
+#include "stream_updates.h"
+#include "vpn_model.h"
+
+namespace clashflux::ui {
+
+// Application scope survives window closure. Runtime shutdown owns cancellation;
+// WorkerSequence forwards shutdown cancellation into preparation/commit checks;
+// synchronous in-flight IO retains the existing bounded download timeout.
+void StartExternalResourceRefreshPump(huxerui::TaskScope tasks) {
+    const auto runtime = huxerui::UseService<AppRuntimeServices>();
+    if (runtime->externalResourceRefreshStarted) return;
+    runtime->externalResourceRefreshStarted = true;
+    const huxerui::WorkerSequence worker;
+    const auto profiles = huxerui::UseService<ProfilesModel>();
+    tasks.Launch([worker, profiles]() -> huxerui::Task<void> {
+        for (;;) {
+            co_await huxerui::Delay(std::chrono::seconds{30});
+            try {
+                const auto batch = co_await worker.Run([](std::stop_token cancel) {
+                    return store::coreStore().refreshDueExternalResources(cancel);
+                });
+                if (batch.updated) ++profiles->externalResourcesRevision;
+                stream::logApplication("debug", "external-resource-schedule attempted=" + std::to_string(batch.attempted) +
+                    " updated=" + std::to_string(batch.updated) + " deferred=" + (batch.deferred ? "true" : "false"));
+            } catch (...) {
+                stream::logApplication("warning", "外部资源定时更新异常，将在下一轮重试");
+            }
+        }
+    });
+}
+
+namespace {
+
+bool isSelectorType(const std::string& type) {
+    return type == "Selector" || type == "selector";
+}
+
+enum class CoreApplyStatus { Applied, PermissionDenied, ServiceInstallFailed, Failed };
+struct CoreApplyResult {
+    CoreApplyStatus status = CoreApplyStatus::Failed;
+    std::string error;
+};
+
+CoreApplyResult ExecuteCoreCommand(const CoreCommand& command) {
+    auto& coreStore = store::coreStore();
+    bool ok = false;
+    switch (command.action) {
+        case CoreAction::Mode:
+            if (command.mode != "rule" && command.mode != "global" && command.mode != "direct")
+                return {.error = "无效的出站模式"};
+            ok = coreStore.applyMode(command.mode);
+            break;
+        case CoreAction::NetworkSettings:
+            return {.error = "网络设置需要通过设置表单提交"};
+        case CoreAction::SystemProxy:
+            return {.status = CoreApplyStatus::Failed,
+                    .error = "移动端不支持桌面系统代理设置"};
+        case CoreAction::Tun:
+#if defined(__ANDROID__)
+            coreStore.setSetting("core.tun_enabled", command.enabled ? "true" : "false");
+            if (!command.enabled) {
+                if (!AndroidStopVpn()) {
+                    return {.status = CoreApplyStatus::Failed,
+                            .error = "Android 后台服务未确认内核退出"};
+                }
+            }
+            coreStore.startCore(store::profilesStore().selectedYaml(), false, command.enabled);
+            // Authorization/service completion is awaited by the application task.
+            return {.status = CoreApplyStatus::Applied};
+#else
+            coreStore.setSetting("core.tun_enabled", "true");
+            coreStore.startCore(store::profilesStore().selectedYaml(), false, true);
+            return {.status = CoreApplyStatus::Applied};
+#endif
+        case CoreAction::Stop:
+            ok = coreStore.stopCore();
+            break;
+        case CoreAction::Restart:
+            ok = coreStore.restartCore(store::profilesStore().selectedYaml());
+            break;
+        case CoreAction::Connect:
+            ok = coreStore.connectProxy();
+            break;
+        case CoreAction::Disconnect:
+            {
+                std::string error;
+                if (!store::vpnStore().stopTraffic(error))
+                    return {.status = CoreApplyStatus::Failed, .error = std::move(error)};
+                ok = coreStore.startReadyCore();
+            }
+            break;
+        case CoreAction::Start:
+            ok = coreStore.startReadyCore();
+            break;
+        case CoreAction::Idle:
+            return {};
+    }
+    return {.status = ok ? CoreApplyStatus::Applied : CoreApplyStatus::Failed,
+            .error = ok ? std::string{} : coreStore.snapshot().lastError};
+}
+
+huxerui::StringVariant CoreActionFailure(CoreAction action) {
+    switch (action) {
+        case CoreAction::Start: return Localized("启动内核失败");
+        case CoreAction::Stop: return Localized("停止内核失败");
+        case CoreAction::Connect: return Localized("连接失败");
+        case CoreAction::Disconnect: return Localized("断开连接失败");
+        case CoreAction::Restart: return Localized("启动内核失败");
+        case CoreAction::Mode: return Localized("出站模式切换失败");
+        case CoreAction::SystemProxy: return Localized("系统代理设置失败");
+        default: return Localized("TUN 切换失败");
+    }
+}
+
+} // namespace
+
+void CoreControl::Run(CoreCommand command) const {
+    if (Busy() || command.action == CoreAction::Idle) return;
+    model->diagnosticsCancel.request_stop();
+    const CoreControl control = *this;
+    const bool previousTun = model->view.Get().tunIntent;
+    const CoreAction action = command.action;
+    LaunchCoreOperation<CoreApplyResult>(tasks, model, std::move(command),
+        [control, previousTun](CoreCommand command) -> huxerui::Task<CoreApplyResult> {
+            CoreApplyResult result;
+            try {
+                result = co_await RunOnTaskThread([command] { return ExecuteCoreCommand(command); });
+    #if defined(__ANDROID__)
+                if (command.action == CoreAction::Tun && result.status == CoreApplyStatus::Applied) {
+                    bool accepted = false;
+                    for (int attempt = 0; attempt < 300; ++attempt) {
+                        const auto [state, requested] = co_await RunOnTaskThread([] {
+                            return std::pair{AndroidVpnState(), store::coreStore().tunEnabled()};
+                        });
+                        const bool active = state == 1 || state == 2;
+                        if (command.enabled ? active : (!active && !requested)) {
+                            accepted = true;
+                            break;
+                        }
+                        if (command.enabled && (state == 3 || !requested)) break;
+                        co_await huxerui::Delay(std::chrono::duration<double>{0.2});
+                    }
+                    if (!accepted) result.status = CoreApplyStatus::Failed;
+                }
+    #else
+                static_cast<void>(previousTun);
+    #endif
+            } catch (const std::exception& error) {
+                result.error = error.what();
+                result.status = CoreApplyStatus::Failed;
+            } catch (...) {
+                result.status = CoreApplyStatus::Failed;
+            }
+            try {
+    #if defined(__ANDROID__)
+                if (command.action == CoreAction::Tun && result.status != CoreApplyStatus::Applied) {
+                    co_await RunOnTaskThread([command, previousTun] {
+                        auto& coreStore = store::coreStore();
+                        // Do not overwrite a newer service/tile intent or a connected tunnel.
+                        if (coreStore.tunEnabled() == command.enabled && AndroidVpnState() != 2)
+                            coreStore.setSetting("core.tun_enabled", previousTun ? "true" : "false");
+                    });
+                }
+    #endif
+                for (;;) {
+                    const auto revision = control.model->operations.revision.Get();
+                    auto next = co_await RunOnTaskThread([] { return ReadCoreView(true, false); });
+                    if (control.model->operations.revision.Get() != revision) continue;
+                    control.model->Update([next = std::move(next)](CoreView& view) { view = next; });
+                    break;
+                }
+            } catch (const std::exception& error) {
+                if (result.error.empty()) result.error = error.what();
+                result.status = CoreApplyStatus::Failed;
+            } catch (...) {
+                result.status = CoreApplyStatus::Failed;
+            }
+            co_return result;
+    }, [control, action](std::optional<CoreApplyResult> completed, std::exception_ptr error) {
+        CoreApplyResult result = completed.value_or(CoreApplyResult{});
+        if (error) {
+            try { std::rethrow_exception(error); }
+            catch (const std::exception& exception) { result.error = exception.what(); }
+            catch (...) {}
+        }
+        control.model->RequestRefresh();
+        if (control.presentationAvailable && !control.presentationAvailable()) {
+            if (result.status != CoreApplyStatus::Applied && control.onHeadlessFailure)
+                control.onHeadlessFailure(
+                    result.status == CoreApplyStatus::PermissionDenied, result.error);
+            return;
+        }
+        if (result.status == CoreApplyStatus::PermissionDenied) {
+            if (!control.window || !control.dialog || !control.toast) {
+                if (control.onHeadlessFailure)
+                    control.onHeadlessFailure(true, result.error);
+                return;
+            }
+            control.window->Show();
+            control.window->Activate();
+            ShowTunGuideDialog(*control.dialog, control.clipboard, *control.toast,
+                               control.textColor, control.hintColor);
+        } else if (result.status != CoreApplyStatus::Applied) {
+            if (control.toast) {
+                control.toast->Show(!result.error.empty() ? huxerui::StringVariant(result.error)
+                    : result.status == CoreApplyStatus::ServiceInstallFailed
+                        ? Localized("安装被取消或失败（需要授权）") : CoreActionFailure(action));
+            } else if (control.onHeadlessFailure) {
+                control.onHeadlessFailure(false, result.error);
+            }
+        }
+    });
+}
+
+void SettingsModel::SetEnvShell(std::string shell) {
+    if (!view.Get().ready) return;
+    store::coreStore().setSetting("ui.env_shell", shell);
+    Update([&](SettingsView& next) { next.envShell = shell; });
+}
+
+namespace {
+
+// Clash 来源的运行 tag 可逆。对象目录尚未发布时先显示来源内原名，
+// 避免把 cf_<来源十六进制>_o_<名称十六进制> 暴露给用户。
+std::optional<std::string> DecodeSourceOutboundName(std::string_view tag) {
+    if (!tag.starts_with("cf_")) return std::nullopt;
+    const auto separator = tag.find("_o_", 3);
+    if (separator == std::string_view::npos) return std::nullopt;
+    const auto decode = [](std::string_view hex) -> std::optional<std::string> {
+        if (hex.empty() || hex.size() % 2 != 0) return std::nullopt;
+        const auto digit = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            return -1;
+        };
+        std::string result;
+        result.reserve(hex.size() / 2);
+        for (std::size_t i = 0; i < hex.size(); i += 2) {
+            const int high = digit(hex[i]);
+            const int low = digit(hex[i + 1]);
+            if (high < 0 || low < 0) return std::nullopt;
+            const char value = static_cast<char>((high << 4) | low);
+            if (static_cast<unsigned char>(value) < 0x20) return std::nullopt;
+            result += value;
+        }
+        return result;
+    };
+    const auto source = decode(tag.substr(3, separator - 3));
+    if (!source || !source->starts_with("profile-") || source->size() == 8 ||
+        !std::ranges::all_of(source->substr(8), [](char c) { return c >= '0' && c <= '9'; }))
+        return std::nullopt;
+    return decode(tag.substr(separator + 3));
+}
+
+// 只服务于 FetchProxiesSnapshot：拥有型策略组 DTO → 扁平快照。不再是公开 API——
+// 消费方一律读 ProxiesModel，避免又出现第二个「各自解析」的入口。
+std::vector<ProxyGroupSnapshot> ParseProxyGroups(const wire::Proxies& snapshot, const std::map<std::string, std::string>& labels) {
+    std::vector<ProxyGroupSnapshot> groups;
+    const auto& proxies = snapshot.entries;
+    for (const auto& [name, value] : proxies) {
+        if (!value.members) continue;
+        ProxyGroupSnapshot group;
+        group.name = name;
+        group.displayName = labels.contains(name) ? labels.at(name) : name;
+
+        group.type = value.type;
+        group.current = value.now;
+        group.selectable = value.selectable.value_or(isSelectorType(group.type));
+        group.nodes = *value.members;
+        for (const auto& node : group.nodes) {
+            if (labels.contains(node)) group.nodeLabels[node] = labels.at(node);
+            if (const auto found = proxies.find(node); found != proxies.end()) {
+                group.delays[node] = found->second.historyDelay;
+            }
+        }
+        groups.push_back(std::move(group));
+    }
+    return groups;
+}
+
+} // namespace
+
+std::vector<huxerui::MenuEntry> BuildProxyLineMenu(
+    const std::vector<ProxyGroupSnapshot>& groups,
+    std::function<void(const std::string&, const std::string&)> on_select,
+    const std::function<std::string(huxerui::StringVariant)>& resolveLabel) {
+    std::vector<huxerui::MenuEntry> entries;
+    for (const ProxyGroupSnapshot& group : groups) {
+        if (!group.selectable) {
+            entries.push_back(huxerui::MenuItem(
+                resolveLabel(LocalizedFormat("{}（自动测速，不支持手动切换）", group.displayName)),
+                [] {}).Enabled(false));
+            continue;
+        }
+        std::vector<huxerui::MenuEntry> nodes;
+        for (const std::string& node : group.nodes) {
+            nodes.push_back(huxerui::MenuItem(
+                                group.nodeLabels.contains(node) ? group.nodeLabels.at(node) : node,
+                                [on_select, groupName = group.name, node] {
+                                    on_select(groupName, node);
+                                })
+                                .Checked(node == group.current));
+        }
+        if (nodes.empty()) {
+            nodes.push_back(
+                huxerui::MenuItem(resolveLabel(Localized("暂无可切换线路")), [] {}).Enabled(false));
+        }
+        entries.push_back(
+            huxerui::MenuItem(group.displayName, std::move(nodes)));
+    }
+    if (entries.empty()) {
+        entries.push_back(
+            huxerui::MenuItem(resolveLabel(Localized("暂无可切换线路")), [] {}).Enabled(false));
+    }
+    return entries;
+}
+
+// ---- 策略组快照：唯一来源（见 proxies_model.h）------------------------------
+
+ProxiesSnapshot FetchProxiesSnapshot() {
+    ProxiesSnapshot next;
+    next.loaded = true;
+    std::string body;
+#if defined(__ANDROID__)
+    const char* raw = clashflux_android_proxy_groups();
+    // VPN 服务未启动时 Java 侧没有 libbox CommandClient，会返回空组对象；
+    // 此时回落到原生 store 的「停止内核」订阅预览，并标明这是预览而非实时。
+    if (raw != nullptr && *raw != '\0' &&
+        std::string_view(raw) != "{\"proxies\":{}}") {
+        body = raw;
+        next.source = ProxiesSource::Live;
+    } else {
+        body = store::coreStore().proxyGroupsSnapshot();
+        next.source = body.empty() ? ProxiesSource::Empty : ProxiesSource::Preview;
+    }
+#else
+    const auto result = store::coreStore().api().proxies();
+    if (result.ok) {
+        body = result.body;
+        next.source = ProxiesSource::Live;
+    } else {
+        // 回落是刻意的（停内核时仍要让用户能预先选节点），但把原因记下来，
+        // 页面可以据此提示「当前是预览」，而不是把预览当实时数据展示。
+        body = store::coreStore().proxyGroupsSnapshot();
+        next.source = body.empty() ? ProxiesSource::Empty : ProxiesSource::Preview;
+        next.error = result.error;
+    }
+#endif
+    next.body = std::move(body);
+    if (!next.body.empty()) {
+        auto decoded = wire::DecodeProxies(next.body);
+        if (decoded) {
+            next.proxies = std::make_shared<const wire::Proxies>(std::move(decoded.value));
+            const auto catalog = store::coreStore().proxySourceObjects(next.source == ProxiesSource::Preview);
+            if (catalog) {
+                const bool qualifySources = ShouldQualifyProxySources(*catalog);
+                for (const auto& object : *catalog) {
+                    next.labels[object.tag] = ProxyObjectDisplayName(object.objectId, object.sourceName, qualifySources);
+                }
+            }
+            for (const auto& entry : next.proxies->entries) {
+                const auto& tag = entry.first;
+                if (next.labels.contains(tag)) continue;
+                if (const auto name = DecodeSourceOutboundName(tag)) next.labels[tag] = *name;
+            }
+            next.groups = ParseProxyGroups(*next.proxies, next.labels);
+        } else {
+            next.error = "代理快照解析失败：" + decoded.error;
+            next.source = ProxiesSource::Empty;
+        }
+    }
+    return next;
+}
+
+void InstallClashFluxUiModels(huxerui::ApplicationContext& context) {
+    auto runtimeServices = std::make_shared<AppRuntimeServices>();
+    context.Provide(runtimeServices);
+    context.Provide(std::make_shared<ProxiesModel>());
+    context.Provide(std::make_shared<CoreModel>());
+    auto profiles = std::make_shared<ProfilesModel>();
+    context.Provide(profiles);
+    InstallProfileLinkActivation(context, profiles, runtimeServices);
+    context.Provide(std::make_shared<VpnModel>());
+    context.Provide(std::make_shared<SettingsModel>());
+    context.Provide(std::make_shared<WebsiteTestModel>());
+}
+
+void DriveProxiesModel(huxerui::TaskScope tasks,
+                       std::shared_ptr<ProxiesModel> model) {
+    tasks.Launch([model]() -> huxerui::Task<void> {
+        for (;;) {
+            const std::uint64_t before = model->refreshTick.Get();
+            ProxiesSnapshot next = co_await RunOnTaskThread(FetchProxiesSnapshot);
+            // 取数据在 worker，写 State 恒在 UI 线程；内容相等时 State::Write
+            // 去重，不会引起订阅方重组。
+            model->snapshot = std::move(next);
+            if (model->refreshTick.Get() != before) continue;
+            co_await huxerui::Delay(std::chrono::duration<double>{2.0});
+        }
+    });
+}
+
+// ---- 内核/接管状态：唯一来源（见 core_model.h）------------------------------
+
+CoreView ReadCoreView(bool slowProbes, bool previousSystemProxyActive) {
+    auto& core = store::coreStore();
+    // 内核崩溃检测：Running 但进程/控制器已不在 → Failed。以前由托盘的 0.5s
+    // 泵顺带做，现在集中在这里每秒做一次。
+    core.checkAlive();
+    core.captureHealthEvidence(slowProbes);
+    CoreView view;
+    view.core = core.snapshot();
+    view.health = core.runtimeHealthSnapshot(view.core);
+    view.ready = clashflux::persistence::persistence().ready();
+    view.tunIntent = core.tunEnabled();
+    view.modeIntent = core.mode();
+    const auto vpnRuntime = ReadAndroidVpnRuntime();
+    view.vpnSnapshotReady = vpnRuntime.ready;
+    view.vpnState = vpnRuntime.state;
+    view.vpnElapsedMs = vpnRuntime.elapsedMs;
+    view.ignoringBattery = AndroidIsIgnoringBattery();
+    view.systemProxyIntent = core.systemProxyEnabled();
+    static_cast<void>(slowProbes);
+    static_cast<void>(previousSystemProxyActive);
+    view.systemProxyActive = false;
+    view.ipv6Enabled = core.setting("core.ipv6_enabled", "false") == "true";
+    // 局域网开关显示的是「意图」（KV），不是内核运行时的 allow-lan 回读值：
+    // 内核没跑时运行时快照不含本次意图，写透后会被这一拍打回去。
+    view.allowLan = core.setting("core.allow_lan", "false") == "true";
+    view.serviceInstalled = false;
+    return view;
+}
+
+void DriveCoreModel(huxerui::TaskScope tasks, std::shared_ptr<CoreModel> model) {
+    tasks.Launch([model]() -> huxerui::Task<void> {
+        // 昂贵探测（系统代理实际指向）每 kSlowProbeInterval 拍做一次；显式的
+        // RequestRefresh 在下一次可发布的读取时补做慢探测，不承担操作结果回传。
+        constexpr int kSlowProbeInterval = 15;
+        int slowCountdown = 0;
+        std::uint64_t seenRefresh = 0;
+        for (;;) {
+            if (model->operations.Busy() || model->serviceChecking.Get()) {
+                co_await huxerui::Delay(std::chrono::duration<double>{0.1});
+                continue;
+            }
+            const std::uint64_t before = model->refreshTick.Get();
+            const auto revision = model->operations.revision.Get();
+            const bool slowProbes = slowCountdown <= 0 || before != seenRefresh;
+            const CoreView previous = model->view.Get();
+            CoreView next = co_await RunOnTaskThread(
+                [slowProbes, active = previous.systemProxyActive] {
+                    return ReadCoreView(slowProbes, active);
+                });
+            if (!model->PublishPolled(revision, std::move(next))) {
+                co_await huxerui::Delay(std::chrono::duration<double>{0.1});
+                continue;
+            }
+            seenRefresh = before;
+            slowCountdown = slowProbes ? kSlowProbeInterval : slowCountdown - 1;
+            if (model->refreshTick.Get() != before) continue;
+            co_await huxerui::Delay(std::chrono::duration<double>{1.0});
+        }
+    });
+}
+
+bool SelectProxyLine(const std::string& group, const std::string& name) {
+#if defined(__ANDROID__)
+    return store::coreStore().selectProxy(group, name);
+#else
+    return store::coreStore().selectProxy(group, name);
+#endif
+}
+
+bool StartProxyGroupTest(const std::string& group) {
+#if defined(__ANDROID__)
+    try {
+        // Android 的测速内核使用无 TUN 的 libbox 配置；如果当前没有已连接
+        // 的 VPN 服务，先只编译当前配置，再由 Java 启动 speed-test-only
+        // 服务。这样测速不会申请 VPN，也不会接管应用流量。
+        if (clashflux_android_vpn_state() != 2) {
+            auto& core = store::coreStore();
+            core.startCore(store::profilesStore().selectedYaml(), false, false,
+                           std::nullopt, true);
+            if (core.snapshot().state == core::CoreState::Failed) return false;
+        }
+        return clashflux_android_url_test(group.c_str());
+    } catch (...) {
+        return false;
+    }
+#else
+    // 桌面节点测速通过内核 delay API 完成。测速依赖内核但不需要接管流量，
+    // 应用启动先保持无代理入站的待命内核；测速不开放代理端口或恢复接管。
+    if (store::coreStore().snapshot().state != core::CoreState::Running) {
+        return false;
+    }
+    return TriggerProxyGroupTest(group);
+#endif
+}
+
+[[huxerui::composable]] huxerui::View SettingItemIcon(huxerui::ImageResource icon, bool danger) {
+    const huxerui::ThemeSpec& theme = huxerui::UseTheme();
+    return huxerui::Image(icon)
+        .Fit(huxerui::ImageFit::Contain)
+        .Tint(danger ? theme.colors.error : theme.colors.on_surface_variant)
+        .With(huxerui::Frame{.width = 20.0F, .height = 20.0F});
+}
+
+[[huxerui::composable]] huxerui::View SettingRow(huxerui::StringVariant label,
+                                                 huxerui::StringVariant hint,
+                                                 huxerui::View control,
+                                                 std::optional<huxerui::ImageResource> icon) {
+    const huxerui::ThemeSpec& theme = huxerui::UseTheme();
+    const bool compact =
+        huxerui::UseViewportClass() == huxerui::ViewportClass::Compact;
+    huxerui::View description = huxerui::Column {
+        huxerui::Text(label).Style(huxerui::TextStyle{
+            huxerui::Font::System(font_size::kBody), theme.colors.on_surface}),
+        huxerui::UseString(hint).empty()
+            ? huxerui::View{huxerui::Row{}}
+            : huxerui::View{huxerui::Text(hint).Style(huxerui::TextStyle{
+                  huxerui::Font::System(font_size::kCaption),
+                  theme.colors.on_surface_variant})},
+    }.With(huxerui::Spacing(2.0F));
+    if (icon) {
+        description = huxerui::Row {
+          SettingItemIcon(*icon),
+          std::move(description).With(huxerui::Grow(1.0F)),
+        }.With(huxerui::Spacing(12.0F),
+               huxerui::CrossAlign(huxerui::CrossAxisAlignment::Center));
+    }
+
+    if (compact) {
+        huxerui::View compactControl = control;
+        if (icon) compactControl = std::move(compactControl).With(huxerui::Padding(huxerui::EdgeInsets{.left = 32.0F}));
+        return SettingsContentRow(huxerui::Column {
+          description,
+          compactControl,
+        }.With(huxerui::Spacing(8.0F),
+               huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch)));
+    }
+
+    return SettingsContentRow(huxerui::Row {
+      std::move(description).With(huxerui::Grow(1.0F)),
+      control,
+    }.With(huxerui::Spacing(12.0F),
+           huxerui::CrossAlign(huxerui::CrossAxisAlignment::Center)));
+}
+
+[[huxerui::composable]] huxerui::View SettingSwitchRow(
+    huxerui::StringVariant label, huxerui::StringVariant hint, huxerui::View control,
+    bool danger, std::optional<huxerui::ImageResource> icon) {
+    const huxerui::ThemeSpec& theme = huxerui::UseTheme();
+    huxerui::View text = huxerui::Column {
+        huxerui::Text(label).Style(huxerui::TextStyle{
+            huxerui::Font::System(font_size::kBody),
+            danger ? theme.colors.error : theme.colors.on_surface}),
+        huxerui::UseString(hint).empty()
+            ? huxerui::View{huxerui::Row{}}
+            : huxerui::View{huxerui::Text(hint).Style(huxerui::TextStyle{
+                  huxerui::Font::System(font_size::kCaption),
+                  theme.colors.on_surface_variant})},
+    }.With(huxerui::Spacing(2.0F), huxerui::Grow(1.0F));
+    if (icon) {
+        return SettingsContentRow(huxerui::Row {
+          SettingItemIcon(*icon, danger),
+          text,
+          control,
+        }.With(huxerui::Spacing(12.0F),
+               huxerui::CrossAlign(huxerui::CrossAxisAlignment::Center)));
+    }
+    return SettingsContentRow(huxerui::Row {
+        std::move(text),
+        control,
+    }.With(huxerui::Spacing(12.0F),
+           huxerui::CrossAlign(huxerui::CrossAxisAlignment::Center)));
+}
+
+[[huxerui::composable]] huxerui::View UnifiedListRow(
+    huxerui::View content, std::string key, bool compact, bool divider) {
+    const float horizontal = compact ? 10.0F : 8.0F;
+    const float vertical = compact ? 8.0F : 6.0F;
+    // 平铺列表行：不逐行套圆角卡壳，行直接落在一级岛表面上，行间用细分隔
+    // 线划界；divider=false 用于最后一行，避免列表尾部悬一条分隔线。
+    // composable 形参被 codegen 固定为 const：拷贝到局部再走右值 With 链。
+    huxerui::View row = content;
+    return huxerui::Column {
+        std::move(row)
+            .With(huxerui::Spacing(compact ? 5.0F : 8.0F),
+                  huxerui::Padding(huxerui::EdgeInsets::Symmetric(horizontal,
+                                                                   vertical)),
+                  huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch)),
+        divider ? huxerui::View{huxerui::Divider()}
+                : huxerui::View{huxerui::Row{}},
+    }.With(huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch))
+        .Key(std::move(key));
+}
+
+[[huxerui::composable]] huxerui::View SectionTitle(huxerui::StringVariant title) {
+    const huxerui::ThemeSpec& theme = huxerui::UseTheme();
+    return huxerui::Text(title).Style(huxerui::TextStyle{
+        huxerui::Font::System(font_size::kChip).WithWeight(huxerui::FontWeight::Bold),
+        theme.colors.primary});
+}
+
+// 所有密码输入统一走 HuxerUI 的受控 TextField 显隐能力：Secure 负责安全
+// 输入策略，TrailingIcon 负责内置眼睛操作。调用方只提供受控的完整
+// TextEditingValue，秘密值不会被组件复制到日志、卡片或错误文本中。
+[[huxerui::composable]] huxerui::View PasswordField(
+    huxerui::State<huxerui::TextEditingValue> password) {
+    auto visible = huxerui::UseState(false);
+    const bool isVisible = visible.Get();
+    return huxerui::TextField(password.Get())
+        .Label(Localized("密码"))
+        .Secure(!isVisible)
+        .TrailingIcon(isVisible ? app::images::visibility_off
+                                : app::images::visibility,
+                      Localized(isVisible ? "隐藏密码" : "显示密码"))
+        .OnTrailingIconClick([visible] { visible = !visible.Get(); })
+        .Variant(huxerui::TextFieldVariant::Outlined)
+        .OnChanged([password](const huxerui::TextEditingValue& value) {
+            password = value;
+        });
+}
+
+// TUN 权限引导弹窗（见 ui.h）。Linux 只引导安装服务模式：应用自身保持非 root
+// （更安全），root 只在服务侧。命令行 = TextField 展示 + 复制按钮（runtime
+// Clipboard 服务，组合期传入）。工厂 lambda 里只消费按值捕获的值，不放钩子
+// （工厂在 layer 组合期执行，未经 codegen 管理的裸钩子是脆弱写法）。
+void ShowTunGuideDialog(huxerui::DialogHandle,
+                        std::shared_ptr<huxerui::Clipboard>,
+                        FluxToastHandle toast, huxerui::Color,
+                        huxerui::Color) {
+    toast.Show(Localized("请在首页通过悬浮按钮管理 VPN 连接"));
+}
+
+float ConcentricRadius(float outer_radius, float inset) {
+    // 内层半径 = 外层半径 − inset，保下限 4pt：更小半径与父级圆角几乎相切，
+    // 视觉上出现反同心（子角比父角“尖”）。
+    constexpr float kMinRadius = 4.0F;
+    return std::max(outer_radius - inset, kMinRadius);
+}
+
+namespace {
+
+huxerui::Color IslandColor(const IslandTheme& islands, const huxerui::ThemeSpec& theme,
+                           IslandLevel level) {
+    switch (level) {
+        case IslandLevel::Base: return islands.base;
+        case IslandLevel::Raised: return islands.raised;
+        case IslandLevel::Active: return islands.active;
+        case IslandLevel::Overlay: return islands.overlay;
+        case IslandLevel::Danger: {
+            huxerui::Color danger = theme.colors.error;
+            danger.alpha = 0.10F;
+            return danger;
+        }
+    }
+    return islands.base;
+}
+
+} // namespace
+
+[[huxerui::composable]] huxerui::View WithoutIconButtonOutlines(
+    huxerui::View content) {
+    // The built-in icon-button focus ring and indication borders read these
+    // scoped values; keep the rest of the theme and interaction feedback intact.
+    huxerui::ThemeSpec theme = huxerui::UseTheme();
+    theme.interactions.focus_ring =
+        huxerui::FocusRing{huxerui::Color::Transparent(), 0.0F, 0.0F};
+    const auto removeIndicationBorders = [](huxerui::Indication& indication) {
+        const auto removeBorder = [](auto& layer) {
+            if (layer) layer->border.reset();
+        };
+        removeBorder(indication.focus);
+        removeBorder(indication.hover);
+        removeBorder(indication.press);
+    };
+    removeIndicationBorders(theme.interactions.indication);
+
+    huxerui::IconButtonStyle iconButtonStyle =
+        huxerui::UseEnvironment<huxerui::IconButtonStyle>();
+    if (iconButtonStyle.indication) {
+        removeIndicationBorders(*iconButtonStyle.indication);
+    }
+
+    huxerui::ThemeDefinition overrides;
+    overrides.Set(theme);
+    overrides.Set(iconButtonStyle);
+    return huxerui::Theme(overrides, content);
+}
+
+[[huxerui::composable]] huxerui::View IslandSurface(huxerui::View content,
+                                                    IslandLevel level) {
+    const huxerui::ThemeSpec& theme = huxerui::UseTheme();
+    const IslandTheme islands = ResolveIslandTheme(theme);
+    // composable 形参被 codegen 固定为 const：拷贝到局部再走右值 With 链。
+    huxerui::View surface = content;
+    return std::move(surface).With(huxerui::Background(IslandColor(islands, theme, level)),
+                                   huxerui::CornerRadius(islands.island_radius),
+                                   huxerui::Padding(islands.island_padding));
+}
+
+[[huxerui::composable]] huxerui::View IslandSection(std::string title,
+                                                    huxerui::View content) {
+    return IslandSurface(
+        huxerui::Column {
+            huxerui::Text(std::move(title), huxerui::TextRole::Title),
+            std::move(content),
+        }.With(huxerui::Spacing(12.0F),
+               huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch)),
+        IslandLevel::Base);
+}
+
+[[huxerui::composable]] huxerui::View PageScaffold(huxerui::StringVariant title,
+                                                   huxerui::View actions,
+                                                   huxerui::View content,
+                                                   bool inlineCompactActions,
+                                                   bool fullWidthSections,
+                                                   bool windowTitle,
+                                                   std::optional<float> contentSpacing,
+                                                   huxerui::View leading,
+                                                   huxerui::View titleSearchField,
+                                                   bool showInlineHeader,
+                                                   huxerui::View inlineHeader,
+                                                   bool scrollToContentEdges) {
+    const huxerui::ThemeSpec& theme = huxerui::UseTheme();
+    const IslandTheme islands = ResolveIslandTheme(theme);
+    // 响应式：Compact(<600) 收窄一级岛内边距。
+    const bool compact =
+        huxerui::UseViewportClass() == huxerui::ViewportClass::Compact;
+    auto contentInsets = PageContentInsets(theme, compact,
+        fullWidthSections ? 0.0F : contentSpacing.value_or(compact ? 4.0F : kPageHorizontalInset));
+    if (contentSpacing) contentInsets.top = *contentSpacing;
+    const float headerTopInset = contentInsets.top;
+    if (scrollToContentEdges) contentInsets.top = contentInsets.bottom = 0.0F;
+    static_cast<void>(windowTitle);
+    // Mobile page titles and actions stay inside the safe-area content.
+    huxerui::View titleView = showInlineHeader
+        ? titleSearchField ? huxerui::View{titleSearchField} : PageTitleText(theme, title)
+        : huxerui::View{};
+    if (leading) titleView = huxerui::Row{leading, titleView}.With(
+        huxerui::Spacing(theme.spacing.small),
+        huxerui::CrossAlign(huxerui::CrossAxisAlignment::Center));
+    huxerui::View header = inlineHeader ? inlineHeader : PageHeaderLayout(theme,
+        titleView,
+        showInlineHeader ? huxerui::View{actions} : huxerui::View{}, compact && !inlineCompactActions,
+        compact && static_cast<bool>(titleSearchField));
+    if (scrollToContentEdges && header) header = PageHeaderWithInset(header, headerTopInset);
+    const float horizontal = fullWidthSections
+        ? kSectionCardSpacing
+        : (compact ? 4.0F : kPageHorizontalInset);
+    huxerui::View body = huxerui::View{content}.With(huxerui::Grow(1.0F));
+    if (fullWidthSections) {
+        if (header) header = huxerui::View{header}.With(
+            huxerui::Padding(huxerui::EdgeInsets::Symmetric(
+                compact ? horizontal : kPageHorizontalInset, 0.0F)));
+        body = huxerui::ProvideEnvironment(SectionTabContentInsets{horizontal}, body);
+    }
+    std::vector<huxerui::View> children;
+    if (header) children.push_back(std::move(header));
+    children.push_back(std::move(body));
+    return huxerui::Column(std::move(children)).With(huxerui::Padding(contentInsets),
+           huxerui::Spacing(scrollToContentEdges ? 0.0F : contentSpacing.value_or(theme.spacing.medium)),
+           huxerui::Background(islands.base),
+           huxerui::CornerRadius(kPageTitlesInWindow || compact ? 0.0F : islands.island_radius),
+           huxerui::ClipChildren(),
+           huxerui::Grow(1.0F),
+           huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch));
+}
+
+[[huxerui::composable]] huxerui::View SecondaryPageScaffold(
+    huxerui::View title, huxerui::View actions, huxerui::View content,
+    std::function<void()> onBack, bool hideBack, bool fullWidthSections,
+    bool centerTitle, bool scrollToContentEdges, std::optional<float> contentSpacing) {
+    const huxerui::ThemeSpec& theme = huxerui::UseTheme();
+    const IslandTheme islands = ResolveIslandTheme(theme);
+    const bool compact =
+        huxerui::UseViewportClass() == huxerui::ViewportClass::Compact;
+    huxerui::View body = huxerui::View{content}.With(huxerui::Grow(1.0F));
+    huxerui::View titleView = title;
+    auto backAction = onBack;
+    huxerui::View backButton;
+    if (!hideBack) backButton =
+        huxerui::IconButton(app::images::arrow_back, Localized("返回上一页"))
+            .With(huxerui::Tooltip(Localized("返回上一页")))
+            .OnClick(onBack);
+    huxerui::View header = centerTitle
+        ? CenteredPageHeader(theme, std::move(titleView), std::move(backButton), std::move(actions))
+        : hideBack
+        ? huxerui::Row {
+              std::move(titleView).With(huxerui::Grow(1.0F)),
+              std::move(actions),
+          }.With(huxerui::CrossAlign(huxerui::CrossAxisAlignment::Center))
+        : huxerui::Row {
+              std::move(backButton),
+              std::move(titleView).With(huxerui::Grow(1.0F)),
+              std::move(actions),
+          }.With(huxerui::Spacing(theme.spacing.small),
+                 huxerui::CrossAlign(huxerui::CrossAxisAlignment::Center));
+    header = std::move(header).With(huxerui::Frame{.min_height = kPageHeaderHeight});
+    const float horizontal = fullWidthSections ? kSectionCardSpacing
+        : contentSpacing.value_or(compact ? 4.0F : kPageHorizontalInset);
+    if (fullWidthSections) {
+        header = huxerui::View{header}.With(
+            huxerui::Padding(huxerui::EdgeInsets::Symmetric(
+                compact ? horizontal : kPageHorizontalInset, 0.0F)));
+        body = huxerui::ProvideEnvironment(SectionTabContentInsets{horizontal}, body);
+    }
+    auto contentInsets = PageContentInsets(theme, compact,
+        fullWidthSections ? 0.0F : horizontal);
+    if (contentSpacing) contentInsets.top = *contentSpacing;
+    if (scrollToContentEdges) {
+        header = PageHeaderWithInset(header, contentInsets.top);
+        contentInsets.top = contentInsets.bottom = 0.0F;
+    }
+    // 一级/二级页共用内容层底色，保持与窗口外框的颜色区分，不套外卡。
+    huxerui::View scaffold = huxerui::Column {
+        std::move(header),
+        std::move(body),
+    }.With(huxerui::Padding(contentInsets),
+           huxerui::Spacing(scrollToContentEdges ? 0.0F : contentSpacing.value_or(theme.spacing.medium)),
+           huxerui::Background(islands.base),
+           huxerui::CornerRadius(kPageTitlesInWindow || compact ? 0.0F : islands.island_radius),
+           huxerui::ClipChildren(), huxerui::Grow(1.0F),
+           huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch));
+    if (backAction && !hideBack) {
+        scaffold = std::move(scaffold).On<huxerui::ViewEvents::BackRequested>(
+            std::move(backAction));
+    }
+    return scaffold;
+}
+
+[[huxerui::composable]] huxerui::View PillSearchField(
+    huxerui::State<huxerui::TextEditingValue> value,
+    huxerui::StringVariant placeholder, huxerui::View trailingAction) {
+    const huxerui::ThemeSpec& theme = huxerui::UseTheme();
+    const bool compact = huxerui::UseViewportClass() == huxerui::ViewportClass::Compact;
+    auto inputFocused = huxerui::UseState(false);
+    const bool focused = kPageTitlesInWindow && !compact && inputFocused.Get();
+    const float height = kPageTitlesInWindow
+        ? compact ? kPageTitleBarHeight : kPageTitleBarSearchHeight
+        : 48.0F;
+    huxerui::TextFieldStyle inputStyle = huxerui::UseEnvironment<huxerui::TextFieldStyle>();
+    inputStyle.border_width = 0.0F;
+    inputStyle.focused_border_width = 0.0F;
+    inputStyle.validation_border_width = 0.0F;
+    inputStyle.focused_validation_border_width = 0.0F;
+    inputStyle.standard.background = huxerui::Color::Transparent();
+    inputStyle.standard.border = huxerui::Color::Transparent();
+    inputStyle.standard.hovered_border = huxerui::Color::Transparent();
+    inputStyle.standard.focused_border = huxerui::Color::Transparent();
+    inputStyle.standard.disabled_border = huxerui::Color::Transparent();
+    inputStyle.standard.minimum_height = height;
+    inputStyle.padding = huxerui::EdgeInsets::Symmetric(0.0F, 0.0F);
+    huxerui::ThemeDefinition inputTheme;
+    inputTheme.Set(inputStyle);
+    huxerui::View input = huxerui::Theme(
+        std::move(inputTheme),
+        huxerui::TextField(value.Get())
+            .Placeholder(placeholder)
+            .Variant(huxerui::TextFieldVariant::Standard)
+            .OnChanged([value](const huxerui::TextEditingValue& next) {
+                value = next;
+            })
+            .On<huxerui::ViewEvents::FocusChanged>([inputFocused](bool focused) {
+                inputFocused = focused;
+            })
+            .With(huxerui::Grow(1.0F)));
+
+    // 胶囊体内容：搜索图标、无框输入、按需清空，页面动作始终在最右侧。
+    std::vector<huxerui::View> pillChildren{
+        huxerui::Image(app::images::search)
+            .Fit(huxerui::ImageFit::Contain)
+            .Align(huxerui::HorizontalAlignment::Center,
+                   huxerui::VerticalAlignment::Center)
+            .Tint(theme.colors.on_surface_variant)
+            .With(huxerui::Frame{.width = 20.0F, .height = 20.0F}),
+        std::move(input),
+    };
+    if (!value.Get().text.empty()) {
+        pillChildren.push_back(
+            huxerui::IconButton(app::images::close, Localized("清除搜索"))
+                .With(huxerui::Tooltip(Localized("清除搜索")))
+                .OnClick([value] { value = huxerui::TextEditingValue{}; }));
+    }
+    if (trailingAction) pillChildren.push_back(std::move(trailingAction));
+    huxerui::View pillContent = huxerui::Row(std::move(pillChildren)).With(
+           huxerui::Spacing(6.0F),
+           huxerui::CrossAlign(huxerui::CrossAxisAlignment::Center),
+           huxerui::Grow(1.0F));
+
+    // 桌面宽屏搜索框上下留白，窄屏和手机保持原有高度。描边必须有：
+    // 浅色主题里胶囊底（surface_container_highest ≈ #FDFDFD）与标题栏/页面
+    // 岛底色（#FAFBFC / #EFF1F4）几乎同色，无描边时整个胶囊不可见。
+    huxerui::View pill = huxerui::Row {
+        std::move(pillContent),
+    }.With(huxerui::Frame{.height = height},
+           huxerui::Padding(huxerui::EdgeInsets{
+               .right = 4.0F,
+               .left = 14.0F,
+           }),
+           huxerui::Background(focused ? huxerui::Color::Transparent()
+                                      : theme.colors.surface_container_highest),
+           huxerui::Border(theme.colors.outline, 1.0F),
+           huxerui::CornerRadius(height / 2.0F),
+           huxerui::ClipChildren(),
+           huxerui::CrossAlign(huxerui::CrossAxisAlignment::Center),
+           huxerui::Grow(1.0F));
+
+    return PageSearchFieldLayout(std::move(pill).Key("pill-search-field"), compact);
+}
+
+[[huxerui::composable]] huxerui::View Card(huxerui::View content,
+                                           bool outlined, std::optional<float> contentPadding) {
+    const huxerui::ThemeSpec& theme = huxerui::UseTheme();
+    const IslandTheme islands = ResolveIslandTheme(theme);
+    const bool flat = huxerui::UseEnvironment<DialogSurfaceContext>().flat;
+    // 二级岛：半透明水晶卡片感的 raised 表面 + 同心圆角。移动端设置页等
+    // 场景不需要描边，由同层级的 raised 表面与页面底色自然区分。
+    //
+    // 表面/圆角/描边必须在**建树时**落在这个 Column 上：composable 返回的是 hcg
+    // 生成的 Scope 包装节点，调用方在 `Card(...)` 的返回值上再补
+    // `.With(Background/Border/CornerRadius)` 只会画在整棵子树背后，从圆角差里漏出
+    // 一圈底色（首页「当前订阅」卡、订阅卡都踩过：深灰卡 + 蓝色圆角边）。需要另一种
+    // 表面就再加一个建树型 composable（如 `SelectableTile`），不要事后装修。
+    return huxerui::Column { std::move(content) }
+        .With(huxerui::Padding(contentPadding.value_or(islands.island_padding)),
+              huxerui::Background(flat ? huxerui::Color::Transparent() : islands.raised),
+              huxerui::CornerRadius(islands.nested_radius),
+              huxerui::Border(outlined && !flat ? islands.outline_soft
+                                       : huxerui::Color::Transparent(),
+                              outlined && !flat ? kCardOutlineWidth : 0.0F),
+              huxerui::ClipChildren(),
+              huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch));
+}
+
+// 通用「拖入或点击」文件选区（声明见 file_drop_zone.h）。FileDropTarget 只做
+// 外部文件的整批元数据校验（扩展名/MIME，整批要么全收要么拒绝），读取与导入
+// 仍由调用方决定；点击走 FilePicker——键盘、触摸与不支持拖入的宿主都依赖这个
+// 等价入口（框架 file_drop.h 的契约要求）。悬停由 Entered/Exited 翻本地 State
+// 驱动重组，物理松手在 Exited 之后才投递 Dropped。圆角/描边跟控件族
+// （shapes.small + outline_soft），与按钮、下拉、菜单同族。
+[[huxerui::composable]] huxerui::View FileDropZone(
+    huxerui::ImageVariant icon, huxerui::StringVariant title,
+    huxerui::State<std::string> picked_path, huxerui::TaskScope tasks,
+    FluxToastHandle toast, std::shared_ptr<huxerui::FilePicker> picker,
+    huxerui::FilePickerFilter filter, std::string key) {
+    const huxerui::ThemeSpec& theme = huxerui::UseTheme();
+    const IslandTheme islands = ResolveIslandTheme(theme);
+    const bool flat = huxerui::UseEnvironment<DialogSurfaceContext>().flat;
+    auto hovering = huxerui::UseState(false);
+    const bool hover = hovering.Get();
+    const std::string pickedPath = picked_path.Get();
+    std::string fileName = pickedPath;
+    const std::size_t slash = pickedPath.find_last_of("/\\");
+    if (slash != std::string::npos) fileName = pickedPath.substr(slash + 1);
+
+    huxerui::FileDropOptions dropOptions;
+    dropOptions.extensions = filter.extensions;
+    dropOptions.allows_multiple = false;
+
+    const auto open_picker = [tasks, picker, toast, filter, picked_path] {
+        tasks.Launch([picker, toast, filter, picked_path]() -> huxerui::Task<void> {
+            const auto picked = co_await PickProfileConfigFile(picker, filter, toast);
+            if (!picked) co_return;
+            if (const auto file = picked->AsFile()) picked_path = file->Path();
+        });
+    };
+
+    const huxerui::Color captionColor = hover ? theme.colors.on_primary_container
+                                              : theme.colors.on_surface_variant;
+    return huxerui::Column {
+        huxerui::Image(icon)
+            .Tint(hover ? theme.colors.primary : theme.colors.on_surface_variant)
+            .With(huxerui::Frame{.width = 30.0F, .height = 30.0F}),
+        huxerui::Text(fileName.empty() ? title : huxerui::StringVariant(fileName))
+            .Style(huxerui::TextStyle{huxerui::Font::System(font_size::kBody),
+                                      hover ? theme.colors.on_primary_container
+                                            : theme.colors.on_surface})
+            .Align(huxerui::TextAlign::Center),
+        pickedPath.empty()
+            ? huxerui::View{huxerui::Text(huxerui::StringVariant(filter.name))
+                                .Style(huxerui::TextStyle{
+                                    huxerui::Font::System(font_size::kCaption),
+                                    captionColor})
+                                .Align(huxerui::TextAlign::Center)}
+            : huxerui::View{huxerui::Text(pickedPath)
+                                .Style(huxerui::TextStyle{
+                                    huxerui::Font::System(font_size::kCaption),
+                                    captionColor})
+                                .Align(huxerui::TextAlign::Center)},
+    }
+        .With(huxerui::Spacing(6.0F),
+              huxerui::MainAlign(huxerui::MainAxisAlignment::Center),
+              huxerui::CrossAlign(huxerui::CrossAxisAlignment::Center),
+              huxerui::Frame{.height = 128.0F},
+              huxerui::Padding(huxerui::EdgeInsets::Symmetric(20.0F, 12.0F)),
+              huxerui::Background(hover ? theme.colors.primary_container
+                                        : theme.colors.surface_container_high),
+              huxerui::CornerRadius(theme.shapes.small),
+              huxerui::Border(hover ? theme.colors.primary : islands.outline_soft,
+                              hover ? kCardEmphasisOutlineWidth : kCardOutlineWidth),
+              huxerui::ClipChildren(),
+              huxerui::FileDropTarget::Accepts(std::move(dropOptions)),
+              huxerui::PointerCursor(huxerui::PointerCursorKind::Hand))
+        .On<huxerui::FileDropEvents::Entered>(
+            [hovering](const huxerui::FileDropOffer&, const huxerui::FileDropEvent&) {
+                hovering = true;
+            })
+        .On<huxerui::FileDropEvents::Exited>(
+            [hovering](const huxerui::FileDropOffer&, const huxerui::FileDropEvent&) {
+                hovering = false;
+            })
+        .On<huxerui::FileDropEvents::Dropped>(
+            [picked_path](const std::vector<huxerui::FileReference>& files,
+                          const huxerui::FileDropEvent&) {
+                if (files.empty()) return;
+                if (const auto file = files.front().AsFile()) picked_path = file->Path();
+            })
+        .On<huxerui::FileDropEvents::Failed>(
+            [toast](const huxerui::IoError& error, const huxerui::FileDropEvent&) {
+                toast.Show(LocalizedFormat("接收文件失败：{}", error.message));
+            })
+        .OnClick(open_picker)
+        .With(huxerui::Focusable(true),
+              huxerui::Semantics{.role = huxerui::SemanticRole::Button,
+                                 .label = huxerui::UseString(title)})
+        .Key(std::move(key));
+}
+
+// 密集卡片（声明见 ui.h）：圆角阶梯的 dense 档（dense_radius 4pt），内边距
+// 减半（island_padding/2）让高密度内容（日志行等）单行更紧凑；raised 表面
+// 与卡片同层，靠圆角与留白密度区分。
+[[huxerui::composable]] huxerui::View DenseCard(huxerui::View content) {
+    const huxerui::ThemeSpec& theme = huxerui::UseTheme();
+    const IslandTheme islands = ResolveIslandTheme(theme);
+    const bool flat = huxerui::UseEnvironment<DialogSurfaceContext>().flat;
+    return huxerui::Column { std::move(content) }
+        .With(huxerui::Padding(islands.island_padding * 0.5F),
+              huxerui::Background(flat ? huxerui::Color::Transparent() : islands.raised),
+              huxerui::CornerRadius(islands.dense_radius),
+              huxerui::ClipChildren(),
+              huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch));
+}
+
+// 可选中卡片与分组选择器共用 selectable_tile.cpp。
+
+// ---- 订阅列表：唯一来源（见 profiles_model.h）-------------------------------
+
+void ProfilesModel::PublishCached() {
+    auto& database = clashflux::persistence::persistence();
+    Publish(database.listProfiles());
+    if (database.ready()) loaded = true;
+}
+
+void ProfilesModel::ReportProfileRefreshFailure(std::int64_t id,
+                                                std::string name,
+                                                std::string error,
+                                                bool userInitiated) {
+    if (error.empty()) return;
+    if (!userInitiated && reportedProfileErrors.contains(id)) return;
+    reportedProfileErrors[id] = true;
+    profileRefreshFailures.Update([&](auto& notices) {
+        const auto existing = std::ranges::find(notices, id,
+            &RefreshFailureNotice::profileId);
+        RefreshFailureNotice notice{id, std::move(name), std::move(error)};
+        if (existing == notices.end()) notices.push_back(std::move(notice));
+        else *existing = std::move(notice);
+    });
+}
+
+void ProfilesModel::ClearProfileRefreshFailure(std::int64_t id) {
+    reportedProfileErrors.erase(id);
+    profileRefreshFailures.Update([&](auto& notices) {
+        std::erase_if(notices, [id](const auto& notice) {
+            return notice.profileId == id;
+        });
+    });
+}
+
+std::vector<ProfilesModel::RefreshFailureNotice>
+ProfilesModel::TakeProfileRefreshFailures() {
+    auto notices = profileRefreshFailures.Get();
+    profileRefreshFailures = std::vector<RefreshFailureNotice>{};
+    return notices;
+}
+
+void DriveProfilesModel(huxerui::TaskScope tasks,
+                        std::shared_ptr<ProfilesModel> model) {
+    DriveProfileList(tasks, model,
+        [] { return clashflux::persistence::persistence().profilesRevision(); },
+        []() -> huxerui::Task<ProfileListSnapshot<db::Profile>> {
+            co_return co_await RunOnTaskThread([] {
+                ProfileListSnapshot<db::Profile> next;
+                next.ready = clashflux::persistence::persistence().ready();
+                next.profiles = clashflux::persistence::persistence().listProfiles();
+                const auto root = cfg::profilesDir();
+                for (const auto& profile : next.profiles) {
+                    if (profile.type == "pptp" || profile.file.empty()) continue;
+                    // Classification only needs a bounded prefix.
+                    std::ifstream input(root / profile.file, std::ios::binary);
+                    std::string prefix(20001, '\0');
+                    input.read(prefix.data(), static_cast<std::streamsize>(prefix.size()));
+                    prefix.resize(static_cast<std::size_t>(input.gcount()));
+                    if (prefix.empty()) continue;
+                    const auto format = singbox::DetectProfileFormat(prefix);
+                    if (format == singbox::ProfileFormat::ClashYaml ||
+                        format == singbox::ProfileFormat::NodeSubscription) next.clashSources.push_back(profile.id);
+                    if (format != singbox::ProfileFormat::OpenVpn) next.ruleSources.push_back(profile.id);
+                }
+                return next;
+            });
+        });
+}
+
+// ---- 应用级设置：唯一读取点（见 settings_model.h）---------------------------
+
+void DriveSettingsModel(huxerui::TaskScope tasks,
+                        std::shared_ptr<SettingsModel> model) {
+    tasks.Launch([model]() -> huxerui::Task<void> {
+        for (;;) {
+            const std::uint64_t before = model->syncTick.Get();
+            SettingsView next;
+            auto& core = store::coreStore();
+            next.ready = clashflux::persistence::persistence().ready();
+            const std::string themeMode = core.setting("ui.theme_mode", "1");
+            next.themeMode = themeMode == "0" ? 0 : themeMode == "2" ? 2 : 1;
+            next.themeColor = core.setting("ui.theme_color", "blue");
+            next.customThemeColors = core.setting("ui.custom_theme_colors", "");
+            next.hiddenThemeColors = core.setting("ui.hidden_theme_colors", "");
+            next.mixedPort = core.setting("core.mixed_port", "7899");
+            next.httpPort = core.setting("core.http_port", "");
+            next.socksPort = core.setting("core.socks_port", "");
+            next.tunMtu = core.setting("core.tun_mtu", "1400");
+            next.tunStrictRoute = core.setting("core.tun_strict_route", "true") == "true";
+            if (next.ready) {
+                try { next.network = core.networkSettings(); }
+                catch (const std::exception& error) { next.networkError = error.what(); }
+            }
+            next.envShell = core.setting("ui.env_shell", "");
+            next.language = core.setting("ui.language", "system");
+            // 都是内存读；State 按 operator== 去重，只有真的变了才通知订阅者。
+            model->view = std::move(next);
+            if (model->syncTick.Get() != before) continue;
+            co_await huxerui::Delay(std::chrono::duration<double>{1.0});
+        }
+    });
+}
+
+// ---- 原生连接状态：唯一来源（见 vpn_model.h）-------------------------------
+
+void DriveVpnModel(huxerui::TaskScope tasks, std::shared_ptr<VpnModel> model) {
+    tasks.Launch([model]() -> huxerui::Task<void> {
+        for (;;) {
+            if (model->operation.Get().Busy()) {
+                co_await huxerui::Delay(std::chrono::duration<double>{0.1});
+                continue;
+            }
+            const std::uint64_t before = model->syncTick.Get();
+            auto next = co_await RunOnTaskThread([] {
+                return store::vpnStore().snapshot();
+            });
+            // 动作完成回调可能已发布更新的快照，不能用在途旧轮询覆盖它。
+            if (!model->PublishPolled(before, std::move(next))) continue;
+            co_await huxerui::Delay(std::chrono::duration<double>{0.25});
+        }
+    });
+}
+
+// ---- 推送流变化 → UI 线程（见 stream_updates.h）-----------------------------
+
+std::uint64_t SubscribeStreamUpdates(
+    huxerui::TaskScope tasks,
+    std::function<void(stream::StreamKind kind)> handler) {
+    struct Consumer {
+        std::function<void(stream::StreamKind)> handler;
+        bool failureReported = false;
+    };
+    auto shared = std::make_shared<Consumer>(std::move(handler));
+    return stream::addStreamUpdateObserver(
+        [tasks, shared](stream::StreamKind kind) {
+            // 推送线程：只 Post（scope 已关闭时 Post 被忽略），不在本线程碰 State。
+            tasks.Post([shared, kind] {
+                if (!stream::consumeStreamUpdate(kind, shared->handler) && !shared->failureReported) {
+                    shared->failureReported = true;
+                    stream::logApplication("warning", "runtime-health UI stream consumer failed; subsequent samples remain enabled");
+                }
+            });
+        });
+}
+
+void UnsubscribeStreamUpdates(std::uint64_t id) {
+    stream::removeStreamUpdateObserver(id);
+}
+
+} // namespace clashflux::ui

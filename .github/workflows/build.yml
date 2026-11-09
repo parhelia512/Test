@@ -1,0 +1,305 @@
+# Mobile-only CI. Android produces the release APK; iOS remains an
+# unsigned Simulator diagnostic and is never included in the Release gate.
+# HuxerUI and sing-box are pinned to reproducible revisions.
+name: build
+
+# 触发策略：main 推送 / PR / v* Tag 都跑完整矩阵。
+# 本仓库是**公开仓库**，标准 GitHub-hosted runner 的 Actions 用量免费（Windows
+# 2×、macOS 10× 的倍率只影响私有仓库的额度），所以提交与 PR 就能看到各平台结果，
+# 不需要为"省额度"把矩阵挪到只在发版时跑。真正的成本是时间与并发（Free 计划
+# 20 并发、macOS 5），一次矩阵 6 个 job、macOS/Windows/Android 合计常要 30–60
+# 分钟。Tag 推送会额外进入 publish-release 创建 GitHub Release；需要单独验证 CI
+# 改动时用 workflow_dispatch。
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  HUXERUI_REPO: 'https://github.com/FarnaHerry/HuxerUI.git'
+  # 与本机 third_party/huxerui checkout 一致（该目录 gitignore，不入库，
+  # CI 必须自行 clone 并钉 commit，保证可复现）。框架补丁集中维护在
+  # farna/main；main 保留官方基线。验证集成更新后同步本机 checkout 与此 pin。
+  HUXERUI_COMMIT: '69f24079bafa4f19d31e387e66a6b9bac8f3776f'
+  SINGBOX_COMMIT: 'c005f35300ce76427dc285481ec5695f5b179cd2' # v1.14.4
+
+jobs:
+  build-ios-simulator-arm64:
+    name: build-ios-simulator-arm64
+    runs-on: macos-15
+    continue-on-error: true
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Go for pinned sing-box Libbox
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.7'
+          cache: false
+
+      - name: Fetch HuxerUI source (pinned) and apply compatibility patches
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none "$HUXERUI_REPO" third_party/huxerui
+          git -C third_party/huxerui checkout "$HUXERUI_COMMIT"
+
+      - name: Install CMake, Ninja, and LLVM
+        run: |
+          set -euo pipefail
+          # 核心工具链钉在 LLVM 19：iOS SDK/OS 的 libc++ 是 19 世代，brew
+          # 最新 llvm（20+）的新 ABI 运行时符号（__atomic_monitor_global
+          # 等）在 OS dylib 里不存在，app 链接成批未定义。
+          brew install llvm@19
+          python3 -m venv "$RUNNER_TEMP/clash-flux-ios-tools"
+          "$RUNNER_TEMP/clash-flux-ios-tools/bin/python" -m pip install \
+            cmake==4.4.2 ninja
+          export PATH="$RUNNER_TEMP/clash-flux-ios-tools/bin:$PATH"
+          echo "$RUNNER_TEMP/clash-flux-ios-tools/bin" >> "$GITHUB_PATH"
+          llvm_prefix="$(brew --prefix llvm@19)"
+          mod_dir="$llvm_prefix/share/libc++/v1"
+          for f in std.cppm std.compat.cppm; do
+            test -f "$mod_dir/$f" || { echo "missing $mod_dir/$f (brew llvm@19 layout changed?)" >&2; exit 1; }
+          done
+          echo "CLASHFLUX_LLVM_PREFIX=$llvm_prefix" >> "$GITHUB_ENV"
+          cmake --version
+          ninja --version
+
+      - name: Build pinned sing-box Libbox for iOS device and Simulator
+        id: ios-libbox
+        run: |
+          set -euo pipefail
+          platform/ios/build-singbox-libbox.sh \
+            "$RUNNER_TEMP/Libbox.xcframework"
+          test -s "$RUNNER_TEMP/Libbox.xcframework/Info.plist"
+          mkdir -p platform/ios/Build
+          cp -R "$RUNNER_TEMP/Libbox.xcframework" platform/ios/Build/
+
+      - name: Build unsigned iOS Simulator app and Packet Tunnel
+        id: ios-app
+        run: |
+          set -euo pipefail
+          derived="$RUNNER_TEMP/ClashFluxDerivedData"
+          # 单架构构建：C++20 std 模块（std.cppm）依赖 clang -fmodule-output，
+          # 该选项不允许与多个 -arch 同用；模拟器冒烟检查在 arm64 runner 上
+          # 编 arm64 切片即可覆盖编译验证，x86_64 切片没有额外价值。
+          xcodebuild \
+            -project platform/ios/ClashFlux.xcodeproj \
+            -scheme ClashFlux \
+            -configuration Release \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$derived" \
+            CODE_SIGNING_ALLOWED=NO \
+            ARCHS=arm64 \
+            build
+          app="$derived/Build/Products/Release-iphonesimulator/ClashFlux.app"
+          test -d "$app/PlugIns/PacketTunnel.appex"
+          /usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionPointIdentifier' \
+            "$app/PlugIns/PacketTunnel.appex/Info.plist" \
+            | grep -Fx 'com.apple.networkextension.packet-tunnel'
+
+      - name: Report iOS integration status
+        if: always()
+        env:
+          IOS_LIBBOX_OUTCOME: ${{ steps.ios-libbox.outcome }}
+          IOS_APP_OUTCOME: ${{ steps.ios-app.outcome }}
+        run: |
+          if [[ "$IOS_APP_OUTCOME" == "success" && "$IOS_LIBBOX_OUTCOME" == "success" ]]; then
+            echo "::notice title=Clash-Flux iOS app and Packet Tunnel compile passed::The unsigned HuxerUI app and Network Extension compiled for iOS Simulator with the pinned sing-box Libbox framework."
+          else
+            echo "::warning title=Clash-Flux iOS integration compile failed::The app, Packet Tunnel extension, or pinned sing-box Libbox.xcframework did not build; keep iOS distribution out of Release."
+          fi
+          echo "::notice title=iOS release gate::This job builds Simulator binaries only; signed device archive, HTTPS profile downloads, and real-device VPN lifecycle verification remain required before publishing an IPA."
+
+  # ---------------------------------------------------------------- Android
+  # Android 发布门禁：验证 GUI/native shell 与 pinned sing-box libbox 能编出
+  # 可启动 APK。仅发布 arm64-v8a，libbox 经 VpnService 建立 TUN。
+  # CLI 来源：仓库自带 Linux 离线 SDK tarball（bin/huxerui）；框架源码与桌面
+  # job 使用同一 HUXERUI_COMMIT，Android Gradle 从该源码构建 HuxerUI。
+  build-android:
+    name: build-android
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Go for sing-box
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.7'
+          cache: false
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+
+      - name: Set up NDK for sing-box libbox
+        id: singbox-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28
+
+      - name: Build pinned sing-box libbox (arm64)
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/libbox-arm64.aar"
+          ANDROID_NDK_HOME="${{ steps.singbox-ndk.outputs.ndk-path }}" \
+            platform/android/build-singbox-libbox.sh "$output"
+          test -s "$output"
+          test -s "$output.metadata.json"
+          echo "CLASHFLUX_SINGBOX_AAR=$output" >> "$GITHUB_ENV"
+
+      - name: Ensure CMake 4.4.2 (pip) and expose to Gradle
+        run: |
+          set -euo pipefail
+          # CPS requires the same CMake 4.4 baseline as desktop builds.
+          # Expose the pip installation to AGP via cmake.dir (not committed).
+          python3 -m pip install --break-system-packages -q cmake==4.4.2
+          cmake_root="$(dirname "$(dirname "$(command -v cmake)")")"
+          "$cmake_root/bin/cmake" --version | head -1
+          # 诊断：SDK 里有哪些 cmake 版本（PATH 搜索失败时的备选）。
+          (yes | sdkmanager --list 2>/dev/null | grep -i "cmake;" | head -5) || true
+          # AGP 读 cmake.dir：setup-android 会重定向 GRADLE_USER_HOME，用户级
+          # gradle.properties 可能被绕过 —— 项目级（必读）+ 用户级双写兜底。
+          # 项目文件改动只存在于本 job，不进仓库。
+          echo "cmake.dir=$cmake_root" >> platform/android/gradle.properties
+          gradle_home="${GRADLE_USER_HOME:-$HOME/.gradle}"
+          mkdir -p "$gradle_home"
+          echo "cmake.dir=$cmake_root" >> "$gradle_home/gradle.properties"
+
+      - name: Prepare HuxerUI CLI and source
+        run: |
+          set -euo pipefail
+          mkdir -p huxerui-sdk
+          tar -xzf third_party/tarballs/huxerui-sdk-0.3.0-linux-x86_64.tar.gz \
+            -C huxerui-sdk --strip-components=1
+          test -x huxerui-sdk/bin/huxerui
+          git clone --filter=blob:none "$HUXERUI_REPO" huxerui-source
+          git -C huxerui-source checkout "$HUXERUI_COMMIT"
+          test -f huxerui-source/CMakeLists.txt
+          test -f huxerui-source/platform/android/huxerui/build.gradle
+          echo "HUXERUI_HOME=$PWD/huxerui-sdk" >> "$GITHUB_ENV"
+          echo "$PWD/huxerui-sdk/bin" >> "$GITHUB_PATH"
+          huxerui-sdk/bin/huxerui --version
+
+      - name: Configure Android release signing
+        env:
+          CLASHFLUX_ANDROID_KEYSTORE_BASE64: ${{ secrets.CLASHFLUX_ANDROID_KEYSTORE_BASE64 }}
+          CLASHFLUX_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.CLASHFLUX_ANDROID_KEYSTORE_PASSWORD }}
+          CLASHFLUX_ANDROID_KEY_ALIAS: ${{ secrets.CLASHFLUX_ANDROID_KEY_ALIAS }}
+          CLASHFLUX_ANDROID_KEY_PASSWORD: ${{ secrets.CLASHFLUX_ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$CLASHFLUX_ANDROID_KEYSTORE_BASE64"
+          test -n "$CLASHFLUX_ANDROID_KEYSTORE_PASSWORD"
+          test -n "$CLASHFLUX_ANDROID_KEY_ALIAS"
+          test -n "$CLASHFLUX_ANDROID_KEY_PASSWORD"
+          keystore="$RUNNER_TEMP/clash-flux-release.jks"
+          printf '%s' "$CLASHFLUX_ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          test -s "$keystore"
+          chmod 600 "$keystore"
+          {
+            echo "ORG_GRADLE_PROJECT_clashfluxReleaseKeystoreFile=$keystore"
+            echo "ORG_GRADLE_PROJECT_clashfluxReleaseKeystorePassword=$CLASHFLUX_ANDROID_KEYSTORE_PASSWORD"
+            echo "ORG_GRADLE_PROJECT_clashfluxReleaseKeyAlias=$CLASHFLUX_ANDROID_KEY_ALIAS"
+            echo "ORG_GRADLE_PROJECT_clashfluxReleaseKeyPassword=$CLASHFLUX_ANDROID_KEY_PASSWORD"
+            echo 'ORG_GRADLE_PROJECT_clashfluxRequireReleaseSigning=true'
+          } >> "$GITHUB_ENV"
+
+      - name: Build Android package (GUI/native shell + sing-box libbox)
+        run: |
+          set -euo pipefail
+          huxerui build android --source huxerui-source --profile release
+
+      - name: Stage Android artifact
+        run: |
+          set -euo pipefail
+          mkdir -p dist-src
+          apk="$(find platform/android/app/build -type f -path '*/outputs/apk/release/*.apk' -print -quit)"
+          test -n "$apk"
+          cp "$apk" dist-src/clash-flux-android-arm64-v8a.apk
+          test -s dist-src/clash-flux-android-arm64-v8a.apk
+          # libbox is the only Android data-plane library.  Keep unsupported
+          # ABI slices out of the published arm64-only APK.
+          unzip -l dist-src/clash-flux-android-arm64-v8a.apk \
+            | grep -q 'lib/arm64-v8a/libbox.so'
+          ! unzip -l dist-src/clash-flux-android-arm64-v8a.apk \
+            | grep -Eq 'lib/arm64-v8a/lib(mihomo|clash)\\.so'
+          ! unzip -l dist-src/clash-flux-android-arm64-v8a.apk \
+            | grep -Eq 'lib/(x86|x86_64|armeabi-v7a)/'
+          ls -lh dist-src
+
+      - name: Verify Android APK signature
+        run: |
+          set -euo pipefail
+          apk="dist-src/clash-flux-android-arm64-v8a.apk"
+          apksigner="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner -print | sort -V | tail -n 1)"
+          test -n "$apksigner"
+          # Lower the verifier's minimum to API 23 so apksigner checks the
+          # legacy v1 signature even though this app's minSdk is 24.
+          report="$("$apksigner" verify --verbose --min-sdk-version 23 --print-certs "$apk")"
+          printf '%s\n' "$report"
+          grep -Fq 'Verified using v1 scheme (JAR signing): true' <<<"$report"
+          grep -Fq 'Verified using v2 scheme (APK Signature Scheme v2): true' <<<"$report"
+          grep -Fq 'certificate SHA-256 digest: 6b9a98c1aa621c7f33c5521e75f3380927a0ec9764834693b8f84195b1688cc2' <<<"$report"
+
+      - name: Upload Android artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-android
+          path: dist-src
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-release:
+    name: publish-release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-android]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download Android APK
+        uses: actions/download-artifact@v8
+        with:
+          name: build-android
+          path: dist-src
+
+      - name: Publish Android release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release_version="${GITHUB_REF_NAME#v}"
+          notes="docs/releases/${GITHUB_REF_NAME}.md"
+          args=(--title "Clash-Flux v${release_version}" --target "$GITHUB_SHA")
+          if [ -f "$notes" ]; then
+            args+=(--notes-file "$notes")
+          else
+            args+=(--generate-notes)
+          fi
+          gh release create "$GITHUB_REF_NAME"             "dist-src/clash-flux-android-arm64-v8a.apk#clash-flux-${release_version}-android-arm64-v8a.apk"             "${args[@]}"

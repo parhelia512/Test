@@ -1,0 +1,837 @@
+// settings_page.cpp — 外观、网络、资源、启动与后台、维护和关于；日常运行控制放在首页。
+//
+// 平台专属内容由模块入口处的编译宏选择，平台函数内部自洽管理状态、
+// 任务、权限和控件；这里不维护 Android/桌面能力矩阵。
+#include <huxerui/huxerui.h>
+
+#include <algorithm>
+#include <chrono>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <stdexcept>
+#include <vector>
+
+#include "app_resources.h"
+#include "ui.h"
+#include "page_loading.h"
+#include "action_menu.h"
+#include "task_bridge.h"
+#include "runtime_diagnostics.h"
+#include "diagnostic_export_file.h"
+#include "app_http_client.h"
+#include "about_update.h"
+#include "app_update_model.h"
+#include "app_runtime_services.h"
+#include "page_layout.h"
+#include "subscription_rule_layout.h"
+#include "refresh_motion.h"
+
+import clashflux.config;
+import clashflux.core;
+import clashflux.db;
+import clashflux.stream;
+import clashflux.store.core;
+
+#include "core_model.h"
+#include "core_control.h"
+#include "profiles_cache.h"
+#include "settings_model.h"
+#include "theme_colors.h"
+#include "theme_color_card.h"
+#include "settings_group_layout.h"
+
+namespace clashflux::ui {
+namespace {
+
+const std::vector<huxerui::StringVariant> kThemeNames{
+    Localized("自动"), Localized("深色"), Localized("浅色")};
+const std::vector<std::string> kLanguages{"system", "zh", "en"};
+const std::vector<huxerui::StringVariant> kLanguageNames{
+    Localized("自动"), "简体中文", "English"};
+
+std::size_t LanguageIndex(const std::string& language) {
+    const auto found = std::find(kLanguages.begin(), kLanguages.end(), language);
+    return found == kLanguages.end() ? 0U : static_cast<std::size_t>(found - kLanguages.begin());
+}
+
+void ApplyLanguage(const std::shared_ptr<SettingsModel>& model, std::size_t index) {
+    if (index >= kLanguages.size()) return;
+    const std::string language = kLanguages[index];
+    store::coreStore().setSetting("ui.language", language);
+    model->Update([language](SettingsView& settings) { settings.language = language; });
+}
+
+constexpr bool kNetworkMobilePage = true;
+
+} // namespace
+
+// 图标与名称共用整行点击区域，入口布局不依赖平台。
+[[huxerui::composable]] huxerui::View SettingNavigationItem(
+    huxerui::StringVariant label, huxerui::ImageResource icon, std::function<void()> open,
+    float horizontalInset = -1.0F) {
+    const huxerui::ThemeSpec& theme = huxerui::UseTheme();
+    const float inset = horizontalInset < 0.0F ? ResolveIslandTheme(theme).island_padding : horizontalInset;
+    return SettingsActionRow(huxerui::Row {
+      SettingItemIcon(icon),
+      huxerui::Text(label).With(huxerui::Grow(1.0F)),
+    }.With(huxerui::Spacing(12.0F), huxerui::CrossAlign(huxerui::CrossAxisAlignment::Center)),
+        open, {.role = huxerui::SemanticRole::Button, .label = label}, SettingsRowInsets{inset, 10.0F, 48.0F});
+}
+
+[[huxerui::composable]] huxerui::View MoreNavRow(
+    huxerui::StringVariant label, huxerui::ImageResource icon, std::function<void()> open) {
+    return SettingNavigationItem(label, icon, open);
+}
+
+[[huxerui::composable]] huxerui::View SettingsSectionCard(
+    huxerui::StringVariant title, huxerui::View content) {
+    const auto& theme = huxerui::UseTheme();
+    const float inset = ResolveIslandTheme(theme).island_padding;
+    return huxerui::Column {
+        huxerui::Column {SectionTitle(title)}.With(
+            huxerui::Padding(huxerui::EdgeInsets::Symmetric(inset, 0.0F)))
+            .Key("settings-group-heading"),
+        Card(huxerui::ProvideEnvironment(SettingsRowInsets{inset, 10.0F, 48.0F}, content), false, 0.0F)
+            .Key("settings-group-surface"),
+    }.With(huxerui::Spacing(theme.spacing.small),
+           huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch));
+}
+
+void SelectThemeColor(const std::shared_ptr<SettingsModel>& model, const std::string& id) {
+    if (model->view.Get().themeColor == id) return;
+    store::coreStore().setSetting("ui.theme_color", id);
+    model->Update([id](SettingsView& settings) { settings.themeColor = id; });
+}
+
+void DeleteThemeColor(const std::shared_ptr<SettingsModel>& model, const std::string& id) {
+    const SettingsView current = model->view.Get();
+    const auto colors = ReadCustomThemeColors(current.customThemeColors);
+    const auto hidden = ReadHiddenThemeColors(current.hiddenThemeColors);
+    const bool preset = IsPresetThemeColor(id);
+    const auto remaining = preset ? colors : RemoveCustomThemeColor(colors, id);
+    const auto remainingHidden = preset ? HidePresetThemeColor(hidden, id) : hidden;
+    const bool removeColor = remaining != colors;
+    const bool hideColor = remainingHidden != hidden;
+    const bool resetSelection = current.themeColor == id;
+    if (!removeColor && !hideColor && !resetSelection) return;
+
+    const std::string saved = removeColor ? SaveCustomThemeColors(remaining) : current.customThemeColors;
+    const std::string savedHidden = hideColor ? SaveHiddenThemeColors(remainingHidden) : current.hiddenThemeColors;
+    std::string selectedColor = current.themeColor;
+    if (resetSelection) {
+        const auto firstVisiblePreset = std::find_if(kFluxAccents.begin(), kFluxAccents.end(),
+            [&remainingHidden](const FluxAccent& accent) {
+                return std::find(remainingHidden.begin(), remainingHidden.end(), accent.id) == remainingHidden.end();
+            });
+        if (firstVisiblePreset != kFluxAccents.end()) selectedColor = firstVisiblePreset->id;
+        else if (!remaining.empty()) selectedColor = remaining.front();
+        else selectedColor = "blue";
+    }
+    if (removeColor) store::coreStore().setSetting("ui.custom_theme_colors", saved);
+    if (hideColor) store::coreStore().setSetting("ui.hidden_theme_colors", savedHidden);
+    if (resetSelection) store::coreStore().setSetting("ui.theme_color", selectedColor);
+    model->Update([saved, savedHidden, selectedColor, removeColor, hideColor, resetSelection](SettingsView& settings) {
+        if (removeColor) settings.customThemeColors = saved;
+        if (hideColor) settings.hiddenThemeColors = savedHidden;
+        if (resetSelection) settings.themeColor = selectedColor;
+    });
+}
+
+[[huxerui::composable]] huxerui::View ThemeColorEditor(
+    std::shared_ptr<SettingsModel> model, std::function<void()> onClose,
+    std::string initialHex, std::optional<std::string> editingId, bool fullPage) {
+    const auto& theme = huxerui::UseTheme();
+    const bool editing = editingId.has_value();
+    auto input = huxerui::UseState(huxerui::TextEditingValue{initialHex});
+    auto hsb = huxerui::UseState(ThemeColorToHsb(ThemeColorFromHex(initialHex)));
+    const auto close = UseEditorClose([input, initialHex] {
+        return NormalizeThemeColor(input.Get().text) != NormalizeThemeColor(initialHex);
+    }, [] { return false; }, onClose);
+    const auto hex = NormalizeThemeColor(input.Get().text);
+    const HsbColor currentHsb = hsb.Get();
+    const auto preview = hex ? ThemeColorFromHex(*hex) : ThemeColorFromHsb(currentHsb);
+    std::vector<huxerui::View> sliders;
+    const std::array<float, 3> channels{
+        currentHsb.hue,
+        currentHsb.saturation * kHsbPercentMaximum,
+        currentHsb.brightness * kHsbPercentMaximum};
+    const std::array<float, 3> maximums{
+        kHsbHueSliderMaximum, kHsbPercentMaximum, kHsbPercentMaximum};
+    const std::array<std::string_view, 3> units{"°", "%", "%"};
+    const std::array<HsbChannel, 3> channelsByKind{
+        HsbChannel::Hue, HsbChannel::Saturation, HsbChannel::Brightness};
+    const auto sliderStyle = HsbGradientSliderStyle(huxerui::UseEnvironment<huxerui::SliderStyle>(), preview);
+    for (std::size_t index = 0; index < channels.size(); ++index) {
+        const HsbChannel channel = channelsByKind[index];
+        sliders.push_back(huxerui::Row {
+          huxerui::Stack {
+            HsbGradientSliderTrack(HsbChannelGradient(currentHsb, channel), sliderStyle),
+            huxerui::ProvideEnvironment(sliderStyle,
+                huxerui::Slider(std::round(channels[index])).Range(0.0F, maximums[index]).Step(1.0F)
+                    .OnChanged([input, hsb, channel](float value) {
+                        const HsbColor changed = UpdateHsbChannel(hsb.Get(), channel, value);
+                        hsb = changed;
+                        input = huxerui::TextEditingValue{ThemeColorToHex(ThemeColorFromHsb(changed))};
+                    })),
+          }.With(huxerui::Grow(1.0F), huxerui::Align(huxerui::HorizontalAlignment::Stretch,
+                                                    huxerui::VerticalAlignment::Center)),
+          huxerui::Text(std::to_string(static_cast<int>(std::round(channels[index]))) +
+                        std::string{units[index]})
+              .With(huxerui::Frame{.width = theme.spacing.extra_large}),
+        }.With(huxerui::Spacing(theme.spacing.small), huxerui::CrossAlign(huxerui::CrossAxisAlignment::Center)));
+    }
+    const auto save = [model, input, onClose, editingId] {
+        const auto color = NormalizeThemeColor(input.Get().text);
+        if (!color || !model->view.Get().ready) return;
+        const SettingsView current = model->view.Get();
+        auto colors = ReadCustomThemeColors(current.customThemeColors);
+        auto hiddenColors = ReadHiddenThemeColors(current.hiddenThemeColors);
+        if (editingId) {
+            colors = ReplaceCustomThemeColor(std::move(colors), *editingId, *color);
+            hiddenColors = HidePresetThemeColor(std::move(hiddenColors), *editingId);
+        } else if (std::find(colors.begin(), colors.end(), *color) == colors.end()) {
+            colors.push_back(*color);
+        }
+        const std::string saved = SaveCustomThemeColors(colors);
+        const std::string savedHidden = SaveHiddenThemeColors(hiddenColors);
+        store::coreStore().setSetting("ui.custom_theme_colors", saved);
+        if (savedHidden != current.hiddenThemeColors)
+            store::coreStore().setSetting("ui.hidden_theme_colors", savedHidden);
+        const std::string selectedColor =
+            !editingId || current.themeColor == *editingId ? *color : current.themeColor;
+        if (current.themeColor != selectedColor)
+            store::coreStore().setSetting("ui.theme_color", selectedColor);
+        model->Update([saved, savedHidden, selectedColor](SettingsView& settings) {
+            settings.customThemeColors = saved;
+            settings.hiddenThemeColors = savedHidden;
+            settings.themeColor = selectedColor;
+        });
+        onClose();
+    };
+    huxerui::View fields = huxerui::Column {
+      huxerui::Row {}.With(huxerui::Frame{.height = kThemeColorPreviewHeight},
+          huxerui::Background(preview), huxerui::CornerRadius(theme.shapes.medium)),
+      huxerui::TextField(input.Get()).Label(Localized("颜色值"))
+          .Variant(huxerui::TextFieldVariant::Outlined)
+          .Placeholder("#RRGGBB")
+          .Validation(hex ? huxerui::ValidationResult::None() :
+              huxerui::ValidationResult::Invalid(Localized("请输入六位十六进制颜色值")))
+          .OnChanged([input, hsb](const huxerui::TextEditingValue& value) {
+              input = value;
+              if (const auto normalized = NormalizeThemeColor(value.text))
+                  hsb = ThemeColorToHsb(ThemeColorFromHex(*normalized));
+          })
+          .OnSubmitted(save),
+      huxerui::Column(std::move(sliders)).With(huxerui::Spacing(theme.spacing.small),
+          huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch)),
+    }.With(huxerui::Spacing(theme.spacing.medium),
+           huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch));
+    const auto title = Localized(editing ? "编辑颜色" : "添加颜色");
+    if (fullPage) {
+        huxerui::View body = FormPageContent(ScrollablePageContent(fields));
+        const auto action = FormHeaderAction(app::images::save, Localized(editing ? "保存" : "添加"), save,
+            hex.has_value() && model->view.Get().ready);
+        if (kPageTitlesInWindow && huxerui::UseViewportClass() != huxerui::ViewportClass::Compact) {
+            const auto back = huxerui::IconButton(app::images::arrow_back, Localized("返回上一页")).OnClick(close);
+            return PageScaffold(title, action, body, true, false, true, std::nullopt, back)
+                .On<huxerui::ViewEvents::BackRequested>(close);
+        }
+        return SecondaryPageScaffold(huxerui::Text(title, huxerui::TextRole::Title),
+            action, body, close, false, false, true);
+    }
+    return DialogScaffold(DialogHeader(title),
+        huxerui::ScrollView(fields).With(huxerui::Frame{.max_height = 420.0F}, huxerui::ScrollBar()),
+        DialogActions({DialogAction(Localized("取消"), close, false),
+            DialogAction(Localized(editing ? "保存" : "添加"), save, true,
+                hex.has_value() && model->view.Get().ready)}), DialogSize::Small);
+}
+
+[[huxerui::composable]] huxerui::View ThemeColorDialog(
+    std::shared_ptr<SettingsModel> model, huxerui::DialogContext context,
+    std::string initialHex, std::optional<std::string> editingId) {
+    return ThemeColorEditor(model, [context] { context.Dismiss(); }, initialHex, editingId, false);
+}
+
+[[huxerui::composable]] huxerui::View ThemeColorEditorPage(
+    std::string initialHex, std::optional<std::string> editingId, std::function<void()> onBack) {
+    return ThemeColorEditor(huxerui::UseService<SettingsModel>(), onBack, initialHex, editingId, true);
+}
+
+[[huxerui::composable]] huxerui::View ThemeColorCard(
+    FluxAccent accent, bool selected, std::shared_ptr<SettingsModel> model, float edge,
+    huxerui::DialogHandle dialog) {
+    const auto& theme = huxerui::UseTheme();
+    auto menu = UseActionMenu();
+    auto tasks = huxerui::UseTaskScope();
+    const auto navigation = huxerui::UseNavigation();
+    const bool compact = huxerui::UseViewportClass() == huxerui::ViewportClass::Compact;
+    const auto fill = IsDarkTheme(theme) ? accent.dark : accent.light;
+    const auto foreground = IsDarkTheme(theme) ? accent.onDark : accent.onLight;
+    const huxerui::StringVariant label = accent.id.starts_with('#') ? huxerui::StringVariant{accent.name} : Localized(accent.name);
+    huxerui::View card = ThemeColorCardSurface(theme, fill, foreground,
+        selected ? std::optional<huxerui::ImageResource>{app::images::check} : std::nullopt,
+        selected, huxerui::UseString(label), [model, id = accent.id] { SelectThemeColor(model, id); }, edge, accent.id)
+        .Key("theme-color-" + accent.id);
+    const std::string id = accent.id;
+    const std::string initialHex = id.starts_with('#') ? id : ThemeColorToHex(accent.light);
+    const auto edit = [dialog, navigation, compact, model, id, initialHex] {
+        if (compact) {
+            navigation.Push(ThemeColorEditorRoutePage, initialHex, std::optional<std::string>{id});
+            return;
+        }
+        ShowEditorDialog(dialog, [model, id, initialHex](huxerui::DialogContext context) {
+            return ThemeColorDialog(model, context, initialHex, id);
+        });
+    };
+    const auto remove = [model, id] { DeleteThemeColor(model, id); };
+    return std::move(card).On<huxerui::ViewEvents::ContextMenuRequested>(
+        [menu, tasks, edit, remove](huxerui::Point position) {
+            std::vector<ActionMenuEntry> entries{
+                ActionMenuItem(app::images::edit, Localized("编辑"), edit),
+                ActionMenuItem(app::images::trash, Localized("删除"), remove).Danger(),
+            };
+            tasks.Launch([menu, position, entries = std::move(entries)]() mutable -> huxerui::Task<void> {
+                co_await huxerui::Delay(std::chrono::duration<double>{0});
+                menu.ShowAt(position, std::move(entries));
+            });
+        });
+}
+
+[[huxerui::composable]] huxerui::View ThemePage(
+    huxerui::State<int> themeMode, std::function<void()> onBack, bool windowTitle) {
+    const auto& theme = huxerui::UseTheme();
+    auto tasks = huxerui::UseTaskScope();
+    auto transition = huxerui::UseSceneTransition();
+    struct ThemeAnimationFlag {
+        bool animating = false;
+    };
+    auto animating =
+        huxerui::UseState(std::make_shared<ThemeAnimationFlag>());
+    const auto settingsModel = huxerui::UseService<SettingsModel>();
+    // 主题模式：0=自动，1=深色，2=浅色。
+    const bool systemDark = huxerui::UseSystemThemeBrightness() == huxerui::ThemeBrightness::Dark;
+    const auto applyTheme = [themeMode, transition, tasks, animating,
+                             settingsModel, systemDark, motion = theme.motion](int mode) {
+        if (animating.Get()->animating) return;
+        const bool currentDark =
+            themeMode.Get() == 1 ||
+            (themeMode.Get() == 0 && systemDark);
+        const bool targetDark =
+            mode == 1 || (mode == 0 && systemDark);
+        const auto mutation = [themeMode, mode, settingsModel] {
+            store::coreStore().setSetting("ui.theme_mode", std::to_string(mode));
+            settingsModel->Update([mode](SettingsView& settings) {
+                settings.themeMode = mode;
+            });
+            themeMode = mode;
+        };
+        if (currentDark == targetDark || motion.reduced_motion) {
+            mutation();
+            return;
+        }
+
+        animating.Get()->animating = true;
+        tasks.Launch([animating, duration = motion.slow + motion.fast]() -> huxerui::Task<void> {
+            co_await huxerui::Delay(std::chrono::duration<double>{duration});
+            animating.Get()->animating = false;
+        });
+        const huxerui::TransitionSpec reveal{
+            huxerui::CircularRevealTransition{}, huxerui::TweenSpec{motion.slow}};
+        transition.RunFromCurrentInteraction(
+            currentDark ? reveal.Reversed() : reveal, std::move(mutation));
+    };
+
+    const auto dialog = huxerui::UseDialog();
+    const auto navigation = huxerui::UseNavigation();
+    const bool compact = huxerui::UseViewportClass() == huxerui::ViewportClass::Compact;
+    const SettingsView settings = settingsModel->view.Get();
+    const float cardEdge = huxerui::UseViewportClass() == huxerui::ViewportClass::Compact ?
+        kThemeColorCompactCardEdge : kThemeColorCardEdge;
+    const auto selectedAccent = ResolveFluxAccent(settings.themeColor);
+    std::vector<huxerui::View> colors;
+    const auto hiddenColors = ReadHiddenThemeColors(settings.hiddenThemeColors);
+    for (const auto& accent : kFluxAccents)
+        if (std::find(hiddenColors.begin(), hiddenColors.end(), accent.id) == hiddenColors.end())
+            colors.push_back(ThemeColorCard(
+                accent, accent.id == selectedAccent.id, settingsModel, cardEdge, dialog));
+    auto customColors = ReadCustomThemeColors(settings.customThemeColors);
+    if (selectedAccent.id.starts_with('#') &&
+        std::find(customColors.begin(), customColors.end(), selectedAccent.id) == customColors.end())
+        customColors.push_back(selectedAccent.id);
+    for (const auto& id : customColors)
+        colors.push_back(ThemeColorCard(
+            ResolveFluxAccent(id), id == selectedAccent.id, settingsModel, cardEdge, dialog));
+    const std::array<huxerui::ImageResource, 3> modeIcons{
+        app::images::sun_moon, app::images::moon, app::images::sun};
+    std::vector<huxerui::View> modes;
+    for (std::size_t index = 0; index < kThemeNames.size(); ++index) {
+        const bool selected = static_cast<int>(index) == themeMode.Get();
+        modes.push_back(ThemeModeCardSurface(theme, modeIcons[index],
+            selected, huxerui::UseString(kThemeNames[index]),
+            [applyTheme, index] { applyTheme(static_cast<int>(index)); },
+            compact ? kThemeModeCompactCardWidth : kThemeModeCardWidth)
+            .Key("theme-mode-" + std::to_string(index)));
+    }
+    colors.push_back(ThemeColorCardSurface(theme, ResolveIslandTheme(theme).active,
+        theme.colors.on_surface_variant, app::images::add, false,
+        huxerui::UseString(Localized("添加颜色")), [dialog, navigation, compact, settingsModel] {
+            if (compact) {
+                navigation.Push(ThemeColorEditorRoutePage, ThemeColorToHex(FluxPalette::water()),
+                    std::optional<std::string>{});
+                return;
+            }
+            ShowEditorDialog(dialog, [settingsModel](huxerui::DialogContext context) {
+                return ThemeColorDialog(settingsModel, context,
+                    ThemeColorToHex(FluxPalette::water()), std::nullopt);
+            });
+        }, cardEdge).Key("theme-color-add"));
+    huxerui::View content = ScrollablePageContent(huxerui::Column {
+      SectionTitle(Localized("模式")),
+      huxerui::Row(std::move(modes)).With(huxerui::Spacing(kSectionCardSpacing),
+          huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch)),
+      SectionTitle(Localized("主题色")),
+      huxerui::Flow(std::move(colors)).With(huxerui::Spacing(kSectionCardSpacing)),
+    }.With(huxerui::Spacing(theme.spacing.medium),
+           huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch)));
+    if (windowTitle) {
+        huxerui::View back = huxerui::IconButton(app::images::arrow_back, Localized("返回上一页"))
+            .OnClick(onBack);
+        return PageScaffold(Localized("主题"), huxerui::View{}, content,
+                            true, false, true, std::nullopt, back)
+            .On<huxerui::ViewEvents::BackRequested>(onBack);
+    }
+    return SecondaryPageScaffold(
+        huxerui::Text(Localized("主题"), huxerui::TextRole::Title), huxerui::View{}, content, onBack);
+}
+
+// 独立语言页与桌面选择框共用同一模型及写入口，选择立即更新全应用语言。
+[[huxerui::composable]] huxerui::View LanguageChoices(std::function<void()> onSelected) {
+    const auto settingsModel = huxerui::UseService<SettingsModel>();
+    const std::size_t selected = LanguageIndex(settingsModel->view.Get().language);
+    std::vector<huxerui::View> choices;
+    for (std::size_t index = 0; index < kLanguages.size(); ++index) {
+        if (index != 0) choices.push_back(huxerui::Divider());
+        choices.push_back(
+            huxerui::RadioButton(index == 0 ? Localized("自动跟随系统语言") : kLanguageNames[index], index == selected)
+                .OnChanged([settingsModel, index, onSelected](bool checked) {
+                    if (!checked) return;
+                    ApplyLanguage(settingsModel, index);
+                    if (onSelected) onSelected();
+                })
+                .With(huxerui::Padding(huxerui::EdgeInsets::Symmetric(12.0F, 10.0F)),
+                      huxerui::Frame{.min_height = 48.0F})
+                .Key("language-option-" + kLanguages[index]));
+    }
+    return huxerui::Column(std::move(choices)).With(
+        huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch));
+}
+
+[[huxerui::composable]] huxerui::View LanguagePage(std::function<void()> onBack) {
+    return SecondaryPageScaffold(
+        huxerui::Text(Localized("语言"), huxerui::TextRole::Title), huxerui::View{},
+        ScrollablePageContent(LanguageChoices({})), onBack);
+}
+
+[[huxerui::composable]] huxerui::View ResponsiveLanguageSetting() {
+    const bool compact = huxerui::UseViewportClass() == huxerui::ViewportClass::Compact;
+    const auto navigation = huxerui::UseNavigation();
+    const auto dialog = huxerui::UseDialog();
+    return SettingNavigationItem(Localized("语言"), app::images::language,
+        [compact, navigation, dialog] {
+            if (compact) {
+                navigation.Push(LanguageRoutePage);
+                return;
+            }
+            dialog.Show([](huxerui::DialogContext context) {
+                const auto close = [context] { context.Dismiss(); };
+                return DialogScaffold(DialogHeader(Localized("语言")), LanguageChoices(close),
+                    DialogActions({DialogAction(Localized("取消"), close, false)}), DialogSize::Small);
+            });
+        }).Key("settings-language");
+}
+
+[[huxerui::composable]] huxerui::View AndroidThemeSetting(huxerui::State<int> themeMode) {
+    const huxerui::NavigationController navigation = huxerui::UseNavigation();
+    return SettingNavigationItem(Localized("主题"), app::images::sun_moon,
+        [navigation, themeMode] { navigation.Push(AndroidThemePage, themeMode); })
+        .Key("settings-theme");
+}
+
+[[huxerui::composable]] huxerui::View AndroidLanguageSetting() {
+    return ResponsiveLanguageSetting();
+}
+
+[[huxerui::composable]] huxerui::View AndroidMoreSettings(
+    huxerui::State<std::size_t>, ProfilesCache profilesCache) {
+    const huxerui::NavigationController navigation = huxerui::UseNavigation();
+    // 同组入口合并成一段；外层由设置页统一加一层卡片。
+    return huxerui::Column {
+        huxerui::Column {
+            MoreNavRow(Localized("规则"), app::images::route, [navigation, profilesCache] {
+                navigation.Push([profilesCache] {
+                    return AndroidRulesPage(profilesCache);
+                });
+            }),
+            MoreNavRow(Localized("连接"), app::images::connections,
+                       [navigation] { navigation.Push(AndroidConnectionsPage); }),
+            MoreNavRow(Localized("日志"), app::images::logs,
+                       [navigation] { navigation.Push(AndroidLogsPage); }),
+            MoreNavRow(Localized("网站测试"), app::images::website_test,
+                       [navigation] { navigation.Push(WebsiteTestsRoutePage); }),
+        }.With(huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch)),
+    }.With(huxerui::Spacing(0.0F),
+           huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch));
+}
+
+[[huxerui::composable]] huxerui::View NetworkSettingsEntry(HomeProxySettingsKind kind) {
+    const auto settings = huxerui::UseService<SettingsModel>();
+    const auto dialog = huxerui::UseDialog();
+    const auto navigation = huxerui::UseNavigation();
+    const bool compact = huxerui::UseViewportClass() == huxerui::ViewportClass::Compact;
+    return SettingNavigationItem(kind == HomeProxySettingsKind::Tun ? Localized("虚拟网卡") :
+            kNetworkMobilePage ? Localized("本地代理") : Localized("系统代理"),
+        kind == HomeProxySettingsKind::Tun ? app::images::tun : app::images::port,
+        [settings, dialog, navigation, compact, kind] {
+            if (!settings->view.Get().ready) return;
+            if (compact || kNetworkMobilePage) { navigation.Push(HomeProxySettingsRoutePage, kind); return; }
+            ShowNetworkSettingsDialog(dialog, kind == HomeProxySettingsKind::Tun);
+        });
+}
+[[huxerui::composable]] huxerui::View RuntimeDiagnosticsBody(
+    huxerui::State<huxerui::TextEditingValue> target, std::function<void()> onClose, bool fullPage) {
+    const auto control = UseCoreControl();
+    const auto model = control.model;
+    const auto clipboard = control.clipboard;
+    const auto picker=huxerui::UseService<huxerui::FilePicker>();
+    const auto toast=UseFluxToast();
+    const std::string reportType=huxerui::UseString(Localized("诊断报告"));
+    const bool busy = model->diagnosticsBusy.Get();
+    const auto report = model->diagnosticsReport.Get();
+    const auto save=[control,model,picker,toast,report,reportType] {
+        if(model->diagnosticsExportBusy.Get()||report->empty()||!picker->CanSaveFiles())return;
+        model->diagnosticsExportBusy=true;
+        control.tasks.Launch([model,picker,toast,report,reportType]() -> huxerui::Task<void> {
+            try {
+                const auto file=co_await RunOnTaskThread([report] {
+                    return DiagnosticExportFile::Prepare(cfg::dataDir(),*report);
+                });
+                const bool saved=co_await picker->SaveFileAsync(huxerui::File(file->Path().string()),
+                    huxerui::SaveFileOptions{.suggested_name="clash-flux-health.txt",
+                        .filter={.name=reportType,.extensions={"txt"},.content_types={"text/plain"}}});
+                if(saved)toast.Show(Localized("诊断报告已保存"));
+            } catch(...) {toast.Show(Localized("诊断报告保存失败"));}
+            model->diagnosticsExportBusy=false;
+        });
+    };
+    const auto start = [control, model, target] {
+        if (control.Busy() || model->diagnosticsBusy.Get()) return;
+        model->diagnosticsCancel = std::stop_source{};
+        const auto token = model->diagnosticsCancel.get_token();
+        const auto serial = ++model->diagnosticsSerial;
+        const auto revision = model->operations.revision.Get();
+        const std::string url = target.Get().text;
+        model->diagnosticsBusy = true;
+        model->diagnosticsReport = std::make_shared<const std::string>();
+        control.tasks.Launch([model, url, token, serial, revision]() -> huxerui::Task<void> {
+            std::string result;
+            try {
+                result = co_await RunOnTaskThread([url, token] {
+                    return store::coreStore().runtimeDiagnostics(url, token);
+                });
+            } catch (...) { result = "diagnostic=failed; unable to collect evidence"; }
+            if (serial != model->diagnosticsSerial) co_return;
+            model->diagnosticsBusy = false;
+            model->diagnosticsReport = std::make_shared<const std::string>(
+                token.stop_requested() || !model->operations.AcceptsPoll(revision)
+                    ? std::string("diagnostic=cancelled-or-superseded; results discarded") : std::move(result));
+        });
+    };
+    return RuntimeDiagnosticsContent(target, busy, !control.Busy(), report, start,
+        [model] { model->diagnosticsCancel.request_stop(); },
+        [clipboard, report, toast] {
+            toast.Show(Localized(clipboard && clipboard->WriteText(*report)
+                ? "已复制到剪贴板" : "复制失败"));
+        },
+        onClose, save, picker->CanSaveFiles(), model->diagnosticsExportBusy.Get(), fullPage);
+}
+
+[[huxerui::composable]] huxerui::View RuntimeDiagnosticsDialog(huxerui::DialogContext context) {
+    const auto target = huxerui::UseState(huxerui::TextEditingValue{});
+    return DialogCard(huxerui::Column {RuntimeDiagnosticsBody(target, [context] { context.Dismiss(); }, false)}
+        .With(huxerui::Frame{.width = 520.0F, .height = 560.0F},
+            huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch)));
+}
+
+[[huxerui::composable]] huxerui::View RuntimeDiagnosticsPage(std::function<void()> onBack) {
+    const auto target = huxerui::UseState(huxerui::TextEditingValue{});
+    const auto body = RuntimeDiagnosticsBody(target, onBack, true);
+    if (kPageTitlesInWindow && huxerui::UseViewportClass() != huxerui::ViewportClass::Compact) {
+        const auto back = huxerui::IconButton(app::images::arrow_back, Localized("返回上一页")).OnClick(onBack);
+        return PageScaffold(Localized("运行诊断"), {}, body, true, false, true, std::nullopt, back)
+            .On<huxerui::ViewEvents::BackRequested>(onBack);
+    }
+    return SecondaryPageScaffold(huxerui::Text(Localized("运行诊断"), huxerui::TextRole::Title),
+        {}, body, onBack);
+}
+
+[[huxerui::composable]] huxerui::View RuntimeDiagnosticsEntry() {
+    const auto dialog = huxerui::UseDialog();
+    const auto navigation = huxerui::UseNavigation();
+    const bool compact = huxerui::UseViewportClass() == huxerui::ViewportClass::Compact;
+    const float inset = ResolveIslandTheme(huxerui::UseTheme()).island_padding;
+    return SettingNavigationItem(Localized("运行诊断"), app::images::info, [dialog, navigation, compact] {
+        if (compact) {
+            navigation.Push(RuntimeDiagnosticsRoutePage);
+            return;
+        }
+        dialog.Show([](huxerui::DialogContext context) { return RuntimeDiagnosticsDialog(context); });
+    }, inset).Key("settings-diagnostics-full-width");
+}
+
+[[huxerui::composable]] huxerui::View HomeProxySettingsPage(
+    HomeProxySettingsKind kind, std::function<void()> onBack) {
+    return NetworkSettingsEditor(kind == HomeProxySettingsKind::Tun, onBack, true);
+}
+
+[[huxerui::composable]] huxerui::View HomeProxySettingsAction(HomeProxySettingsKind kind) {
+    const auto dialog = huxerui::UseDialog();
+    const auto navigation = huxerui::UseNavigation();
+    const auto settings = huxerui::UseService<SettingsModel>();
+    const bool compact = huxerui::UseViewportClass() == huxerui::ViewportClass::Compact;
+    const huxerui::StringVariant label = kind == HomeProxySettingsKind::SystemProxy
+        ? Localized("系统代理设置") : Localized("虚拟网卡设置");
+    return huxerui::IconButton(app::images::gear, label)
+        .With(huxerui::Tooltip(label), huxerui::Frame{.width = 32.0F, .height = 32.0F},
+              huxerui::Enabled(settings->view.Get().ready))
+        .Key(kind == HomeProxySettingsKind::SystemProxy
+            ? "home-system-proxy-settings" : "home-tun-settings")
+        .OnClick([dialog, navigation, compact, kind] {
+            if (compact || kNetworkMobilePage) {
+                navigation.Push(HomeProxySettingsRoutePage, kind);
+                return;
+            }
+            ShowNetworkSettingsDialog(dialog, kind == HomeProxySettingsKind::Tun);
+        });
+}
+
+// Whole-row feedback is clipped by the enclosing card, including its corners.
+[[huxerui::composable]] huxerui::View AboutActionRow(
+    huxerui::StringVariant label, huxerui::StringVariant description,
+    huxerui::ImageResource icon, std::function<void()> action,
+    bool enabled = true, bool spinning = false) {
+    const auto& theme = huxerui::UseTheme();
+    const auto rotation = RefreshIconRotation(theme, spinning);
+    return huxerui::Row{
+        SettingItemIcon(icon).With(huxerui::Rotation(rotation)).Key("about-action-icon"),
+        huxerui::Column{
+            huxerui::Text(label),
+            huxerui::UseString(description).empty() ? huxerui::View{} : huxerui::View{
+                huxerui::Text(description).Style(huxerui::TextStyle{
+                    huxerui::Font::System(font_size::kCaption), theme.colors.on_surface_variant})},
+        }.With(huxerui::Spacing(4.0F), huxerui::Grow(1.0F),
+               huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch)),
+    }.With(huxerui::Padding(huxerui::EdgeInsets::Symmetric(
+               ResolveIslandTheme(theme).island_padding, 12.0F)),
+           huxerui::Frame{.min_height = 48.0F}, huxerui::Spacing(12.0F),
+           huxerui::CrossAlign(huxerui::CrossAxisAlignment::Center),
+           theme.interactions.indication, huxerui::Focusable(true),
+           huxerui::Enabled(enabled),
+           huxerui::Semantics{.role = huxerui::SemanticRole::Button,
+                             .label = huxerui::UseString(label)})
+        .OnClick(action);
+}
+
+[[huxerui::composable]] huxerui::View AboutPage(std::function<void()> onBack) {
+    const auto& theme = huxerui::UseTheme();
+    const auto tasks = huxerui::UseApplicationTaskScope();
+    const auto http = huxerui::UseService<AppHttpClient>();
+    const auto updates = huxerui::UseService<AppUpdateModel>();
+    const auto runtime = huxerui::UseService<AppRuntimeServices>();
+    const auto control = UseCoreControl();
+    const auto dialog = huxerui::UseDialog();
+    const auto cache = huxerui::UseApplication().Directories().cache_directory;
+    const auto checking = updates->checking;
+    const auto checked = updates->checked;
+    const auto scroll = huxerui::UseState(std::make_shared<PageScrollOffset>()).Get();
+    const auto result = updates->release.Get();
+    const auto phase = updates->phase.Get();
+    const auto check = [tasks, http, updates] {
+        updates->Check(tasks, http, CLASHFLUX_VERSION);
+    };
+    huxerui::StringVariant status = Localized("查看 GitHub 上的最新稳定版本");
+    if (checking.Get()) status = Localized("正在检查更新…");
+    else if (checked.Get()) status = !result.error.empty()
+        ? Localized("检查失败，请检查网络后重试")
+        : LocalizedFormat("最新稳定版本：{}", result.tag);
+    if (checked.Get() && !checking.Get() && result.error.empty() &&
+        StableVersion(result.tag) == StableVersion(CLASHFLUX_VERSION))
+        status = Localized("已是最新稳定版本");
+    std::vector<huxerui::View> updateRows{
+        AboutActionRow(Localized("检查更新"), status, app::images::refresh,
+            check, !checking.Get() && !updates->Transferring() && !updates->CanInstall() &&
+                phase != AppUpdatePhase::Installing, checking.Get()).Key("about-check-update")};
+    if (!checking.Get() && result.error.empty() && result.newer && result.asset) {
+        const auto download = [tasks, http, updates, cache] {
+            updates->Download(tasks, http, std::filesystem::path(cache.Path()));
+        };
+        if (updates->Transferring()) {
+            updateRows.push_back(AboutActionRow(
+                phase == AppUpdatePhase::Verifying ? Localized("正在校验安装包…") :
+                    LocalizedFormat("正在下载更新：{}%", updates->percent.Get()),
+                Localized("离开此页面后仍会继续下载"), app::images::refresh, {}, false, true)
+                .Key("about-update-progress"));
+            updateRows.push_back(AboutActionRow(Localized("取消下载"), {}, app::images::close,
+                [updates] { updates->CancelDownload(); }).Key("about-update-cancel"));
+        } else if (updates->CanInstall() || phase == AppUpdatePhase::Installing) {
+            const auto install = [dialog, runtime, updates, control] {
+                if (!updates->CanInstall() || control.Busy() || !runtime->installAppUpdate) return;
+                dialog.Show([runtime](huxerui::DialogContext context) {
+                    return DialogScaffold(DialogHeaderContent(huxerui::Text(Localized("安装更新？"), huxerui::TextRole::Title)),
+                    huxerui::Column {
+                      huxerui::Text(Localized("确认后将保存配置、断开代理并打开系统安装界面。首次可能需要允许安装此来源的应用。")),
+                    }.With(huxerui::Spacing(12.0F), huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch)),
+                    DialogActions({DialogAction(Localized("取消"), [context] { context.Dismiss(); }, false),
+                        huxerui::Button(Localized("继续安装"))
+                          .OnClick([context, runtime] {
+                            context.Dismiss();
+                            if (runtime->installAppUpdate) runtime->installAppUpdate();
+                        })}), DialogSize::Small);
+                });
+            };
+            updateRows.push_back(AboutActionRow(
+                phase == AppUpdatePhase::Installing ? Localized("正在准备安装…") : Localized("安装已下载的更新"),
+                phase == AppUpdatePhase::InstallFailed ? Localized("安装准备失败，应用已保留；请重试") :
+                    Localized("APK 与发布签名已校验；安装由系统确认"),
+                app::images::check, install, phase != AppUpdatePhase::Installing && !control.Busy(),
+                phase == AppUpdatePhase::Installing).Key("about-update-install"));
+        } else {
+            updateRows.push_back(AboutActionRow(LocalizedFormat("下载新版本 {}", result.tag),
+                phase == AppUpdatePhase::DownloadFailed ? Localized("下载或校验失败，请重试") :
+                    Localized("在应用内下载安装包，完成后由你确认安装"),
+                app::images::arrow_down, download).Key("about-update-download"));
+        }
+    }
+    if (!checking.Get() && result.error.empty() && result.newer)
+        updateRows.push_back(AboutActionRow(LocalizedFormat("查看新版本 {}", result.tag),
+            result.asset ? Localized("打开发布页面查看说明和下载") : Localized("此平台或版本暂不支持应用内安装，请手动下载"),
+            app::images::github,
+            [tag = result.tag] { core::openInBrowser(AppReleaseUrl(tag)); })
+            .Key("about-release"));
+    const auto repository = [](const char* url) {
+        return [url] { core::openInBrowser(url); };
+    };
+    auto content = huxerui::Column{
+        huxerui::Column{
+            huxerui::Image(IsDarkTheme(theme)
+                ? app::images::clash_flux_logo_vector_dark_current
+                : app::images::clash_flux_logo_vector_light_current)
+                .With(huxerui::Frame{.width = 80.0F, .height = 80.0F}),
+            huxerui::Text("Clash-Flux", huxerui::TextRole::Title),
+            huxerui::Text("v" CLASHFLUX_VERSION).Style(huxerui::TextStyle{
+                huxerui::Font::System(font_size::kBody), theme.colors.on_surface_variant}),
+            huxerui::Text(Localized("基于 HuxerUI 与 sing-box 的跨平台代理客户端。"))
+                .Align(huxerui::TextAlign::Center),
+        }.With(huxerui::Spacing(12.0F),
+               huxerui::Padding(huxerui::EdgeInsets::Symmetric(16.0F, 16.0F)),
+               huxerui::CrossAlign(huxerui::CrossAxisAlignment::Center)).Key("about-identity"),
+        Card(huxerui::Column(std::move(updateRows)).With(
+            huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch)), false, 0.0F),
+        SettingsSectionCard(Localized("项目与组件"), huxerui::Column{
+            AboutActionRow("Clash-Flux", "FarnaHerry/Clash-Flux", app::images::github,
+                repository("https://github.com/FarnaHerry/Clash-Flux")),
+            AboutActionRow(Localized("HuxerUI 界面框架"), "HuxerUI/HuxerUI", app::images::github,
+                repository("https://github.com/HuxerUI/HuxerUI")),
+            AboutActionRow(Localized("所用 HuxerUI fork"), "FarnaHerry/HuxerUI", app::images::github,
+                repository("https://github.com/FarnaHerry/HuxerUI")),
+            AboutActionRow(Localized("sing-box 内核"), "SagerNet/sing-box", app::images::github,
+                repository("https://github.com/SagerNet/sing-box")),
+        }.With(huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch))),
+        SettingsSectionCard(Localized("免责声明"), SettingsContentRow(
+            huxerui::Text(Localized("Clash-Flux 不提供代理服务器或订阅服务。请仅使用可信来源的配置，并遵守所在地法律及所使用服务的条款。项目按开源许可提供，不承诺服务可用性。"))
+                .Style(huxerui::TextStyle{huxerui::Font::System(font_size::kBody),
+                    theme.colors.on_surface_variant}))).Key("about-disclaimer"),
+    }.With(huxerui::Spacing(20.0F), huxerui::Frame{.max_width = 640.0F},
+           huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch)).Key("about-content");
+    const auto body = ScrollablePageContent(huxerui::Row{
+        huxerui::Spacer(), content, huxerui::Spacer(),
+    }.With(huxerui::CrossAlign(huxerui::CrossAxisAlignment::Start)), scroll).Key("about-scroll");
+    if (kPageTitlesInWindow &&
+        huxerui::UseViewportClass() != huxerui::ViewportClass::Compact) {
+        const auto back = huxerui::IconButton(app::images::arrow_back, Localized("返回上一页"))
+            .OnClick(onBack);
+        return PageScaffold(Localized("关于"), {}, body, true, false, true,
+            std::nullopt, back, {}, true, {}, true)
+            .On<huxerui::ViewEvents::BackRequested>(onBack);
+    }
+    return SecondaryPageScaffold(
+        huxerui::Text(Localized("关于"), huxerui::TextRole::Title), {},
+        body,
+        onBack, false, false, false, true);
+}
+
+[[huxerui::composable]] huxerui::View SettingsPage(
+    huxerui::State<int> themeMode, huxerui::State<std::size_t> navPage,
+    ProfilesCache profilesCache, bool active) {
+    const huxerui::ThemeSpec& theme = huxerui::UseTheme();
+    const IslandTheme islands = ResolveIslandTheme(theme);
+    const bool compact =
+        huxerui::UseViewportClass() == huxerui::ViewportClass::Compact;
+    const auto coreModel = huxerui::UseService<CoreModel>();
+    const CoreView coreView = coreModel->view.Get();
+    const auto settingsModel = huxerui::UseService<SettingsModel>();
+    const auto navigation = huxerui::UseNavigation();
+    const auto scroll = huxerui::UseState(std::make_shared<PageScrollOffset>()).Get();
+    // 不可见时只保留本页 State/Lifecycle，不构建重子树：huxerui 的 Pager 会把
+    // 四个一级页同时挂载，隐藏页即使不重组，其已挂载子树仍随每一帧被重新测量。
+    // 真机实测（代理页大分组）：四页同挂时每帧 1443 次测量请求 / ~20ms，
+    // 只留当前页后降到 28 次 / ~0ms；因此不可见页必须返回空占位。
+    if (!active) return huxerui::View{huxerui::Row{}}.Key("settings-idle");
+
+    if (kPageTitlesInWindow && !compact && (!coreView.ready || !settingsModel->view.Get().ready))
+        return PageLoadingScaffold(Localized("设置"), theme, true);
+
+    std::vector<huxerui::View> sections;
+    sections.push_back(SettingsSectionCard(Localized("更多"), AndroidMoreSettings(navPage, profilesCache))
+        .Key("settings-more"));
+    // Daily controls stay on Home; these groups own parameters and maintenance.
+    sections.push_back(SettingsSectionCard(Localized("外观"), huxerui::Column {
+      AndroidThemeSetting(themeMode),
+      AndroidLanguageSetting(),
+    }.With(huxerui::Spacing(0.0F), huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch)))
+        .Key("settings-general"));
+    sections.push_back(SettingsSectionCard(Localized("代理与网络"), huxerui::Column {
+      NetworkSettingsEntry(HomeProxySettingsKind::Tun),
+    }.With(huxerui::Spacing(0.0F), huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch)))
+        .Key("settings-network"));
+    sections.push_back(SettingsSectionCard(Localized("规则与资源"),
+        SettingNavigationItem(Localized("外部资源"), app::images::route,
+            [navigation] { navigation.Push(ResourcesPage); })).Key("settings-resources"));
+    sections.push_back(SettingsSectionCard(Localized("启动与后台"), AndroidKernelSettings())
+        .Key("settings-background"));
+    sections.push_back(SettingsSectionCard(Localized("工具与维护"), huxerui::Column {
+      RuntimeDiagnosticsEntry(),
+    }.With(huxerui::Spacing(0.0F), huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch)))
+        .Key("settings-maintenance"));
+
+    sections.push_back(Card(AboutActionRow(Localized("关于"), {}, app::images::info,
+                    [navigation] { navigation.Push(AboutRoutePage); }), false, 0.0F)
+        .Key("settings-about"));
+    if (compact) sections.push_back(CompactFloatingNavigationFooter());
+    huxerui::View content = huxerui::Column(sections).With(
+        huxerui::Spacing(20.0F), huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch));
+    if (kPageTitlesInWindow && !compact) content = huxerui::Row {
+      huxerui::Spacer(),
+      huxerui::View{content}.With(huxerui::Frame{.max_width = 720.0F}),
+      huxerui::Spacer(),
+    }.With(huxerui::CrossAlign(huxerui::CrossAxisAlignment::Start));
+    return PageScaffold(
+        Localized("设置"), huxerui::View{},
+        ScrollablePageContent(content, scroll)
+            .Key("settings-scroll"), false, false, true,
+            islands.nested_radius, {}, {}, true, {}, true);
+}
+
+} // namespace clashflux::ui

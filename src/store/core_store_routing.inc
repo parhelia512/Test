@@ -1,0 +1,89 @@
+// core_store_routing.inc — 原生连接路由与配置刷新
+// 由 src/store/core_store.cppm 在 CoreStore 类体内包含。
+
+    // The application starts a standby core. Connect enables traffic listeners;
+    // settings only reconfigure an active connection or retain the next choice.
+
+    // ---- 内核控制（阻塞：UI 必须 RunOnTaskThread）----
+
+    // Dialing and the prepared handoff share one application lifecycle lock.
+    // Platform services keep transport outside TUN; both desktops preserve the
+    // captured running mode and proxy state across candidate failure/rollback.
+    inline std::unique_lock<std::recursive_mutex> lockNativeLifecycle() {
+        return std::unique_lock(lifecycleMutex_);
+    }
+    inline bool runningPlanUsesNative(std::string_view id) const {
+        return lastAppliedOptions_ && std::ranges::any_of(lastAppliedOptions_->nativeConnections,
+            [&](const auto& connection) { return connection.id == id && connection.connected; });
+    }
+    inline bool resumeNativeRouting(const CoreSnapshot& before, bool systemProxyEnabled,
+                                    std::string& error) {
+        std::lock_guard operationLock(lifecycleMutex_);
+        auto healthPause = streams_.pauseHealth();
+        preparedOptions_ = routingOptions(lastProfileYaml_, before.tunEnabled);
+        preparedOptions_->proxyListening = before.proxyListening;
+        startCore(lastProfileYaml_, false, before.tunEnabled,
+                  systemProxyEnabled ? std::optional<bool>(true)
+                                     : std::nullopt);
+        if (snapshot().state == core::CoreState::Running) {
+            if (before.proxyListening) {
+                std::lock_guard lock(mutex_);
+                snap_.connectedSince = before.connectedSince;
+            }
+            return true;
+        }
+        error = snapshot().lastError;
+        return false;
+    }
+
+    // Called by the native store after establishing a session, or BEFORE
+    // tearing one down. Suspend unavailable destinations before the interface
+    // can disappear or be reused by another connection.
+    inline bool updateNativeRouting(std::vector<singbox::NativeConnection> sessions,
+                                    std::string& error) {
+        std::lock_guard operationLock(lifecycleMutex_);
+        auto healthPause = streams_.pauseHealth();
+        nativeSessions_ = std::move(sessions);
+        return refreshRouting(error);
+    }
+
+    // Recompile saved global rules on every policy/session change. Core
+    // lifecycle operations are serialized so a TUN toggle cannot race a VPN
+    // connect/disconnect and restore an obsolete configuration.
+    inline bool refreshRouting(std::string& error) {
+        std::lock_guard operationLock(lifecycleMutex_);
+        auto healthPause = streams_.pauseHealth();
+        ensureOpen();
+        error.clear();
+        const bool running = snapshot().state == core::CoreState::Running;
+        try {
+            const bool tunEnabled = snapshot().tunEnabled;
+            const auto content = currentMainContent();
+            if (!running) {
+                auto options = routingOptions(content, tunEnabled);
+                singbox::CompileResult compiled;
+                if (!prepareHttpRuleProviders(options, compiled, error)) return false;
+                if (compiled.json.empty() || !compiled.error.empty()) {
+                    error = "路由计划编译失败：" + compiled.error; return false;
+                }
+                return true;
+            }
+            if (restartCore(content, true)) return true;
+            error = snapshot().lastError;
+            if (error.empty()) error = "应用路由计划后主 VPN 未能启动";
+            // Never leave the old core using an interface that is being
+            // released. Stopping the main core is also required on failure.
+            if (snapshot().state != core::CoreState::Running) { stopCore(); fail(error); }
+            return false;
+        } catch (const std::exception& exception) {
+            error = exception.what();
+            return false;
+        }
+    }
+
+    // 启动内核；profileYaml 为启用订阅的原文（无订阅传空）。
+    // tunEnabled/systemProxyState 是本次操作捕获的运行态，不从 settings
+    // 表重新读取。这样普通 core start 只启动内核，不会隐式恢复 TUN 或
+    // 系统代理；恢复上次接管状态的启动路径必须显式传入这些状态。
+    // detached=true（CLI core start）：直连 spawn 走 setsid 脱离会话驻留，
+    // 本进程退出不带走内核。

@@ -1,0 +1,639 @@
+// ui.h — Clash-Flux HuxerUI 前端内部声明（UI 层是普通 C++ 源，经 huxerui_add_app
+// codegen；composable 定义只在 .cpp，见 .claude/skills/huxerui-app-development）。
+#pragma once
+
+#include <huxerui/huxerui.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <map>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include "../runtime_health.h"
+#include "app_http_client.h"
+#include "theme_colors.h"
+#include "toast_stack.h"
+
+namespace clashflux::ui {
+
+void StartExternalResourceRefreshPump(huxerui::TaskScope tasks);
+
+namespace pages {
+
+enum PageIndex : std::size_t {
+    kHome = 0,
+    kProfiles = 1,
+    kProxies = 2,
+    kRules = 3,
+    kConnections = 4,
+    kLogs = 5,
+    kWebsiteTests = 6,
+    kSettings = 7,
+};
+
+} // namespace pages
+
+struct AndroidVpnRuntime {
+    bool ready = false;
+    int state = 0;
+    std::int64_t elapsedMs = 0;
+};
+
+// Section edge inset and card grid spacing share one rhythm across the app.
+inline constexpr float kSectionCardSpacing = 8.0F;
+
+// Shared mobile layout geometry.
+inline constexpr float kPageTopContentGap = 4.0F;
+inline constexpr float kPageTitleBarHeight = 48.0F;
+inline constexpr float kPageTitleBarSearchWidth = 320.0F;
+inline constexpr float kPageTitleBarSearchInset = 3.0F;
+inline constexpr float kPageTitleBarSearchHeight =
+    kPageTitleBarHeight - 2.0F * kPageTitleBarSearchInset;
+inline constexpr float kPageChromeDividerThickness = 0.5F;
+
+// Resolve app-authored text through HuxerUI's locale-aware resource service.
+// The same UTF-8 phrase hashes to the resource key emitted in strings/*.properties.
+inline huxerui::StringResource LocalizedResource(std::string_view source) {
+    // Stable across platforms and builds: catalogs use msg_<FNV-1a-64(source UTF-8)>.
+    std::uint64_t hash = 14695981039346656037ULL;
+    for (const unsigned char byte : source) {
+        hash ^= byte;
+        hash *= 1099511628211ULL;
+    }
+    constexpr char digits[] = "0123456789abcdef";
+    std::string key = "strings/msg_0000000000000000";
+    for (int index = 0; index < 16; ++index) {
+        key[12 + index] = digits[(hash >> ((15 - index) * 4)) & 0x0fU];
+    }
+    return huxerui::StringResource{"app", key};
+}
+
+inline huxerui::StringVariant Localized(std::string_view source) {
+    return LocalizedResource(source);
+}
+
+template <class... Arguments>
+huxerui::StringVariant LocalizedFormat(std::string_view source,
+                                       Arguments&&... arguments) {
+    return huxerui::StringVariant::Format(
+        LocalizedResource(source), std::forward<Arguments>(arguments)...);
+}
+
+// 相对时间格式化（订阅卡片等展示）：
+// < 60s: "刚刚"
+// < 3600s: "N分钟前"
+// < 86400s: "N小时前"
+// < 30天: "N天前"
+// < 365天: "N个月前"
+// >= 365天: "N年前"
+// unixSec <= 0: "未拉取"
+inline huxerui::StringVariant FormatRelativeTime(std::int64_t unixSec) {
+    if (unixSec <= 0) {
+        return Localized("未拉取");
+    }
+    const auto now = std::chrono::system_clock::now();
+    const auto nowSec = std::chrono::duration_cast<std::chrono::seconds>(
+        now.time_since_epoch()).count();
+    const std::int64_t diff = nowSec - unixSec;
+    if (diff < 60) {
+        return Localized("刚刚");
+    }
+    if (diff < 3600) {
+        const auto minutes = std::max<std::int64_t>(1, diff / 60);
+        return LocalizedFormat("{}分钟前", minutes);
+    }
+    if (diff < 86400) {
+        const auto hours = std::max<std::int64_t>(1, diff / 3600);
+        return LocalizedFormat("{}小时前", hours);
+    }
+    if (diff < 86400 * 30) {
+        const auto days = std::max<std::int64_t>(1, diff / 86400);
+        return LocalizedFormat("{}天前", days);
+    }
+    if (diff < 86400 * 365) {
+        const auto months = std::max<std::int64_t>(1, diff / (86400 * 30));
+        return LocalizedFormat("{}个月前", months);
+    }
+    const auto years = std::max<std::int64_t>(1, diff / (86400 * 365));
+    return LocalizedFormat("{}年前", years);
+}
+
+// Android VPN 隧道开关（首页悬浮按钮 → VpnService consent/前台服务）。
+// 这些是 Android bridge 的平台前缀函数；桌面目标提供空操作桩，避免通用
+// 组件在控件内部再写平台分支。
+#ifdef __ANDROID__
+extern "C" void clashflux_android_start_vpn() noexcept;
+extern "C" bool clashflux_android_stop_vpn() noexcept;
+inline void AndroidStartVpn() noexcept { clashflux_android_start_vpn(); }
+inline bool AndroidStopVpn() noexcept { return clashflux_android_stop_vpn(); }
+extern "C" void clashflux_android_request_background_keep_alive() noexcept;
+inline void AndroidRequestBackgroundKeepAlive() noexcept {
+    clashflux_android_request_background_keep_alive();
+}
+extern "C" void clashflux_android_request_ignore_battery() noexcept;
+inline void AndroidRequestIgnoreBattery() noexcept {
+    clashflux_android_request_ignore_battery();
+}
+extern "C" void clashflux_android_open_battery_settings() noexcept;
+inline void AndroidOpenBatterySettings() noexcept {
+    clashflux_android_open_battery_settings();
+}
+extern "C" bool clashflux_android_is_ignoring_battery() noexcept;
+inline bool AndroidIsIgnoringBattery() noexcept {
+    return clashflux_android_is_ignoring_battery();
+}
+extern "C" int clashflux_android_vpn_state() noexcept;
+inline int AndroidVpnState() noexcept { return clashflux_android_vpn_state(); }
+extern "C" void clashflux_android_vpn_snapshot(bool*, int*, std::int64_t*) noexcept;
+inline AndroidVpnRuntime ReadAndroidVpnRuntime() noexcept {
+    AndroidVpnRuntime result;
+    clashflux_android_vpn_snapshot(&result.ready, &result.state, &result.elapsedMs);
+    return result;
+}
+extern "C" const char* clashflux_android_proxy_groups() noexcept;
+extern "C" const char* clashflux_android_connections() noexcept;
+extern "C" bool clashflux_android_close_connection(const char*) noexcept;
+extern "C" bool clashflux_android_close_all_connections() noexcept;
+extern "C" bool clashflux_android_select_outbound(const char* group,
+                                                    const char* name) noexcept;
+extern "C" bool clashflux_android_url_test(const char* group) noexcept;
+inline bool TriggerProxyGroupTest(const std::string& group) noexcept {
+    return clashflux_android_url_test(group.c_str());
+}
+inline constexpr bool ProxyTestUsesNativeGroup() noexcept { return true; }
+#else
+inline void AndroidStartVpn() noexcept {}
+inline bool AndroidStopVpn() noexcept { return false; }
+inline void AndroidRequestBackgroundKeepAlive() noexcept {}
+inline void AndroidRequestIgnoreBattery() noexcept {}
+inline void AndroidOpenBatterySettings() noexcept {}
+inline bool AndroidIsIgnoringBattery() noexcept { return false; }
+inline int AndroidVpnState() noexcept { return 0; }
+inline AndroidVpnRuntime ReadAndroidVpnRuntime() noexcept { return {}; }
+inline const char* clashflux_android_connections() noexcept { return ""; }
+inline bool clashflux_android_close_connection(const char*) noexcept { return false; }
+inline bool clashflux_android_close_all_connections() noexcept { return false; }
+inline bool TriggerProxyGroupTest(const std::string&) noexcept { return true; }
+inline constexpr bool ProxyTestUsesNativeGroup() noexcept { return false; }
+#endif
+
+// Replace a snapshot-backed collection without storing the whole collection in
+// one State value. StateList keeps the list identity stable so virtualized
+// views can retain their item state across refreshes.
+template <class T>
+void ReplaceStateList(huxerui::StateList<T> list, std::vector<T> values) {
+    list.Clear();
+    for (auto& value : values) {
+        list.PushBack(std::move(value));
+    }
+}
+
+// 当前运行内核公开的可切换策略组快照。桌面来自 clash_api，Android 来自
+// libbox CommandClient；UI 只依赖这份跨平台模型，不直接知道平台 API。
+struct ProxyGroupSnapshot {
+    std::string name; // 内核 tag，始终用于 API 与持久化
+    std::string displayName;
+    std::map<std::string, std::string> nodeLabels;
+    std::string type;
+    std::string current;
+    std::vector<std::string> nodes;
+    std::map<std::string, int> delays;
+    // sing-box URLTest/Fallback groups are readable but cannot be changed
+    // with SelectOutbound; only selector groups are manually selectable.
+    bool selectable = false;
+
+    bool operator==(const ProxyGroupSnapshot&) const = default;
+};
+
+inline huxerui::Color DelayLevelColor(const huxerui::ThemeSpec& theme, int delay,
+                                      bool unavailable = false) {
+    if (unavailable || delay <= 0) return theme.colors.error;
+    if (delay < 300) return SemanticSuccessColor(theme);
+    if (delay < 600) return theme.colors.primary;
+    if (delay < 1000) return SemanticWarningColor(theme);
+    return theme.colors.error;
+}
+
+// 由组合期调用，resolveLabel 将应用 Locale 的资源解析为拥有型菜单文案。
+std::vector<huxerui::MenuEntry> BuildProxyLineMenu(
+    const std::vector<ProxyGroupSnapshot>& groups,
+    std::function<void(const std::string&, const std::string&)> on_select,
+    const std::function<std::string(huxerui::StringVariant)>& resolveLabel);
+
+// 策略组快照不在本层暴露取数接口：唯一来源是 ProxiesModel（proxies_model.h），
+// 由 AppRoot 驱动刷新，页面/托盘只读它的 State。下面两个调用均可能触发阻塞
+// REST，调用方必须经 RunOnTaskThread 执行；Android 的切换由 libbox bridge 提供
+// 同名能力。
+bool SelectProxyLine(const std::string& group, const std::string& name);
+bool StartProxyGroupTest(const std::string& group);
+
+// 指定订阅的保真度一行摘要（"跳过 3 个节点 · 降级 1 个组"）。阻塞：会为了拿账本
+// 编译一次订阅原文（不 spawn、不写盘、不联网），调用方必须经 RunOnTaskThread；
+// 无降级或无法编译时返回空串。见 docs/singbox-layers-and-fidelity.md §2。
+std::string ProfileFidelitySummary(std::int64_t profileId);
+
+
+// 全项目统一字号阶梯（pt）：控件/正文跟随 SDK 默认 14，不再散落硬编码字面量。
+namespace font_size {
+inline constexpr float kCaption = 11.0F;  // 徽标、状态小字
+inline constexpr float kChip = 12.0F;     // 紧凑部件文字
+inline constexpr float kBody = 14.0F;     // 正文/按钮/输入框（SDK 默认）
+inline constexpr float kMonoBody = 13.0F; // 等宽正文（日志、连接元数据）
+inline constexpr float kBodySmall = 13.0F; // 列表项标题（比正文小一号）
+inline constexpr float kTitle = 20.0F;    // 页面/弹窗标题
+} // namespace font_size
+
+// Compact 悬浮导航覆盖在内容岛底部时，滚动内容需要一个真正属于滚动内容
+// 的尾部空白，确保最后一项可以滑到悬浮岛上方，而不是被悬浮层遮住。
+inline constexpr float kCompactFloatingNavigationInset = 96.0F;
+// 56pt 悬浮操作按钮采用圆角方形，与页面卡片的圆角语言一致。
+inline constexpr float kFloatingActionCornerRadius = 18.0F;
+
+inline huxerui::View CompactFloatingNavigationFooter() {
+    return huxerui::Spacer{}.With(
+        huxerui::Frame{.height = kCompactFloatingNavigationInset});
+}
+
+// ---- 岛屿结构（对齐 apitab island 模型）----
+// 语义层级：页面通过层级选表面，不直接依赖 Material 的 surface_container_* 命名；
+// 颜色仍由当前 ThemeSpec 派生，深浅主题共用组件。
+enum class IslandLevel {
+    Base,    // 一级岛（页面根）
+    Raised,  // 二级岛（卡片/分组）
+    Active,  // 选中/强调面
+    Overlay, // 浮动面（弹层、胶囊）
+    Danger,  // 危险面（error 半透明）
+};
+
+struct IslandTheme {
+    float page_gap;        // 岛间缝隙（透出窗口底色「海面」）
+    float island_padding;  // 一级岛内边距
+    float island_radius;   // 一级岛圆角 22pt
+    float nested_radius;   // 二级岛/卡片圆角 14pt
+    float dense_radius;    // 密集内容卡圆角 4pt（日志行等高密度表面）
+    huxerui::Color ocean;   // 海面（窗口背景）
+    huxerui::Color base;    // 一级岛表面
+    huxerui::Color raised;  // 二级岛表面
+    huxerui::Color active;
+    huxerui::Color overlay;
+    huxerui::Color outline_soft;
+};
+
+inline IslandTheme ResolveIslandTheme(const huxerui::ThemeSpec& theme) {
+    return IslandTheme{
+        .page_gap = 10.0F,
+        .island_padding = theme.spacing.medium,
+        .island_radius = 22.0F,
+        .nested_radius = 14.0F,
+        .dense_radius = 4.0F,
+        .ocean = theme.colors.background,
+        .base = theme.colors.surface_container_low,
+        .raised = theme.colors.surface_container,
+        .active = theme.colors.surface_container_high,
+        .overlay = theme.colors.surface_container_highest,
+        .outline_soft = theme.colors.outline,
+    };
+}
+
+// 内层同心圆角：inner = outer − inset，下限 4pt。
+float ConcentricRadius(float outer_radius, float inset);
+
+// 岛屿原语：Surface 负责语义表面/圆角/内边距；Section 在其上提供标题+内容排版。
+huxerui::View IslandSurface(huxerui::View content, IslandLevel level = IslandLevel::Base);
+huxerui::View IslandSection(std::string title, huxerui::View content);
+
+// 订阅列表的页面句柄：唯一来源是应用级 ProfilesModel（见 profiles_model.h），
+// 这里的 StateList 只是它的镜像（AppRoot 以模型 State 为依赖同步）。订阅页、
+// 规则页（含「添加全局规则规则」的目标连接列表）等消费同一份，不再各自向存储
+// 层要快照。selection_pending 与模型共享：为 true 时模型暂停发布，避免未确认
+// 的选中态被闪回。
+// 定义在 profiles_cache.h（成员是 StateList<db::Profile>，属于
+// clashflux.model 的模块内类型，只能在 import 之后见到，故不能在本头文件
+// 定义）；这里只前向声明，函数声明按值传不完整类型是合法的，用到定义的
+// 翻译单元在 import clashflux.db 之后包含 profiles_cache.h。
+struct ProfilesCache;
+struct ConnectionRow;
+
+// ---- 页面（定义在各自 .cpp，均为 [[huxerui::composable]]）----
+// active=false 表示该一级页当前不可见（Pager/IndexedPages 的其它页）：页面仍
+// 会被挂载以保住自身 State 与 Lifecycle，但只返回空占位，不构建重子树。
+huxerui::View HomePage(huxerui::State<std::size_t> navPage, bool active); // 首页（概览）
+huxerui::View ProfilesPage(ProfilesCache profiles, bool active);   // 订阅
+huxerui::View ProxiesPage(bool active);    // 代理
+huxerui::View RulesPage(ProfilesCache profiles,
+                        std::function<void()> onBack = {},
+                        bool active = true); // 规则（只读实际规则）
+huxerui::View SubscriptionRulesEditorPage(ProfilesCache profiles,
+                                          std::int64_t profileId,
+                                          std::function<void()> onBack);
+huxerui::View SubscriptionRulesDialog(ProfilesCache profiles,
+                                      std::int64_t profileId,
+                                      std::function<void()> onClose);
+huxerui::View GlobalRulesEditorPage(ProfilesCache profiles,
+                                    std::function<void()> onBack);
+huxerui::View ConnectionsPage(std::function<void()> onBack = {},
+                              bool active = true);                // 连接
+huxerui::View LogsPage(std::function<void()> onBack = {},
+                       bool active = true);                       // 日志
+huxerui::View FidelityPage(std::int64_t profileId, std::function<void()> onBack);
+huxerui::View WebsiteTestsPage(std::function<void()> onBack = {}, bool active = true);
+huxerui::View WebsiteTestsRoutePage();
+huxerui::View ConnectionDetailPage(ConnectionRow initial,
+                                   std::function<void()> onBack,
+                                   bool windowTitle = false);
+// 手机端二级页：由设置页「更多」入口 push 到 NavigationStack，页面自带的
+// 进入/返回动画与一级页切换动画互相独立；返回箭头与系统返回键统一弹栈。
+huxerui::View AndroidProfilesPage(
+    huxerui::NavigationController navigation, ProfilesCache profiles,
+    bool active = true);
+huxerui::View AndroidRulesPage(ProfilesCache profiles);
+huxerui::View AndroidConnectionsPage();
+huxerui::View AndroidLogsPage();
+huxerui::View AndroidLanguagePage();
+huxerui::View AndroidThemePage(huxerui::State<int> themeMode);
+huxerui::View AndroidFidelityPage(std::int64_t profileId);
+huxerui::View AndroidConnectionDetailPage(ConnectionRow initial);
+huxerui::View LanguagePage(std::function<void()> onBack);
+huxerui::View LanguageRoutePage();
+huxerui::View ThemePage(huxerui::State<int> themeMode, std::function<void()> onBack,
+                        bool windowTitle = false);
+huxerui::View ExternalResourcesPage(std::int64_t profileId, std::string profileName,
+                                    std::function<void()> onBack);
+huxerui::View ResourcesPage();
+struct MobileSettingsNavigationModel {
+    // IndexedPages forms have their own lifetime, independent of pushed routes.
+    huxerui::State<bool> compactProfileFormOpen{false};
+};
+inline void UseCompactProfileFormNavigation(
+    std::shared_ptr<MobileSettingsNavigationModel> model, bool open) {
+    huxerui::Lifecycle([model, open] {
+        if (model) model->compactProfileFormOpen = open;
+        return [model] {
+            if (model) model->compactProfileFormOpen = false;
+        };
+    }, model, open);
+}
+struct MobileSettingsNavigation {
+    std::shared_ptr<MobileSettingsNavigationModel> model;
+    static MobileSettingsNavigation Default() { return {}; }
+    bool operator==(const MobileSettingsNavigation&) const = default;
+};
+void OpenProfileFidelityPage(huxerui::NavigationController navigation,
+    std::shared_ptr<MobileSettingsNavigationModel> navigationModel, std::int64_t profileId);
+void OpenRuleEditor(huxerui::NavigationController navigation,
+    std::shared_ptr<MobileSettingsNavigationModel> navigationModel,
+    std::function<huxerui::View()> editor);
+void OpenConnectionDetailPage(huxerui::NavigationController navigation,
+    std::shared_ptr<MobileSettingsNavigationModel> navigationModel,
+    ConnectionRow initial);
+
+// 设置页持有主题模式 State（AppRoot 传入）。
+huxerui::View SettingsPage(huxerui::State<int> themeMode,
+                           huxerui::State<std::size_t> navPage,
+                           ProfilesCache profiles, bool active);
+
+// 设置页按通用 / 网络 / 维护 / 关于组织。平台宏只在模块入口选择
+// 平台函数；函数自己管理平台相关状态、任务、权限和控件。
+// Mobile platform application boundaries.
+#if defined(__ANDROID__)
+void AndroidPreparePlatformDataDirectory(const huxerui::ApplicationHandle& application);
+huxerui::View AndroidProfileRefreshPump();
+huxerui::View AndroidApplicationEffects(
+    const huxerui::ApplicationHandle& application, const huxerui::ThemeSpec& rootSpec);
+huxerui::View AndroidAppContent(huxerui::View mainRow, const huxerui::ThemeSpec& rootSpec);
+#else
+huxerui::View MobileProfileRefreshPump();
+huxerui::View MobileApplicationEffects(
+    const huxerui::ApplicationHandle& application, const huxerui::ThemeSpec& rootSpec);
+huxerui::View MobileAppContent(huxerui::View mainRow, const huxerui::ThemeSpec& rootSpec);
+#endif
+huxerui::View AndroidGeneralSettings();
+huxerui::View AndroidKernelSettings();
+
+// ---- 通用部件（common.cpp）----
+
+huxerui::View WithoutIconButtonOutlines(huxerui::View content);
+
+huxerui::View PasswordField(
+    huxerui::State<huxerui::TextEditingValue> password);
+
+// Form submission stays in the header when the keyboard changes body height.
+inline constexpr float kFormHeaderActionSize = 40.0F;
+inline huxerui::View FormHeaderAction(huxerui::ImageResource icon,
+    huxerui::StringVariant label, std::function<void()> onClick,
+    bool enabled = true, bool busy = false) {
+    if (busy) {
+        return huxerui::Column {
+          huxerui::ProgressCircle().With(huxerui::Frame{.width = 20.0F, .height = 20.0F}),
+        }.With(huxerui::Frame{.width = kFormHeaderActionSize, .height = kFormHeaderActionSize},
+               huxerui::MainAlign(huxerui::MainAxisAlignment::Center),
+               huxerui::CrossAlign(huxerui::CrossAxisAlignment::Center),
+               huxerui::Enabled(false), huxerui::Tooltip(label),
+               huxerui::Semantics{.role = huxerui::SemanticRole::Button, .label = label, .busy = true});
+    }
+    return huxerui::IconButton(icon, label)
+        .With(huxerui::Frame{.width = kFormHeaderActionSize, .height = kFormHeaderActionSize},
+              huxerui::Enabled(enabled), huxerui::Tooltip(label))
+        .OnClick(std::move(onClick));
+}
+
+inline huxerui::View FormPageContent(huxerui::View content) {
+    return huxerui::View{content}.With(huxerui::Grow(1.0F),
+        huxerui::SafeAreaPadding{.top = false, .right = false, .left = false});
+}
+
+// 页面骨架（一级岛）：标题行（标题 + 右缘动作）+ 内容区，整体为 16pt 圆角岛，
+// 落在窗口海面底色上（岛间缝隙经壳层 Spacing 透出）。
+// contentSpacing controls fixed header/horizontal insets. Scroll content owns its vertical edge gaps.
+huxerui::View PageScaffold(huxerui::StringVariant title, huxerui::View actions,
+                           huxerui::View content,
+                           bool inlineCompactActions = false,
+                           bool fullWidthSections = false,
+                           bool windowTitle = false,
+                           std::optional<float> contentSpacing = std::nullopt,
+                           huxerui::View leading = {},
+                           huxerui::View titleSearchField = {},
+                           bool showInlineHeader = true,
+                           huxerui::View inlineHeader = {},
+                           bool scrollToContentEdges = true);
+huxerui::View AboutRoutePage();
+huxerui::View AboutPage(std::function<void()> onBack);
+huxerui::View RuntimeDiagnosticsPage(std::function<void()> onBack);
+huxerui::View RuntimeDiagnosticsRoutePage();
+enum class HomeProxySettingsKind { SystemProxy, Tun };
+huxerui::View NetworkSettingsEditor(bool tun, std::function<void()> onClose, bool fullPage,
+    std::shared_ptr<std::function<void()>> dismissRequest = {});
+void ShowNetworkSettingsDialog(huxerui::DialogHandle dialog, bool tun);
+huxerui::View HomeProxySettingsAction(HomeProxySettingsKind kind);
+huxerui::View HomeProxySettingsPage(HomeProxySettingsKind kind, std::function<void()> onBack);
+huxerui::View HomeProxySettingsRoutePage(HomeProxySettingsKind kind);
+huxerui::View ThemeColorEditorPage(std::string initialHex, std::optional<std::string> editingId,
+    std::function<void()> onBack);
+huxerui::View ThemeColorEditorRoutePage(std::string initialHex, std::optional<std::string> editingId);
+huxerui::View SecondaryPageScaffold(huxerui::View title,
+                                    huxerui::View actions, huxerui::View content,
+                                    std::function<void()> onBack,
+                                    bool hideBack = false,
+                                    bool fullWidthSections = false,
+                                    bool centerTitle = false,
+                                    bool scrollToContentEdges = true,
+                                    std::optional<float> contentSpacing = std::nullopt);
+huxerui::View PillSearchField(huxerui::State<huxerui::TextEditingValue> value,
+                              huxerui::StringVariant placeholder,
+                              huxerui::View trailingAction = {});
+
+// 卡片容器（二级岛）：raised 表面 + nested 圆角 + 内边距。outlined=false 去掉
+// 描边，仅靠表面层级区分卡片（移动端设置页等无边框场景）。
+// 描边宽度统一由 theme_colors.h 的卡片主题常量控制，页面不单独指定。
+// contentPadding 可显式设为 0，让整行反馈铺满表面，留白交给行内内容。
+huxerui::View Card(huxerui::View content, bool outlined = true,
+                   std::optional<float> contentPadding = std::nullopt);
+
+// 密集卡片：圆角阶梯的 dense 档（IslandTheme::dense_radius 4pt）+ 减半
+// 内边距，用于日志行等高密度内容——嵌套圆角 14pt 在密集列表里过圆。
+huxerui::View DenseCard(huxerui::View content);
+
+// 可选中卡片（全项目统一的列表项原语，形状以代理页节点卡为标准）：
+// 8pt 圆角、Symmetric(10, 8) 内边距、未选中 islands.active 表面 / 选中
+// primary_container 淡染底 + primary 描边。交互状态由调用方显式指定：
+// ReadOnly 保持正常外观、焦点与点击反馈，但回调只提示、不执行选择
+// （例如 urltest 组里的节点）；
+// Disabled 用于真正禁用的卡片。
+//
+// 文字色由 ResolveSelectableTileColors() 给出同一套：主文字 fg、次级 muted、更弱
+// faint；选中态用 on_primary_container（次级降透明度），错误色仍由调用方用
+// theme.colors.error。解析函数用 Resolve 前缀：结构体与工厂同名会被函数名遮蔽。
+struct SelectableTileColors {
+    huxerui::Color surface;
+    huxerui::Color fg;
+    huxerui::Color muted;
+    huxerui::Color faint;
+};
+huxerui::View FittedSingleLineLabel(std::string text, huxerui::TextStyle style,
+    huxerui::TextAlign align = huxerui::TextAlign::Leading);
+
+constexpr float kSelectableTileRadius = 8.0F;
+
+enum class SelectableTileInteraction { Selectable, ReadOnly, Disabled };
+enum class SelectableTileStyle { Standard, Subscription };
+
+SelectableTileColors ResolveSelectableTileColors(
+    const huxerui::ThemeSpec& theme, bool selected);
+huxerui::View SelectableTile(huxerui::View content, bool selected,
+                             std::string semantics_label,
+                             std::function<void()> on_click,
+                             SelectableTileInteraction interaction,
+                             SelectableTileStyle style = SelectableTileStyle::Standard);
+
+// 注意（踩过的坑）：**不要在 composable 的返回值上补 `Background/Border/CornerRadius`**。
+// composable 返回的是 hcg 生成的 Scope 包装节点，那些 paint 修饰符只会画在整棵子树
+// 背后，从子节点圆角差里漏出一圈底色（首页「当前订阅」卡、订阅卡都出现过「深灰卡 +
+// 蓝色圆角边」）。表面/圆角/描边必须在建树时确定：要么写进 `Card`/`SelectableTile`
+// 这类建树型 composable，要么直接写在返回的 `Column{...}.With(...)` 上。
+
+// 日志、连接、规则等信息列表的统一行容器。内容由页面自己组织，容器统一
+// 内边距；行平铺在一级岛表面上（不逐行套卡），行间画细分隔线，divider=false
+// 用于最后一行。
+huxerui::View UnifiedListRow(huxerui::View content, std::string key,
+                             bool compact = false, bool divider = true);
+
+// 通用设置排版部件；这里不做任何平台判断。
+huxerui::View SettingItemIcon(huxerui::ImageResource icon, bool danger = false);
+huxerui::View SettingRow(huxerui::StringVariant label,
+                         huxerui::StringVariant hint,
+                         huxerui::View control,
+                         std::optional<huxerui::ImageResource> icon = std::nullopt);
+// Switch 专用设置行：主名称与小字描述在左侧列，开关固定在右侧。
+huxerui::View SettingSwitchRow(huxerui::StringVariant label,
+                               huxerui::StringVariant hint,
+                               huxerui::View control, bool danger = false,
+                               std::optional<huxerui::ImageResource> icon = std::nullopt);
+huxerui::View SectionTitle(huxerui::StringVariant title);
+
+// 二级分区标签栏（全项目统一的页内分区切换，实现与样式说明见 section_tabs.cpp）：
+// 代理页分组、规则页「订阅规则/全局规则」、订阅页类型分区共用。key 参与
+// 选中匹配与节点 Key，label 是展示文本；badge 是可选角标（非空时以警示色显示在
+// label 之后，例如被 sing-box 降级的策略组），留空即无角标。
+struct SectionTab {
+    std::string key;
+    huxerui::StringVariant label;
+    std::string badge;
+};
+// 每对标签栏/内容页共享一个保留的几何通道；动画采样不写 State、不触发重组。
+class SectionTabMotion;
+using SectionTabMotionHandle = std::shared_ptr<SectionTabMotion>;
+// 骨架决定内容留白，分页将它放在每一页内部；Pager 自身占满骨架宽度。
+struct SectionTabContentInsets {
+    float horizontal = kSectionCardSpacing;
+    static SectionTabContentInsets Default() { return {}; }
+    bool operator==(const SectionTabContentInsets&) const = default;
+};
+struct SectionTabPickerInsets {
+    float top = 0.0F;
+    static SectionTabPickerInsets Default() { return {}; }
+    bool operator==(const SectionTabPickerInsets&) const = default;
+};
+enum class SectionTabPickerMode { Menu, ResponsiveGroups };
+SectionTabMotionHandle UseSectionTabMotion();
+huxerui::View SectionTabBar(const std::vector<SectionTab>& tabs,
+                            const std::string& selectedKey,
+                            std::function<void(const std::string&)> onSelect,
+                            SectionTabMotionHandle motion = {},
+                            SectionTabPickerMode pickerMode = SectionTabPickerMode::Menu);
+
+// 通用二级内容分页：标签栏留在外侧。点击、菜单与跟手滑动共用受控索引，
+// 页面有界并保持挂载；滚动边界交给框架，取消时回弹，reduced motion 由主题控制。
+huxerui::View SectionTabPages(std::vector<huxerui::View> pages, std::size_t selectedIndex,
+                              std::function<void(std::size_t)> onSelect,
+                              SectionTabMotionHandle motion = {});
+
+struct DialogSurfaceContext {
+    bool flat = false;
+    static DialogSurfaceContext Default() { return {}; }
+    bool operator==(const DialogSurfaceContext&) const = default;
+};
+
+// 自定义内容弹窗的卡片包裹：SDK 的 dialog.Show(ViewFactory/DialogFactory) 不给
+// 内容加底板（只有标题+消息的内置形态才有 DialogStyle），统一包一层：
+// overlay 表面 + 阴影 + 描边 + 16pt 圆角 + 内边距。
+huxerui::View DialogCard(huxerui::View content);
+
+enum class DialogSize { Small, Form, Large };
+huxerui::View DialogHeader(huxerui::StringVariant title, huxerui::View actions = {},
+    huxerui::View leading = {});
+huxerui::View DialogHeaderContent(huxerui::View title, huxerui::View actions = {},
+    huxerui::View leading = {});
+huxerui::View DialogAction(huxerui::StringVariant label, std::function<void()> action,
+    bool primary = true, bool enabled = true, bool danger = false);
+huxerui::View DialogActions(std::vector<huxerui::View> actions);
+huxerui::View DialogScaffold(huxerui::View header, huxerui::View body, huxerui::View actions = {},
+    DialogSize size = DialogSize::Form, bool fillHeight = false);
+void ConfirmDiscardChanges(huxerui::DialogHandle dialog, std::function<void()> discard);
+void ShowEditorDialog(huxerui::DialogHandle dialog, huxerui::DialogFactory content);
+std::function<void()> UseEditorClose(std::function<bool()> changed,
+    std::function<bool()> busy, std::function<void()> close);
+
+// TUN 权限引导弹窗（core::tunGate()==Denied 时调用，UI 线程）：Linux 引导安装
+// 服务模式（应用保持非 root，root 只在服务侧），展示终端指令 + 一键复制
+// （成功/失败经 toast 提示；clipboard 从 UseApplication().Clipboard() 获取）。
+// 纯函数无钩子，可在任务协程续体里调。
+void ShowTunGuideDialog(huxerui::DialogHandle dialog,
+                        std::shared_ptr<huxerui::Clipboard> clipboard,
+                        FluxToastHandle toast, huxerui::Color textColor,
+                        huxerui::Color hintColor);
+
+// Android 订阅自动更新：任务线程列出到期订阅，应用共享 HTTP 客户端在 UI
+// 协程中抓取并由 store 收尾；iOS 由 MobileProfileRefreshPump 调用。
+struct ProfilesModel;
+huxerui::Task<int> AndroidRefreshProfilesDueOnce(
+    std::shared_ptr<AppHttpClient> http,
+    std::shared_ptr<ProfilesModel> profilesModel);
+
+} // namespace clashflux::ui

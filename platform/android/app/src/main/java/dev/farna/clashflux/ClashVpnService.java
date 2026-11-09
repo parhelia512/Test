@@ -1,0 +1,1947 @@
+package dev.farna.clashflux;
+
+import android.app.*;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.pm.ServiceInfo;
+import android.net.ConnectivityManager;
+import android.net.DnsResolver;
+import android.net.LinkProperties;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
+import android.net.IpPrefix;
+import android.net.RouteInfo;
+import android.net.VpnService;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.CancellationSignal;
+import android.os.Handler;
+import android.os.HandlerThread;
+import android.os.ParcelFileDescriptor;
+import android.os.Process;
+import android.os.SystemClock;
+import android.os.PowerManager;
+import android.system.ErrnoException;
+import android.util.Log;
+import io.nekohasekai.libbox.*;
+import java.io.File;
+import java.net.InetAddress;
+import java.net.InterfaceAddress;
+import java.net.InetSocketAddress;
+import java.net.UnknownHostException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Iterator;
+import java.util.List;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.atomic.AtomicBoolean;
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+/** sing-box owns the data plane; Android owns TUN creation and protect(fd). */
+public final class ClashVpnService extends VpnService implements PlatformInterface, CommandServerHandler, CommandClientHandler {
+    private static final String TAG = "ClashFlux", CHANNEL_ID = "clashflux_vpn";
+    private static final String SERVICE_PREFS = "clashflux";
+    private static final String KEY_SERVICE_MODE = "vpn_service_mode";
+    private static final String KEY_TUN_RESET_PENDING = "tun_preference_reset_pending";
+    private static final String MODE_CORE_ONLY = "core_only";
+    private static final String MODE_VPN = "vpn";
+    private static final int NOTIFICATION_ID = 1;
+    static final String EXTRA_SPEED_TEST_ONLY = "speed_test_only";
+    static final String EXTRA_CORE_ONLY = "core_only";
+    private static final Object LIBBOX_SETUP_LOCK = new Object();
+    private static final Object URL_TEST_LOCK = new Object();
+    private static final AtomicBoolean URL_TEST_RUNNING = new AtomicBoolean();
+    private static final Executor URL_TEST_EXECUTOR = Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "clashflux-url-test");
+        thread.setDaemon(true);
+        return thread;
+    });
+    private static final ScheduledExecutorService NETWORK_EXECUTOR =
+            Executors.newSingleThreadScheduledExecutor(runnable -> {
+                Thread thread = new Thread(runnable, "clashflux-network-recovery");
+                thread.setDaemon(true);
+                return thread;
+            });
+    private static volatile boolean libboxSetup;
+    private CommandServer server;
+    private CommandClient client;
+    private ParcelFileDescriptor tunnel;
+    private volatile boolean started;
+    private boolean foregroundReady;
+    private boolean libboxReady;
+    private volatile boolean runtimeBootstrapReady;
+    private boolean failureReported;
+    private volatile boolean speedTestOnly;
+    private volatile boolean coreOnly;
+    private volatile boolean starting;
+    private volatile boolean startRequested;
+    private final AtomicBoolean stopRequested = new AtomicBoolean();
+    private final Object stopLock = new Object();
+    private volatile Network defaultNetwork;
+    private volatile InterfaceUpdateListener defaultInterfaceListener;
+    private volatile PhysicalLink physicalLink = new PhysicalLink(null, null);
+    private volatile long networkChangeGeneration;
+    private ConnectivityManager connectivityManager;
+    private HandlerThread networkThread;
+    private boolean networkMonitorRegistered;
+    private boolean wakeReceiverRegistered;
+    private final ConnectivityManager.NetworkCallback networkCallback =
+            new ConnectivityManager.NetworkCallback() {
+                @Override public void onAvailable(Network network) {
+                    handlePhysicalNetworkChanged("Android 网络已连接");
+                }
+
+                @Override public void onLost(Network network) {
+                    handlePhysicalNetworkChanged("Android 网络已断开");
+                }
+
+                @Override public void onLinkPropertiesChanged(Network network,
+                                                               LinkProperties properties) {
+                    handlePhysicalNetworkChanged("Android 网络配置已更新", network, properties);
+                }
+            };
+    private final BroadcastReceiver wakeReceiver = new BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) {
+            if (Intent.ACTION_SCREEN_ON.equals(intent.getAction())) {
+                scheduleUpstreamReset("设备唤醒");
+                return;
+            }
+            if (PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED.equals(intent.getAction())) {
+                PowerManager power = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                if (power != null && !power.isDeviceIdleMode()) {
+                    scheduleUpstreamReset("设备退出省电待机");
+                }
+            }
+        }
+    };
+    private final Object clientLock = new Object();
+    private final Object clientConnectLock = new Object();
+    private final RuntimeModeReconciler modeReconciler = new RuntimeModeReconciler();
+    private volatile String requestedClashMode = "";
+    private final RuntimeHealth health = new RuntimeHealth();
+    private final ScheduledExecutorService healthExecutor = Executors.newSingleThreadScheduledExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "clashflux-status-health");
+        thread.setDaemon(true);
+        return thread;
+    });
+    private java.util.concurrent.ScheduledFuture<?> healthTask;
+    private boolean healthPaused;
+    private long healthTick;
+    private final Object connectionsLock = new Object();
+    private Connections connectionSnapshot = Libbox.newConnections();
+    private static volatile ClashVpnService current;
+    private static volatile int runtimeCoreState;
+    private static final VpnUptime vpnUptime = new VpnUptime();
+    private static volatile String runtimeMessage = "";
+    private static volatile long runtimeUploadRate;
+    private static volatile long runtimeDownloadRate;
+    private static volatile long runtimeUploadTotal;
+    private static volatile long runtimeDownloadTotal;
+    private static volatile int runtimeConnections;
+    private static volatile String outboundGroupsJson = "{\"proxies\":{}}";
+    private static volatile String pendingUrlTestGroup;
+    private static volatile String connectionsJson =
+            "{\"uploadTotal\":0,\"downloadTotal\":0,\"connections\":[]}";
+    private static volatile long uploadTotal;
+    private static volatile long downloadTotal;
+    private static final Executor DNS_EXECUTOR = Executors.newCachedThreadPool(runnable -> {
+        Thread thread = new Thread(runnable, "clashflux-dns");
+        thread.setDaemon(true);
+        return thread;
+    });
+    static { System.loadLibrary(BuildConfig.HUXERUI_APP_LIBRARY); }
+    private static native void nativeCoreState(int state, String message);
+    private static native void nativeVpnState(int state, String message);
+    private static native void nativeVpnStats(long uploadRate, long downloadRate,
+                                              long uploadTotal, long downloadTotal,
+                                              int connections);
+
+    static Bundle runtimeSnapshot() {
+        ClashVpnService owner = current;
+        if (owner != null) synchronized (owner.clientLock) { return owner.lockedRuntimeSnapshot(); }
+        Bundle empty = new Bundle();
+        // Service destruction may follow a failed resource close. An absent
+        // owner must not turn that error into Bundle.getInt()'s default zero.
+        empty.putInt("coreState", runtimeCoreState);
+        VpnUptime.Snapshot vpn = vpnUptime.snapshot(SystemClock.elapsedRealtime());
+        empty.putInt("vpnState", vpn.state);
+        empty.putLong("vpnElapsedMs", vpn.elapsedMs);
+        empty.putString("message", runtimeMessage);
+        empty.putString("clashMode", "");
+        empty.putString("statusHealth", "paused");
+        empty.putLong("statusAgeMs", -1);
+        return empty;
+    }
+    private Bundle lockedRuntimeSnapshot() {
+        Bundle snapshot = new Bundle();
+        snapshot.putInt("coreState", runtimeCoreState);
+        VpnUptime.Snapshot vpn = vpnUptime.snapshot(SystemClock.elapsedRealtime());
+        snapshot.putInt("vpnState", vpn.state);
+        snapshot.putLong("vpnElapsedMs", vpn.elapsedMs);
+        snapshot.putString("message", runtimeMessage);
+        snapshot.putString("clashMode", modeReconciler.actualMode());
+        snapshot.putLong("uploadRate", runtimeUploadRate);
+        snapshot.putLong("downloadRate", runtimeDownloadRate);
+        snapshot.putLong("uploadTotal", runtimeUploadTotal);
+        snapshot.putLong("downloadTotal", runtimeDownloadTotal);
+        snapshot.putInt("connections", runtimeConnections);
+        ClashVpnService service = this;
+        synchronized (service.clientLock) {
+            long now = SystemClock.elapsedRealtime();
+            snapshot.putLong("runtimeEpoch", service.health.epoch);
+            snapshot.putLong("statusSequence", service.health.sequence);
+            snapshot.putLong("statusAgeMs", service.health.age(now));
+            snapshot.putLong("clientGeneration", service.health.generation);
+            snapshot.putBoolean("clientConnected", service.health.connected);
+            snapshot.putBoolean("trafficAvailable", service.health.trafficAvailable);
+            snapshot.putInt("statusRepairs", service.health.repairs);
+            snapshot.putString("statusHealth", service.health.state(now, service.healthPaused));
+        }
+        return snapshot;
+    }
+
+    private static void publishCoreState(int state, String message) {
+        // A resident core is not a VPN session, including after a reused service.
+        vpnUptime.update(0, SystemClock.elapsedRealtime());
+        runtimeCoreState = state;
+        runtimeMessage = message == null ? "" : message;
+        nativeCoreState(state, runtimeMessage);
+    }
+
+    private static void publishVpnState(int state, String message) {
+        vpnUptime.update(state, SystemClock.elapsedRealtime());
+        runtimeCoreState = state;
+        runtimeMessage = message == null ? "" : message;
+        nativeVpnState(state, runtimeMessage);
+    }
+
+    private static void publishStats(long uploadRate, long downloadRate,
+                                     long uploadTotal, long downloadTotal,
+                                     int connections) {
+        runtimeUploadRate = uploadRate;
+        runtimeDownloadRate = downloadRate;
+        runtimeUploadTotal = uploadTotal;
+        runtimeDownloadTotal = downloadTotal;
+        runtimeConnections = connections;
+        nativeVpnStats(uploadRate, downloadRate, uploadTotal, downloadTotal, connections);
+    }
+
+    @Override public void onCreate() {
+        super.onCreate();
+        current = this;
+        // Android starts the foreground-service deadline before onCreate.
+        // Promote the service before JNI setup, file access, or any libbox
+        // initialization so a slow device cannot kill the VPN process first.
+        try {
+            foreground();
+            foregroundReady = true;
+            MainActivity.appLog("VPN 前台服务已就绪", false);
+        } catch (RuntimeException error) {
+            fail("无法启动 VPN 前台服务：" + error.getMessage());
+            return;
+        }
+        try {
+            MainActivity.appLog("sing-box 后台服务已创建，等待运行命令", false);
+            registerNetworkMonitor();
+            registerWakeMonitor();
+        } catch (Throwable error) {
+            Log.e(TAG, "Runtime monitor initialization", error);
+            MainActivity.appLog("后台网络监视初始化失败：" + error.getMessage(), true);
+        }
+    }
+    @Override public int onStartCommand(Intent i, int f, int id) {
+        if (!foregroundReady) {
+            MainActivity.appLog("VPN 服务未完成前台初始化，拒绝启动数据面", true);
+            return START_NOT_STICKY;
+        }
+        if (!RuntimeStartPolicy.mayStart(stopRequested.get(), started, starting,
+                server != null, tunnel != null)) {
+            MainActivity.appLog("Android 内核仍在关闭，拒绝旧启动请求", false);
+            return START_NOT_STICKY;
+        }
+        if (i == null) {
+            // START_STICKY deliberately does not redeliver the last Intent.
+            // Restore the selected service mode instead of accidentally
+            // turning a no-TUN core restart into a VPN/TUN start.
+            String restoredMode = getSharedPreferences(SERVICE_PREFS, MODE_PRIVATE)
+                    .getString(KEY_SERVICE_MODE, "");
+            if (MODE_CORE_ONLY.equals(restoredMode)) {
+                coreOnly = true;
+                speedTestOnly = false;
+                MainActivity.appLog("系统重建服务：恢复无 TUN 内核模式", false);
+            } else if (MODE_VPN.equals(restoredMode) || BootReceiver.isVpnActive(this)) {
+                coreOnly = false;
+                speedTestOnly = false;
+                if (!MODE_VPN.equals(restoredMode)) persistServiceMode(MODE_VPN);
+                MainActivity.appLog("系统重建服务：恢复 VPN/TUN 模式", false);
+            } else {
+                MainActivity.appLog("系统重建了无持久运行模式的服务，停止空服务", false);
+                stopForeground(STOP_FOREGROUND_REMOVE);
+                stopSelf(id);
+                return START_NOT_STICKY;
+            }
+        }
+        final boolean requestedSpeedTest = i != null
+                && i.getBooleanExtra(EXTRA_SPEED_TEST_ONLY, false);
+        final boolean requestedCoreOnly = i != null
+                && i.getBooleanExtra(EXTRA_CORE_ONLY, false);
+        if (i != null && requestedCoreOnly) {
+            if (RuntimeStartPolicy.preserveLiveVpn(started, starting, startRequested,
+                    stopRequested.get(), coreOnly, speedTestOnly)) {
+                // Reattaching UI must leave a live VPN alone. A stale durable
+                // mode may restore only a system sticky restart, never this request.
+                persistServiceMode(MODE_VPN);
+                coreOnly = false;
+                speedTestOnly = false;
+            } else {
+                persistServiceMode(MODE_CORE_ONLY);
+                coreOnly = true;
+                speedTestOnly = false;
+                BootReceiver.setVpnActive(this, false);
+                // The C++ side persists a TUN intent for config compilation.
+                // Starting the resident core without the tunnel makes that
+                // intent stale; flag it so the UI clears its switch to OFF
+                // (the reclaim restore will also come back as core-only).
+                markTunPreferenceResetPending();
+            }
+        } else if (i != null && requestedSpeedTest) {
+            // A speed-test request can share an already-running resident core.
+            // Keep its durable mode so Android can still restore it after a
+            // process reclaim; only a standalone test remains non-sticky.
+            if (!started && !starting) {
+                speedTestOnly = true;
+                coreOnly = false;
+            }
+        } else if (i != null) {
+            persistServiceMode(MODE_VPN);
+            // A real VPN request promotes an already-running no-TUN core
+            // service back to the normal data plane on the next start.
+            if ((speedTestOnly || coreOnly) && started && !starting) {
+                speedTestOnly = false;
+                coreOnly = false;
+                stopRequested.set(false);
+                starting = true;
+                new Thread(() -> {
+                    if (!close("切换到 Android VPN 数据面", false)) {
+                        stopRequested.set(true);
+                        starting = false;
+                        return;
+                    }
+                    if (!stopRequested.get()) {
+                        startRequested = true;
+                        startDataPlane();
+                    } else {
+                        starting = false;
+                    }
+                }, "clashflux-vpn-promote").start();
+                return START_STICKY;
+            }
+            speedTestOnly = false;
+            coreOnly = false;
+        }
+        // stopCurrent() may have stopped the data plane while Android reused
+        // this service instance. A new start command is a fresh lifecycle.
+        stopRequested.set(false);
+        if (!started && !starting) {
+            starting = true;
+            startRequested = true;
+            MainActivity.appLog("VPN 数据面启动线程已开始", false);
+            new Thread(this::startDataPlane, "clashflux-vpn-start").start();
+        }
+        return speedTestOnly && !hasPersistentServiceMode()
+                ? START_NOT_STICKY : START_STICKY;
+    }
+
+    private void persistServiceMode(String mode) {
+        boolean saved = getSharedPreferences(SERVICE_PREFS, MODE_PRIVATE)
+                .edit()
+                .putString(KEY_SERVICE_MODE, mode)
+                .commit();
+        if (!saved) MainActivity.appLog("无法保存 Android 服务恢复模式", true);
+    }
+
+    private boolean hasPersistentServiceMode() {
+        String mode = getSharedPreferences(SERVICE_PREFS, MODE_PRIVATE)
+                .getString(KEY_SERVICE_MODE, "");
+        return MODE_CORE_ONLY.equals(mode) || MODE_VPN.equals(mode)
+                || BootReceiver.isVpnActive(this);
+    }
+
+    static void clearPersistentServiceMode(Context context) {
+        context.getSharedPreferences(SERVICE_PREFS, MODE_PRIVATE)
+                .edit()
+                .remove(KEY_SERVICE_MODE)
+                .commit();
+    }
+
+    @Override public void onRevoke() {
+        MainActivity.appLog("系统撤销了 VPN 授权", true);
+        markTunPreferenceResetPending();
+        clearPersistentServiceMode(this);
+        BootReceiver.setVpnActive(this, false);
+        RuntimeControlService.requestStop(this);
+    }
+    @Override public void onDestroy() {
+        MainActivity.appLog("VPN 服务正在销毁", false);
+        unregisterRuntimeMonitors();
+        close("VPN 已关闭");
+        healthExecutor.shutdownNow();
+        if (current == this) current = null;
+        super.onDestroy();
+    }
+    private void setup() {
+        try {
+            SetupOptions o = new SetupOptions();
+            o.setBasePath(getFilesDir().getPath());
+            o.setWorkingPath(getFilesDir().getPath());
+            o.setTempPath(getCacheDir().getPath());
+            // libbox can call Java platform callbacks from a Go goroutine.
+            // This workaround prevents the Android callback stack-splitting
+            // failure seen on some ARM64/older Android runtimes.
+            o.setFixAndroidStack(true);
+            o.setLogMaxLines(3000);
+            o.setDebug(BuildConfig.DEBUG);
+            o.setCrashReportSource("ClashFlux");
+            o.setAppVersion(String.valueOf(BuildConfig.VERSION_CODE));
+            o.setAppMarketingVersion(BuildConfig.VERSION_NAME);
+            synchronized (LIBBOX_SETUP_LOCK) {
+                if (libboxSetup) {
+                    Libbox.reloadSetupOptions(o);
+                } else {
+                    Libbox.setup(o);
+                    libboxSetup = true;
+                }
+            }
+            libboxReady = true;
+            MainActivity.appLog("libbox 初始化完成", false);
+        } catch (Throwable e) {
+            Log.e(TAG, "libbox setup", e);
+            MainActivity.appLog("libbox 初始化失败：" + e.getMessage(), true);
+        }
+    }
+    private void startDataPlane() {
+        final long prepareBegan = SystemClock.elapsedRealtime();
+        long checkpoint = prepareBegan;
+        final boolean noTun = speedTestOnly || coreOnly;
+        MainActivity.appLog(noTun ? "开始创建无 TUN 的 sing-box 内核"
+                                  : "开始创建 sing-box VPN 数据面", false);
+        if (noTun) {
+            publishCoreState(1, "正在启动无 TUN 的 sing-box 内核");
+            updateForegroundNotification("sing-box 内核启动中（未启用 VPN）");
+        } else {
+            publishVpnState(1, "正在启动 sing-box VPN 数据面");
+            updateForegroundNotification("正在启动 sing-box VPN 隧道");
+        }
+        try {
+            initializeRuntime();
+            if (!libboxReady) throw new IllegalStateException("libbox 尚未初始化完成");
+            checkpoint = logPreparationStage("libbox-init", checkpoint);
+            // The native store compiles the selected profile into sing-box
+            // JSON (clashflux.singbox). Java only hands the file content to
+            // libbox — no second converter on this side.
+            File config = new File(getFilesDir(), "clash-flux/core/config.json");
+            for (int attempt = 0; !config.isFile() && attempt < 50; ++attempt) {
+                if (!startRequested) return;
+                Thread.sleep(200);
+            }
+            if (!startRequested) return;
+            if (!config.isFile()) {
+                throw new IllegalStateException("未找到启用订阅的运行配置");
+            }
+            MainActivity.appLog("已找到运行配置，准备校验 libbox 配置", false);
+            String configContent = new String(
+                    Files.readAllBytes(config.toPath()), StandardCharsets.UTF_8);
+            if (requestedClashMode.isEmpty()) requestedClashMode = configuredClashMode(configContent);
+            configContent = runtimeConfig(configContent, noTun);
+            tunHasCustomRoutes = hasCustomTunRoutes(configContent);
+            checkpoint = logPreparationStage("config-wait-and-read", checkpoint);
+            Libbox.checkConfig(configContent);
+            checkpoint = logPreparationStage("libbox-check", checkpoint);
+            if (!startRequested) return;
+            MainActivity.appLog("运行配置校验通过", false);
+            MainActivity.appLog("正在创建 libbox CommandServer", false);
+            server = new CommandServer(this, this);
+            MainActivity.appLog("libbox CommandServer 已创建，正在监听本地命令通道", false);
+            server.start();
+            checkpoint = logPreparationStage("command-server", checkpoint);
+            MainActivity.appLog("libbox CommandServer 已启动", false);
+            if (!startRequested) {
+                close("VPN 启动已取消");
+                return;
+            }
+            MainActivity.appLog("正在启动 libbox 服务数据面", false);
+            server.startOrReloadService(configContent, new OverrideOptions());
+            checkpoint = logPreparationStage("libbox-start", checkpoint);
+            MainActivity.appLog("libbox 服务数据面启动完成", false);
+            if (!startRequested) {
+                close("VPN 启动已取消");
+                return;
+            }
+            started = true;
+            // default_mode does not override sing-box cache.db. Confirm the
+            // callback-observed mode before exposing a Running state to the UI.
+            if (startRequested && !stopRequested.get()) {
+                synchronized (clientLock) {
+                    health.start(SystemClock.elapsedRealtime(), SystemClock.elapsedRealtimeNanos());
+                }
+                if (healthTask != null) healthTask.cancel(false);
+                healthTask = healthExecutor.scheduleWithFixedDelay(this::checkStatusHealth, 2, 2, TimeUnit.SECONDS);
+                CommandClient activeClient = controlClient();
+                reconcileRequestedClashMode(activeClient);
+            }
+            if (!startRequested || stopRequested.get()) {
+                close("VPN 启动已取消");
+                return;
+            }
+            if (noTun) {
+                BootReceiver.setVpnActive(this, false);
+                publishCoreState(2, coreOnly
+                        ? "sing-box 内核已启动（未启用 VPN/TUN）"
+                        : "测速内核已启动（未启用 VPN/TUN）");
+                updateForegroundNotification(coreOnly
+                        ? "sing-box 内核运行中（未启用 VPN）"
+                        : "sing-box 测速内核运行中（未启用 VPN）");
+                MainActivity.appLog(coreOnly
+                        ? "sing-box 内核已启动，未启用 Android VPN/TUN"
+                        : "测速内核已启动，未启用 Android VPN/TUN", false);
+            } else {
+                BootReceiver.setVpnActive(this, true);
+                publishVpnState(2, "sing-box 已附着 TUN；socket protect 已启用");
+                updateForegroundNotification("sing-box VPN 隧道运行中");
+                MainActivity.appLog("sing-box 已成功附着 Android TUN", false);
+            }
+            String queuedGroup;
+            synchronized (URL_TEST_LOCK) {
+                queuedGroup = pendingUrlTestGroup;
+                pendingUrlTestGroup = null;
+            }
+            if (queuedGroup != null && !queuedGroup.isEmpty()) {
+                queueUrlTest(queuedGroup);
+            }
+        } catch (Throwable e) {
+            if (startRequested) fail("sing-box 启动失败: " + e.getMessage());
+        } finally {
+            MainActivity.appLog("runtime-prepare total_ms=" +
+                    (SystemClock.elapsedRealtime() - prepareBegan) + " data_plane_ready=" + started +
+                    " mode=" + (noTun ? "core-only" : "vpn"), false);
+            starting = false;
+        }
+    }
+
+    private void reconcileRequestedClashMode(CommandClient activeClient) throws Exception {
+        String actual = modeReconciler.reconcileLatest(
+                () -> requestedClashMode, activeClient::setClashMode, 10000);
+        MainActivity.appLog("sing-box 出站模式已确认：" + actual, false);
+    }
+
+    private long logPreparationStage(String stage, long began) {
+        long now = SystemClock.elapsedRealtime();
+        MainActivity.appLog("runtime-prepare stage=" + stage + " elapsed_ms=" + (now - began), false);
+        return now;
+    }
+
+    private void initializeRuntime() {
+        if (runtimeBootstrapReady) return;
+        synchronized (this) {
+            if (runtimeBootstrapReady) return;
+            MainActivity.appLog("后台进程正在初始化 JNI 与 libbox", false);
+            MainActivity.bootstrapNative(this);
+            defaultNetwork = findPhysicalNetwork();
+            physicalLink = readPhysicalLink(defaultNetwork, null, null);
+            setup();
+            if (!libboxReady) throw new IllegalStateException("libbox 初始化失败");
+            runtimeBootstrapReady = true;
+        }
+    }
+    private boolean tunHasCustomRoutes;
+
+    private static boolean hasCustomTunRoutes(String content) throws Exception {
+        JSONArray inbounds = new JSONObject(content).optJSONArray("inbounds");
+        if (inbounds == null) return false;
+        for (int index = 0; index < inbounds.length(); index++) {
+            JSONObject inbound = inbounds.getJSONObject(index);
+            if (!"tun".equals(inbound.optString("type"))) continue;
+            for (String key : new String[]{"route_address", "route_address_set"}) {
+                Object value = inbound.opt(key);
+                if (value instanceof JSONArray && ((JSONArray) value).length() > 0) return true;
+                if (value instanceof String && !((String) value).isEmpty()) return true;
+            }
+        }
+        return false;
+    }
+
+    private static String runtimeConfig(String content, boolean noTun) throws Exception {
+        if (!noTun) return content;
+        JSONObject config = new JSONObject(content);
+        JSONArray inbounds = config.optJSONArray("inbounds");
+        if (inbounds == null) return content;
+        JSONArray retained = new JSONArray();
+        for (int index = 0; index < inbounds.length(); ++index) {
+            JSONObject inbound = inbounds.getJSONObject(index);
+            if (RuntimeStartPolicy.retainInbound(noTun, inbound.optString("type"))) retained.put(inbound);
+        }
+        if (retained.length() == inbounds.length()) return content;
+        // Keep the committed VPN config intact for an actual sticky VPN restore.
+        config.put("inbounds", retained);
+        return config.toString();
+    }
+    private static String configuredClashMode(String content) throws Exception {
+        JSONObject experimental = new JSONObject(content).optJSONObject("experimental");
+        JSONObject clashApi = experimental == null ? null : experimental.optJSONObject("clash_api");
+        if (clashApi == null) throw new IllegalStateException("运行配置缺少 Clash 模式控制配置");
+        String mode = clashApi.optString("default_mode", "");
+        RuntimeModeReconciler.requireSupported(mode);
+        return mode;
+    }
+    private void requireTunRequest() {
+        if (!RuntimeStartPolicy.allowTun(coreOnly, speedTestOnly, startRequested, stopRequested.get()))
+            throw new IllegalStateException("当前运行请求不允许创建 Android VPN/TUN");
+    }
+    @Override public int openTun(TunOptions o) throws Exception {
+        try {
+            requireTunRequest();
+            String conflict = VpnConflict.find(this);
+            if (!conflict.isEmpty()) throw new IllegalStateException(conflict);
+            if (VpnService.prepare(this) != null) {
+                throw new SecurityException("Android VPN 尚未获得系统授权");
+            }
+            Builder b = new Builder().setSession("Clash-Flux")
+                    .setMtu(o.getMTU()).setBlocking(false);
+            // The app must keep a physical-network escape path for importing
+            // or refreshing subscriptions while its own TUN is active.  The
+            // VPN data plane still captures other applications; without this
+            // exclusion HuxerUI HttpClient is routed back into the TUN before
+            // a usable profile exists and subscription HTTP requests fail.
+            addAddresses(b, o.getInet4Address());
+            addAddresses(b, o.getInet6Address());
+            if (Build.VERSION.SDK_INT >= 29) b.setMetered(false);
+            if (o.getAutoRoute()) {
+                // Android 13+ expects the explicit route-address iterator. The
+                // route-range iterator is the legacy API and is empty for the
+                // current libbox when the managed config uses auto_route. An
+                // empty Builder route only leaves the /30 TUN address route,
+                // so other applications never enter the VPN data plane.
+                boolean hasIPv4Route = false;
+                boolean hasIPv6Route = false;
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    hasIPv4Route = addRoutes(b, o.getInet4RouteAddress());
+                    hasIPv6Route = addRoutes(b, o.getInet6RouteAddress());
+                    addExcludedRoutes(b, o.getInet4RouteExcludeAddress(),
+                            o.getInet6RouteExcludeAddress());
+                } else {
+                    hasIPv4Route = addRoutes(b, o.getInet4RouteRange());
+                    hasIPv6Route = addRoutes(b, o.getInet6RouteRange());
+                }
+                if (!hasIPv4Route && !tunHasCustomRoutes) {
+                    b.addRoute("0.0.0.0", 0);
+                    MainActivity.appLog("Android VPN 未返回 IPv4 路由，已补充全局路由 0.0.0.0/0", false);
+                }
+                // Do not install an IPv6 default route unless libbox also
+                // supplied an IPv6 TUN address. Some Android 13+ devices
+                // reject ::/0 without an IPv6 address on the VPN interface.
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                        !hasIPv6Route && !tunHasCustomRoutes && hasIPv6Address(o)) {
+                    b.addRoute("::", 0);
+                }
+                StringBox dnsMode = o.getDNSMode();
+                if (dnsMode != null && !Libbox.DNSModeDisabled.equals(dnsMode.getValue())) {
+                    addDnsServers(b, o.getDNSServerAddress());
+                }
+            }
+            addPackageRules(b, o);
+            MainActivity.appLog("已排除 Clash-Flux 自身流量，订阅请求保持直连", false);
+            b.setConfigureIntent(PendingIntent.getActivity(
+                    this, 0, new Intent(this, MainActivity.class),
+                    PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE));
+            requireTunRequest();
+            tunnel = b.establish();
+            if (tunnel == null) throw new IllegalStateException("系统拒绝创建 VPN 接口");
+            if (!RuntimeStartPolicy.allowTun(coreOnly, speedTestOnly, startRequested, stopRequested.get())) {
+                tunnel.close();
+                tunnel = null;
+                throw new IllegalStateException("Android VPN 启动已取消");
+            }
+            MainActivity.appLog("Android VPN 接口已创建", false);
+            // Keep the PFD owned by the service until libbox is stopped.  The
+            // official Android client returns pfd.fd and closes the same PFD
+            // from onDestroy; detachFd() makes the Java lifetime unrelated to
+            // the descriptor handed to libbox and can leave a stale tunnel
+            // across service recreation.
+            return tunnel.getFd();
+        } catch (Exception error) {
+            MainActivity.appLog("Android VPN 接口创建失败：" + error.getMessage(), true);
+            throw error;
+        }
+    }
+    private static void addAddresses(Builder b, RoutePrefixIterator i) {
+        if (i == null) return;
+        while (i.hasNext()) {
+            RoutePrefix p = i.next();
+            if (p != null) b.addAddress(p.address(), p.prefix());
+        }
+    }
+    private static boolean addRoutes(Builder b, RoutePrefixIterator i) {
+        if (i == null) return false;
+        boolean added = false;
+        while (i.hasNext()) {
+            RoutePrefix p = i.next();
+            if (p != null) {
+                b.addRoute(p.address(), p.prefix());
+                added = true;
+            }
+        }
+        return added;
+    }
+
+    private static void addExcludedRoutes(Builder b, RoutePrefixIterator ipv4,
+                                          RoutePrefixIterator ipv6) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return;
+        if (ipv4 != null) {
+            while (ipv4.hasNext()) {
+                RoutePrefix p = ipv4.next();
+                if (p != null) excludeRoute(b, p);
+            }
+        }
+        if (ipv6 != null) {
+            while (ipv6.hasNext()) {
+                RoutePrefix p = ipv6.next();
+                if (p != null) excludeRoute(b, p);
+            }
+        }
+    }
+
+    private static void excludeRoute(Builder b, RoutePrefix p) {
+        try {
+            b.excludeRoute(new IpPrefix(InetAddress.getByName(p.address()), p.prefix()));
+        } catch (Exception error) {
+            MainActivity.appLog("忽略无效的 Android 排除路由：" + p.address() + "/" + p.prefix(), true);
+        }
+    }
+
+    private static boolean hasIPv6Address(TunOptions o) {
+        RoutePrefixIterator addresses = o.getInet6Address();
+        if (addresses == null) return false;
+        boolean found = addresses.hasNext();
+        while (addresses.hasNext()) addresses.next();
+        return found;
+    }
+
+    private void addPackageRules(Builder b, TunOptions o) {
+        StringIterator include = o.getIncludePackage();
+        boolean hasInclude = include != null && include.hasNext();
+        if (hasInclude) {
+            while (include.hasNext()) {
+                String packageName = include.next();
+                if (packageName == null || packageName.isEmpty()) continue;
+                if (packageName.equals(getPackageName()))
+                    throw new IllegalArgumentException("Clash-Flux 自身必须保持直连");
+                try {
+                    b.addAllowedApplication(packageName);
+                } catch (Exception error) {
+                    throw new IllegalArgumentException("应用不存在，保留原接管设置：" + packageName, error);
+                }
+            }
+            return;
+        }
+        // Keep the control/subscription app on the physical network. This is
+        // also the fallback when the imported profile has no per-app options.
+        try {
+            b.addDisallowedApplication(getPackageName());
+        } catch (Exception error) {
+            MainActivity.appLog("无法排除 Clash-Flux 自身流量：" + error.getMessage(), true);
+        }
+        StringIterator exclude = o.getExcludePackage();
+        if (exclude != null) {
+            while (exclude.hasNext()) {
+                String packageName = exclude.next();
+                if (packageName == null || packageName.isEmpty()) continue;
+                try {
+                    b.addDisallowedApplication(packageName);
+                } catch (Exception error) {
+                    throw new IllegalArgumentException("应用不存在，保留原接管设置：" + packageName, error);
+                }
+            }
+        }
+    }
+
+    private static void addDnsServers(Builder b, StringIterator i) {
+        if (i == null) return;
+        while (i.hasNext()) {
+            String address = i.next();
+            if (address != null && !address.isEmpty()) b.addDnsServer(address);
+        }
+    }
+
+    private static final class StringArray implements StringIterator {
+        private final List<String> values;
+        private int index;
+
+        StringArray(List<String> values) {
+            this.values = values;
+        }
+
+        @Override public boolean hasNext() { return index < values.size(); }
+        // Keep the same contract as sing-box's Android StringArray: core
+        // consumes the iterator, and does not use len() for preallocation.
+        @Override public int len() { return 0; }
+        @Override public String next() { return values.get(index++); }
+    }
+
+    private static final class NetworkInterfaceArray implements NetworkInterfaceIterator {
+        private final Iterator<io.nekohasekai.libbox.NetworkInterface> values;
+
+        NetworkInterfaceArray(List<io.nekohasekai.libbox.NetworkInterface> values) {
+            this.values = values.iterator();
+        }
+
+        @Override public boolean hasNext() { return values.hasNext(); }
+        @Override public io.nekohasekai.libbox.NetworkInterface next() {
+            return values.next();
+        }
+    }
+
+    private static final LocalDNSTransport SYSTEM_DNS = new LocalDNSTransport() {
+        private Network physicalNetwork() {
+            ClashVpnService service = current;
+            Network physical = service == null ? null : service.defaultNetwork;
+            if (physical == null && service != null) {
+                physical = service.findPhysicalNetwork();
+                service.defaultNetwork = physical;
+            }
+            return physical;
+        }
+
+        @Override public boolean raw() {
+            return Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q;
+        }
+
+        @Override public void exchange(ExchangeContext context, byte[] message) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                context.errorCode(2);
+                return;
+            }
+            final Network physical = physicalNetwork();
+            if (physical == null) {
+                context.errorCode(2);
+                return;
+            }
+            final CountDownLatch completed = new CountDownLatch(1);
+            final CancellationSignal cancellation = new CancellationSignal();
+            try {
+                context.onCancel(() -> {
+                    cancellation.cancel();
+                    completed.countDown();
+                });
+                DnsResolver.getInstance().rawQuery(
+                        physical, message, DnsResolver.FLAG_NO_RETRY, DNS_EXECUTOR,
+                        cancellation, new DnsResolver.Callback<byte[]>() {
+                            @Override public void onAnswer(byte[] answer, int rcode) {
+                                try {
+                                    if (rcode == 0) context.rawSuccess(answer);
+                                    else context.errorCode(rcode);
+                                } finally {
+                                    completed.countDown();
+                                }
+                            }
+
+                            @Override public void onError(DnsResolver.DnsException error) {
+                                try {
+                                    if (error.getCause() instanceof ErrnoException) {
+                                        context.errnoCode(((ErrnoException) error.getCause()).errno);
+                                    } else {
+                                        context.errorCode(2);
+                                    }
+                                } finally {
+                                    completed.countDown();
+                                }
+                            }
+                        });
+                await(completed, cancellation);
+            } catch (RuntimeException error) {
+                cancellation.cancel();
+                context.errorCode(2);
+            }
+        }
+
+        @Override public void lookup(ExchangeContext context, String network,
+                                     String domain) {
+            final Network physical = physicalNetwork();
+            if (physical == null) {
+                context.errorCode(2);
+                return;
+            }
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                try {
+                    InetAddress[] addresses = physical.getAllByName(domain);
+                    StringBuilder result = new StringBuilder();
+                    for (InetAddress address : addresses) {
+                        if (address == null) continue;
+                        if (result.length() > 0) result.append('\n');
+                        result.append(address.getHostAddress());
+                    }
+                    if (result.length() == 0) context.errorCode(3);
+                    else context.success(result.toString());
+                } catch (UnknownHostException error) {
+                    context.errorCode(3);
+                } catch (RuntimeException error) {
+                    context.errorCode(2);
+                }
+                return;
+            }
+
+            final CountDownLatch completed = new CountDownLatch(1);
+            final CancellationSignal cancellation = new CancellationSignal();
+            try {
+                context.onCancel(() -> {
+                    cancellation.cancel();
+                    completed.countDown();
+                });
+                int type = network != null && network.endsWith("4")
+                        ? DnsResolver.TYPE_A
+                        : network != null && network.endsWith("6")
+                        ? DnsResolver.TYPE_AAAA : 0;
+                DnsResolver.Callback<Collection<InetAddress>> callback =
+                        new DnsResolver.Callback<Collection<InetAddress>>() {
+                            @Override public void onAnswer(Collection<InetAddress> addresses,
+                                                            int rcode) {
+                                try {
+                                    if (rcode != 0) {
+                                        context.errorCode(rcode);
+                                        return;
+                                    }
+                                    StringBuilder result = new StringBuilder();
+                                    if (addresses != null) {
+                                        for (InetAddress address : addresses) {
+                                            if (address == null) continue;
+                                            if (result.length() > 0) result.append('\n');
+                                            result.append(address.getHostAddress());
+                                        }
+                                    }
+                                    if (result.length() == 0) context.errorCode(3);
+                                    else context.success(result.toString());
+                                } finally {
+                                    completed.countDown();
+                                }
+                            }
+
+                            @Override public void onError(DnsResolver.DnsException error) {
+                                try {
+                                    if (error.getCause() instanceof ErrnoException) {
+                                        context.errnoCode(((ErrnoException) error.getCause()).errno);
+                                    } else {
+                                        context.errorCode(2);
+                                    }
+                                } finally {
+                                    completed.countDown();
+                                }
+                            }
+                        };
+                if (type == DnsResolver.TYPE_A || type == DnsResolver.TYPE_AAAA) {
+                    DnsResolver.getInstance().query(
+                            physical, domain, type, DnsResolver.FLAG_NO_RETRY,
+                            DNS_EXECUTOR, cancellation, callback);
+                } else {
+                    DnsResolver.getInstance().query(
+                            physical, domain, DnsResolver.FLAG_NO_RETRY,
+                            DNS_EXECUTOR, cancellation, callback);
+                }
+                await(completed, cancellation);
+            } catch (RuntimeException error) {
+                cancellation.cancel();
+                context.errorCode(2);
+            }
+        }
+
+        private void await(CountDownLatch completed, CancellationSignal cancellation) {
+            try {
+                if (!completed.await(15, TimeUnit.SECONDS)) {
+                    cancellation.cancel();
+                }
+            } catch (InterruptedException error) {
+                cancellation.cancel();
+                Thread.currentThread().interrupt();
+            }
+        }
+    };
+
+    private Network findPhysicalNetwork() {
+        ConnectivityManager manager =
+                (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        if (manager == null) return null;
+        Network active = manager.getActiveNetwork();
+        try {
+            Network best = null;
+            for (Network network : manager.getAllNetworks()) {
+                NetworkCapabilities capabilities = manager.getNetworkCapabilities(network);
+                MainActivity.appLog("Android 网络候选：" + describeNetwork(manager, network), false);
+                if (!isPhysicalNetwork(manager, network)) continue;
+                if (best == null) best = network;
+                if (capabilities != null &&
+                        capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
+                    best = network;
+                    break;
+                }
+            }
+            if (best != null) {
+                MainActivity.appLog("Android 选择物理网络：" + describeNetwork(manager, best), false);
+                return best;
+            }
+        } catch (RuntimeException error) {
+            MainActivity.appLog("读取 Android 默认网络失败：" + error.getMessage(), true);
+        }
+        // getAllNetworks can be temporarily unavailable during a handover.
+        if (isPhysicalNetwork(manager, active)) {
+            MainActivity.appLog("Android 回退到活动物理网络：" + describeNetwork(manager, active), false);
+            return active;
+        }
+        return null;
+    }
+
+    private static String describeNetwork(ConnectivityManager manager, Network network) {
+        if (network == null) return "null";
+        LinkProperties link = manager.getLinkProperties(network);
+        NetworkCapabilities capabilities = manager.getNetworkCapabilities(network);
+        String name = link == null || link.getInterfaceName() == null
+                ? "?" : link.getInterfaceName();
+        if (capabilities == null) return name + " [no-capabilities]";
+        String transport = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ? "wifi"
+                : capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ? "cellular"
+                : capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) ? "ethernet"
+                : capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN) ? "vpn" : "other";
+        return name + " [" + transport
+                + (capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                        ? ",internet" : ",no-internet")
+                + (capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                        ? ",validated" : ",unvalidated")
+                + (capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+                        ? ",unmetered" : ",metered")
+                + "]";
+    }
+
+    private static final class PhysicalLink {
+        final Network network;
+        final LinkProperties properties;
+        final String interfaceName;
+        final List<String> dnsServers;
+
+        PhysicalLink(Network network, LinkProperties properties) {
+            this.network = network;
+            this.properties = properties;
+            interfaceName = this.properties == null || this.properties.getInterfaceName() == null
+                    ? "" : this.properties.getInterfaceName();
+            dnsServers = new ArrayList<>();
+            if (this.properties != null) {
+                for (InetAddress dns : this.properties.getDnsServers()) {
+                    if (dns != null) dnsServers.add(stripAddressScope(dns));
+                }
+            }
+        }
+    }
+
+    private PhysicalLink readPhysicalLink(Network network, Network changedNetwork,
+                                          LinkProperties changedProperties) {
+        LinkProperties properties = network == null || connectivityManager == null ? null
+                : java.util.Objects.equals(network, changedNetwork) && changedProperties != null
+                        ? changedProperties : connectivityManager.getLinkProperties(network);
+        return new PhysicalLink(network, properties);
+    }
+
+    private void registerNetworkMonitor() {
+        connectivityManager =
+                (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        if (connectivityManager == null) return;
+        try {
+            defaultNetwork = findPhysicalNetwork();
+            physicalLink = readPhysicalLink(defaultNetwork, null, null);
+            NetworkRequest request = new NetworkRequest.Builder()
+                    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    .build();
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                networkThread = new HandlerThread("clashflux-network-monitor");
+                networkThread.start();
+                connectivityManager.registerNetworkCallback(request, networkCallback,
+                        new Handler(networkThread.getLooper()));
+            } else {
+                connectivityManager.registerNetworkCallback(request, networkCallback);
+            }
+            networkMonitorRegistered = true;
+        } catch (RuntimeException error) {
+            MainActivity.appLog("注册 Android 网络变化监听失败：" + error.getMessage(), true);
+        }
+    }
+
+    private void registerWakeMonitor() {
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(Intent.ACTION_SCREEN_ON);
+        filter.addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED);
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(wakeReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+            } else {
+                registerReceiver(wakeReceiver, filter);
+            }
+            wakeReceiverRegistered = true;
+        } catch (RuntimeException error) {
+            MainActivity.appLog("注册 Android 唤醒监听失败：" + error.getMessage(), true);
+        }
+    }
+
+    private void unregisterRuntimeMonitors() {
+        if (networkMonitorRegistered && connectivityManager != null) {
+            try {
+                connectivityManager.unregisterNetworkCallback(networkCallback);
+            } catch (RuntimeException ignored) {
+            }
+            networkMonitorRegistered = false;
+        }
+        if (networkThread != null) {
+            networkThread.quitSafely();
+            networkThread = null;
+        }
+        if (wakeReceiverRegistered) {
+            try {
+                unregisterReceiver(wakeReceiver);
+            } catch (RuntimeException ignored) {
+            }
+            wakeReceiverRegistered = false;
+        }
+    }
+
+    private void handlePhysicalNetworkChanged(String reason) {
+        handlePhysicalNetworkChanged(reason, null, null);
+    }
+
+    private synchronized void handlePhysicalNetworkChanged(String reason, Network changedNetwork,
+                                                           LinkProperties changedProperties) {
+        Network physical = findPhysicalNetwork();
+        PhysicalLink next = readPhysicalLink(physical, changedNetwork, changedProperties);
+        PhysicalLink previous = physicalLink;
+        boolean changed = !java.util.Objects.equals(previous.network, next.network)
+                || !previous.interfaceName.equals(next.interfaceName)
+                || !previous.dnsServers.equals(next.dnsServers);
+        defaultNetwork = physical;
+        physicalLink = next;
+        if (!changed) return;
+
+        MainActivity.appLog(reason + "，物理接口="
+                + (next.interfaceName.isEmpty() ? "不可用" : next.interfaceName), false);
+        InterfaceUpdateListener listener = defaultInterfaceListener;
+        if (listener != null) notifyDefaultInterface(listener);
+        if (started) scheduleUpstreamReset(reason);
+    }
+
+    private void scheduleUpstreamReset(String reason) {
+        synchronized (clientLock) { health.resume(SystemClock.elapsedRealtime()); }
+        final long generation = ++networkChangeGeneration;
+        NETWORK_EXECUTOR.schedule(() -> {
+            if (generation != networkChangeGeneration || !started || !startRequested
+                    || stopRequested.get()) return;
+            try {
+                controlClient().closeConnections();
+                MainActivity.appLog(reason + "：已关闭旧连接，等待 sing-box 按新网络重连", false);
+            } catch (Exception error) {
+                MainActivity.appLog(reason + "后清理旧连接失败：" + error.getMessage(), true);
+            }
+        }, 800, TimeUnit.MILLISECONDS);
+    }
+
+    private static boolean isPhysicalNetwork(ConnectivityManager manager,
+                                             Network network) {
+        if (network == null) return false;
+        NetworkCapabilities capabilities = manager.getNetworkCapabilities(network);
+        return capabilities != null
+                && !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+                && capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
+    }
+
+    private void notifyDefaultInterface(InterfaceUpdateListener listener) {
+        if (listener == null) return;
+        // The interface and its LinkProperties may appear a few hundred
+        // milliseconds after the network callback on OEM ROMs. Retry before
+        // reporting that no physical interface exists.
+        for (int attempt = 0; attempt < 10; ++attempt) {
+            if (notifyDefaultInterfaceOnce(listener)) return;
+            if (attempt == 9) break;
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        try {
+            listener.updateDefaultInterface("", -1, false, false);
+        } catch (RuntimeException ignored) {
+        }
+        MainActivity.appLog("Android 未找到可用的默认物理网络接口", true);
+    }
+
+    private boolean notifyDefaultInterfaceOnce(InterfaceUpdateListener listener) {
+        try {
+            ConnectivityManager manager =
+                    (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (manager == null) return false;
+            Network physical = defaultNetwork;
+            if (!isPhysicalNetwork(manager, physical)) {
+                physical = findPhysicalNetwork();
+                defaultNetwork = physical;
+                physicalLink = readPhysicalLink(physical, null, null);
+            }
+            if (physical == null) return false;
+            PhysicalLink snapshot = physicalLink;
+            LinkProperties link = snapshot.properties != null
+                    && java.util.Objects.equals(snapshot.network, physical)
+                    ? snapshot.properties : manager.getLinkProperties(physical);
+            if (link == null || link.getInterfaceName() == null) return false;
+            java.net.NetworkInterface networkInterface =
+                    java.net.NetworkInterface.getByName(link.getInterfaceName());
+            if (networkInterface == null) return false;
+            NetworkCapabilities capabilities = manager.getNetworkCapabilities(physical);
+            boolean metered = capabilities != null && !capabilities.hasCapability(
+                    NetworkCapabilities.NET_CAPABILITY_NOT_METERED);
+            listener.updateDefaultInterface(link.getInterfaceName(),
+                    networkInterface.getIndex(), metered, false);
+            MainActivity.appLog("Android 默认物理接口已注册：" + link.getInterfaceName()
+                    + " (" + networkInterface.getIndex() + ")", false);
+            return true;
+        } catch (Exception error) {
+            MainActivity.appLog("注册 Android 默认物理接口失败：" + error.getMessage(), true);
+            return false;
+        }
+    }
+
+    @Override public NetworkInterfaceIterator getInterfaces() {
+        List<io.nekohasekai.libbox.NetworkInterface> result = new ArrayList<>();
+        ConnectivityManager manager =
+                (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        if (manager == null) return new NetworkInterfaceArray(result);
+        try {
+            // Build the list from Android ConnectivityManager, not from every
+            // Linux interface. This avoids exposing the VPN's own tun device
+            // as a candidate physical default interface.
+            for (Network network : manager.getAllNetworks()) {
+                PhysicalLink snapshot = physicalLink;
+                // Use the callback's LinkProperties until ConnectivityManager's
+                // synchronous view catches up, so libbox sees DNS-only changes.
+                LinkProperties link = snapshot.properties != null
+                        && java.util.Objects.equals(snapshot.network, network)
+                        ? snapshot.properties : manager.getLinkProperties(network);
+                NetworkCapabilities capabilities = manager.getNetworkCapabilities(network);
+                if (link == null || capabilities == null
+                        || link.getInterfaceName() == null) continue;
+                java.net.NetworkInterface source;
+                try {
+                    source = java.net.NetworkInterface.getByName(link.getInterfaceName());
+                } catch (Exception ignored) {
+                    continue;
+                }
+                if (source == null) continue;
+                io.nekohasekai.libbox.NetworkInterface target =
+                        new io.nekohasekai.libbox.NetworkInterface();
+                target.setName(link.getInterfaceName());
+                target.setIndex(source.getIndex());
+                try {
+                    int mtu = source.getMTU();
+                    target.setMTU(mtu > 0 ? mtu : 1500);
+                } catch (Exception ignored) {
+                    target.setMTU(1500);
+                }
+
+                List<String> addresses = new ArrayList<>();
+                for (InterfaceAddress address : source.getInterfaceAddresses()) {
+                    if (address == null || address.getAddress() == null) continue;
+                    addresses.add(stripAddressScope(address.getAddress()) + "/"
+                            + address.getNetworkPrefixLength());
+                }
+                target.setAddresses(new StringArray(addresses));
+                List<String> dnsServers = new ArrayList<>();
+                for (InetAddress dns : link.getDnsServers()) {
+                    if (dns != null) dnsServers.add(stripAddressScope(dns));
+                }
+                target.setDNSServer(new StringArray(dnsServers));
+                List<String> gateways = new ArrayList<>();
+                for (RouteInfo route : link.getRoutes()) {
+                    if (route == null || route.getDestination() == null
+                            || route.getDestination().getPrefixLength() != 0) continue;
+                    InetAddress gateway = route.getGateway();
+                    if (gateway != null && !gateway.isAnyLocalAddress()) {
+                        gateways.add(stripAddressScope(gateway));
+                    }
+                }
+                target.setGateway(new StringArray(gateways));
+                if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                    target.setType(Libbox.InterfaceTypeWIFI);
+                } else if (capabilities.hasTransport(
+                        NetworkCapabilities.TRANSPORT_CELLULAR)) {
+                    target.setType(Libbox.InterfaceTypeCellular);
+                } else if (capabilities.hasTransport(
+                        NetworkCapabilities.TRANSPORT_ETHERNET)) {
+                    target.setType(Libbox.InterfaceTypeEthernet);
+                } else {
+                    target.setType(Libbox.InterfaceTypeOther);
+                }
+
+                int flags = 0;
+                try {
+                    if (capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+                        flags |= 0x1 | 0x40;
+                    }
+                    if (source.isLoopback()) flags |= 0x8;
+                    if (source.isPointToPoint()) flags |= 0x10;
+                    if (source.supportsMulticast()) flags |= 0x1000;
+                } catch (Exception ignored) {
+                    // Interface metadata is advisory; keep the entry usable.
+                }
+                target.setFlags(flags);
+                target.setMetered(!capabilities.hasCapability(
+                        NetworkCapabilities.NET_CAPABILITY_NOT_METERED));
+                result.add(target);
+            }
+        } catch (Exception error) {
+            MainActivity.appLog("读取 Android 网络接口失败：" + error.getMessage(), true);
+        }
+        return new NetworkInterfaceArray(result);
+    }
+
+    private static String stripAddressScope(InetAddress address) {
+        String value = address.getHostAddress();
+        int scope = value == null ? -1 : value.indexOf('%');
+        return scope < 0 ? value : value.substring(0, scope);
+    }
+
+    @Override public LocalDNSTransport localDNSTransport() { return SYSTEM_DNS; }
+
+    private void checkStatusHealth() {
+        if (!startRequested || stopRequested.get() || !started) return;
+        try {
+            final long now = SystemClock.elapsedRealtime();
+            PowerManager power = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            boolean paused = Build.VERSION.SDK_INT >= 23 && power != null && power.isDeviceIdleMode();
+            CommandClient expired;
+            synchronized (clientLock) {
+                if (healthPaused && !paused || healthTick != 0 && now - healthTick > 5000) health.resume(now);
+                healthPaused = paused;
+                healthTick = now;
+                if (!health.reserve(now, paused)) return;
+                expired = client;
+                client = null;
+                health.reopen(now); // reject old callbacks before disconnecting
+            }
+            // Never call gomobile disconnect/connect while holding the callback lock.
+            if (expired != null) expired.disconnect();
+            if (startRequested && !stopRequested.get()) controlClient();
+            MainActivity.appLog("runtime-health status subscription repair", false);
+        } catch (Throwable error) {
+            // Exception details may contain endpoint credentials; fixed label only.
+            MainActivity.appLog("runtime-health status subscription repair failed", true);
+        }
+    }
+
+    private CommandClientHandler clientHandler(long generation) {
+        return new CommandClientHandler() {
+            private void deliver(Runnable action) {
+                synchronized (clientLock) { if (health.accepts(generation)) action.run(); }
+            }
+            @Override public void connected() { deliver(() -> { health.connected = true; }); }
+            // libbox may report one failed optional subscription. Only stale required status
+            // authorizes repair; localized error strings do not classify all streams as dead.
+            @Override public void disconnected(String message) { deliver(() -> {
+                health.connected = false;
+            }); }
+            @Override public void clearLogs() { deliver(() -> ClashVpnService.this.clearLogs()); }
+            @Override public void initializeClashMode(StringIterator modes, String mode) { deliver(() -> modeReconciler.update(mode)); }
+            @Override public void setDefaultLogLevel(int level) { deliver(() -> ClashVpnService.this.setDefaultLogLevel(level)); }
+            @Override public void updateClashMode(String mode) { deliver(() -> modeReconciler.update(mode)); }
+            @Override public void writeConnectionEvents(ConnectionEvents events) { deliver(() -> ClashVpnService.this.writeConnectionEvents(events)); }
+            @Override public void writeGroups(OutboundGroupIterator groups) { deliver(() -> ClashVpnService.this.writeGroups(groups)); }
+            @Override public void writeLogs(LogIterator logs) { deliver(() -> ClashVpnService.this.writeLogs(logs)); }
+            @Override public void writeOutbounds(OutboundGroupItemIterator outbounds) { deliver(() -> ClashVpnService.this.writeOutbounds(outbounds)); }
+            @Override public void writeStatus(StatusMessage status) { deliver(() -> {
+                if (status == null) return;
+                ClashVpnService.this.writeStatus(status);
+                health.sample(generation, SystemClock.elapsedRealtime(), status.getTrafficAvailable());
+                health.connected = true;
+            }); }
+        };
+    }
+
+    private CommandClient controlClient() throws Exception {
+        synchronized (clientConnectLock) {
+            final CommandClient candidate;
+            final long generation;
+            synchronized (clientLock) {
+                if (client != null) return client;
+                if (!startRequested || stopRequested.get() || !health.active) throw new IllegalStateException("VPN 未在运行");
+                modeReconciler.reset();
+                generation = health.reopen(SystemClock.elapsedRealtime());
+                CommandClientOptions options = new CommandClientOptions();
+                options.addCommand(Libbox.CommandLog);
+                options.addCommand(Libbox.CommandGroup);
+                options.addCommand(Libbox.CommandStatus);
+                options.addCommand(Libbox.CommandClashMode);
+                options.addCommand(Libbox.CommandConnections);
+                options.setStatusInterval(1000000000L);
+                candidate = new CommandClient(clientHandler(generation), options);
+                client = candidate;
+            }
+            try { candidate.connect(); }
+            catch (Exception error) {
+                synchronized (clientLock) {
+                    if (client == candidate) {
+                        client = null;
+                        modeReconciler.reset();
+                        health.reopen(SystemClock.elapsedRealtime());
+                    }
+                }
+                try { candidate.disconnect(); } catch (Exception ignored) {}
+                throw error;
+            }
+            synchronized (clientLock) {
+                if (health.accepts(generation) && client == candidate) return candidate;
+            }
+            candidate.disconnect();
+            throw new IllegalStateException("control connection superseded");
+        }
+    }
+    private boolean close(String msg) { return close(msg, true); }
+    private boolean close(String msg, boolean reportStopped) {
+        final boolean noTun = speedTestOnly || coreOnly;
+        startRequested = false;
+        synchronized (clientLock) { health.stop(); }
+        modeReconciler.reset();
+        requestedClashMode = "";
+        if (healthTask != null) { healthTask.cancel(false); healthTask = null; }
+        MainActivity.appLog("VPN 数据面关闭：" + msg, false);
+        if (!started && tunnel == null && server == null) {
+            if (reportStopped && !failureReported) {
+                if (noTun) publishCoreState(0, msg);
+                else publishVpnState(0, msg);
+            }
+            return true;
+        }
+        started = false;
+        BootReceiver.setVpnActive(this, false);
+        outboundGroupsJson = "{\"proxies\":{}}";
+        connectionsJson = "{\"uploadTotal\":0,\"downloadTotal\":0,\"connections\":[]}";
+        uploadTotal = 0;
+        downloadTotal = 0;
+        synchronized (connectionsLock) {
+            connectionSnapshot = Libbox.newConnections();
+        }
+        RuntimeSnapshotStore.writeAsync(this, "connections.json", connectionsJson);
+        RuntimeSnapshotStore.writeAsync(this, "outbound-groups.json", outboundGroupsJson);
+        CommandClient activeClient;
+        synchronized (clientLock) {
+            activeClient = client;
+            client = null;
+        }
+        try { if (activeClient != null) activeClient.disconnect(); } catch (Exception ignored) {}
+        boolean closed = true;
+        boolean dataPlaneClosed = true;
+        try {
+            if (server != null) server.closeService();
+        } catch (Exception error) {
+            MainActivity.appLog("关闭 sing-box 数据面失败：" + error.getMessage(), true);
+            closed = false;
+            dataPlaneClosed = false;
+        }
+        try {
+            // CommandServer.close() only closes its control plane, not the
+            // data plane. Retain the owner if closeService() needs a retry.
+            if (dataPlaneClosed) {
+                if (server != null) server.close();
+                server = null;
+            }
+        }
+        catch (Exception error) {
+            MainActivity.appLog("关闭 sing-box 服务失败：" + error.getMessage(), true);
+            closed = false;
+        }
+        try {
+            if (tunnel != null) tunnel.close();
+            tunnel = null;
+        }
+        catch (Exception error) {
+            MainActivity.appLog("关闭 Android TUN 失败：" + error.getMessage(), true);
+            closed = false;
+        }
+        publishStats(0, 0, 0, 0, 0);
+        if (!closed) {
+            updateForegroundNotification("Android 内核资源关闭失败，请重试停止");
+            if (noTun) publishCoreState(3, "Android 内核资源未完全关闭");
+            else publishVpnState(3, "Android 内核资源未完全关闭");
+        } else if (reportStopped && !failureReported) {
+            if (noTun) publishCoreState(0, msg);
+            else publishVpnState(0, msg);
+        }
+        return closed;
+    }
+
+    static boolean hasRuntimeOwner() { return current != null; }
+
+    /** Stops the current data plane before asking Android to destroy the service. */
+    public static boolean stopCurrent() {
+        ClashVpnService service = current;
+        if (service == null) return false;
+        synchronized (service.stopLock) {
+            service.stopRequested.set(true);
+            synchronized (URL_TEST_LOCK) { pendingUrlTestGroup = null; }
+            if (!service.coreOnly && !service.speedTestOnly) {
+                service.markTunPreferenceResetPending();
+            }
+            clearPersistentServiceMode(service);
+            BootReceiver.setVpnActive(service, false);
+            service.startRequested = false;
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15);
+            while (service.starting && System.nanoTime() < deadline) {
+                try { Thread.sleep(25); }
+                catch (InterruptedException error) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+            if (service.starting) return false;
+            boolean stopped = service.close("用户请求关闭 Android VPN");
+            if (stopped) {
+                service.stopForeground(STOP_FOREGROUND_REMOVE);
+                service.stopSelf();
+            }
+            return stopped;
+        }
+    }
+
+    static void stopServiceFallback(Context context) {
+        if (BootReceiver.isVpnActive(context)) {
+            context.getSharedPreferences(SERVICE_PREFS, MODE_PRIVATE).edit()
+                    .putBoolean(KEY_TUN_RESET_PENDING, true).commit();
+        }
+        clearPersistentServiceMode(context);
+        BootReceiver.setVpnActive(context, false);
+        context.stopService(new Intent(context, ClashVpnService.class));
+    }
+
+    private void markTunPreferenceResetPending() {
+        getSharedPreferences(SERVICE_PREFS, MODE_PRIVATE).edit()
+                .putBoolean(KEY_TUN_RESET_PENDING, true).commit();
+    }
+
+    public static boolean selectOutbound(String group, String name) {
+        ClashVpnService service = current;
+        if (service == null || group == null || group.isEmpty() || name == null || name.isEmpty()) {
+            return false;
+        }
+        try {
+            MainActivity.appLog("sing-box 线路切换请求：" + group + " → " + name, false);
+            service.controlClient().selectOutbound(group, name);
+            MainActivity.appLog("sing-box 线路切换完成：" + group + " → " + name, false);
+            return true;
+        } catch (Exception error) {
+            Log.w(TAG, "Unable to select outbound " + group + " -> " + name, error);
+            MainActivity.appLog("线路切换失败：" + error.getMessage(), true);
+            return false;
+        }
+    }
+
+    public static boolean urlTest(String group) {
+        if (group == null || group.isEmpty()) return false;
+        synchronized (URL_TEST_LOCK) {
+            pendingUrlTestGroup = group;
+        }
+        ClashVpnService service = current;
+        if (service == null || (!service.started && !service.starting)) {
+            // The speed-only service uses a no-TUN config. It does not request
+            // VPN consent and does not capture application traffic.
+            MainActivity.startSpeedTestService();
+            return true;
+        }
+        if (!service.started) {
+            // A normal VPN service is still starting; startDataPlane() drains
+            // the pending request once its command server is ready.
+            return true;
+        }
+        synchronized (URL_TEST_LOCK) {
+            pendingUrlTestGroup = null;
+        }
+        service.queueUrlTest(group);
+        return true;
+    }
+
+    private void queueUrlTest(String group) {
+        if (!URL_TEST_RUNNING.compareAndSet(false, true)) {
+            MainActivity.appLog("测速已在进行中，合并重复请求", false);
+            return;
+        }
+        URL_TEST_EXECUTOR.execute(() -> {
+            try {
+                runUrlTestWhenReady(group);
+            } finally {
+                URL_TEST_RUNNING.set(false);
+            }
+        });
+    }
+
+    private void runUrlTestWhenReady(String group) {
+        Exception lastError = null;
+        for (int attempt = 0; attempt < 80; ++attempt) {
+            if (!startRequested || stopRequested.get()) return;
+            try {
+                CommandClient activeClient = controlClient();
+                JSONObject root = new JSONObject(outboundGroupsJson);
+                JSONObject proxies = root.optJSONObject("proxies");
+                JSONObject target = proxies == null ? null : proxies.optJSONObject(group);
+                JSONArray all = target == null ? null : target.optJSONArray("all");
+                if (all == null || all.length() == 0) {
+                    throw new IllegalStateException("出站组尚未同步");
+                }
+                MainActivity.appLog("开始测速：" + group + "（" + all.length()
+                        + " 个成员，使用组配置的 URLTest 地址）", false);
+                // libbox tests the group through the group's own URLTest URL
+                // and timeout. Calling each member separately would silently
+                // fall back to sing-box's per-outbound default URL.
+                activeClient.urlTest(group);
+                return;
+            } catch (Exception error) {
+                lastError = error;
+                try {
+                    Thread.sleep(200);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }
+        if (lastError != null) {
+            Log.w(TAG, "Unable to test outbound group " + group, lastError);
+            MainActivity.appLog("测速启动失败：" + lastError.getMessage(), true);
+        }
+    }
+
+    public static boolean setClashMode(String mode) {
+        ClashVpnService service = current;
+        if (service == null || mode == null || mode.isEmpty()) return false;
+        String previous = service.requestedClashMode;
+        try {
+            RuntimeModeReconciler.requireSupported(mode);
+            service.requestedClashMode = mode;
+            if (!service.started) return true;
+            service.reconcileRequestedClashMode(service.controlClient());
+            return true;
+        } catch (Exception error) {
+            if (service.started) service.requestedClashMode = previous;
+            Log.w(TAG, "Unable to set clash mode " + mode, error);
+            MainActivity.appLog("出站模式切换失败：" + error.getMessage(), true);
+            return false;
+        }
+    }
+
+    public static String proxyGroups() {
+        ClashVpnService service = current;
+        if (service != null) {
+            try {
+                // 代理快照按需建立控制通道；首次进入代理页时也必须触发
+                // writeGroups，否则 outboundGroupsJson 仍是空对象。
+                service.controlClient();
+            } catch (Exception error) {
+                MainActivity.appLog("读取出站线路失败：" + error.getMessage(), true);
+            }
+        }
+        return outboundGroupsJson;
+    }
+
+    public static String connectionsSnapshot() {
+        ClashVpnService service = current;
+        return service == null ? connectionsJson : service.readConnectionsSnapshot();
+    }
+
+    private String readConnectionsSnapshot() {
+        synchronized (connectionsLock) {
+            return connectionsJson;
+        }
+    }
+
+    public static boolean closeConnection(String id) {
+        ClashVpnService service = current;
+        if (service == null || id == null || id.isEmpty()) return false;
+        try {
+            service.controlClient().closeConnection(id);
+            return true;
+        } catch (Exception error) {
+            MainActivity.appLog("关闭 Android 连接失败：" + error.getMessage(), true);
+            return false;
+        }
+    }
+
+    public static boolean closeAllConnections() {
+        ClashVpnService service = current;
+        if (service == null) return false;
+        try {
+            service.controlClient().closeConnections();
+            return true;
+        } catch (Exception error) {
+            MainActivity.appLog("关闭 Android 连接失败：" + error.getMessage(), true);
+            return false;
+        }
+    }
+    // Preserve Failed for the native/UI state machine.  Previously close() sent
+    // a second "stopped" callback immediately, hiding the actual libbox error.
+    private void fail(String msg) {
+        failureReported = true;
+        stopRequested.set(true);
+        Log.e(TAG, msg);
+        MainActivity.appLog(msg, true);
+        if (!speedTestOnly && !coreOnly) markTunPreferenceResetPending();
+        clearPersistentServiceMode(this);
+        BootReceiver.setVpnActive(this, false);
+        boolean closed = close(msg, false);
+        if (speedTestOnly || coreOnly) publishCoreState(3, msg);
+        else publishVpnState(3, msg);
+        if (closed) {
+            stopForeground(STOP_FOREGROUND_REMOVE);
+            stopSelf();
+        }
+    }
+
+    @Override public boolean usePlatformAutoDetectInterfaceControl(){return true;}
+    // Present in newer libbox builds but deliberately not annotated: v1.14 does
+    // not declare it, while an unannotated method remains harmless there.
+    public boolean usePlatformAutoRedirect(){return false;}
+    @Override public void autoDetectInterfaceControl(int fd){protect(fd);}
+    @Override public boolean includeAllNetworks(){return false;} @Override public boolean underNetworkExtension(){return false;}
+    @Override public boolean usePlatformBridge(){return false;} @Override public boolean usePlatformShell(){return false;}
+    @Override public void clearDNSCache(){}
+    // libbox dereferences the returned owner while preparing TUN DNS metadata;
+    // returning null here causes a Go-side SIGSEGV. Android 10+ exposes the
+    // exact socket-to-UID lookup. In 1.14.4 the older-Android procfs lookup is
+    // an explicit Libbox function instead of a PlatformInterface mode flag.
+    @Override public ConnectionOwner findConnectionOwner(int protocol, String sourceAddress,
+                                                         int sourcePort, String destinationAddress,
+                                                         int destinationPort) throws Exception {
+        final int uid;
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            ConnectionOwner owner = Libbox.findConnectionOwner(protocol, sourceAddress,
+                    sourcePort, destinationAddress, destinationPort);
+            if (owner == null) throw new IllegalStateException("Android 未找到连接所属应用");
+            uid = owner.getUserId();
+        } else {
+            ConnectivityManager manager =
+                    (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (manager == null) throw new IllegalStateException("Android 网络服务不可用");
+            uid = manager.getConnectionOwnerUid(protocol,
+                    new InetSocketAddress(sourceAddress, sourcePort),
+                    new InetSocketAddress(destinationAddress, destinationPort));
+        }
+        if (uid == Process.INVALID_UID) {
+            throw new IllegalStateException("Android 未找到连接所属应用");
+        }
+        String[] packages = getPackageManager().getPackagesForUid(uid);
+        List<String> packageNames = new ArrayList<>();
+        if (packages != null) {
+            for (String packageName : packages) {
+                if (packageName != null && !packageName.isEmpty()) packageNames.add(packageName);
+            }
+        }
+        ConnectionOwner owner = new ConnectionOwner();
+        owner.setUserId(uid);
+        owner.setUserName(packageNames.isEmpty() ? "" : packageNames.get(0));
+        owner.setAndroidPackageNames(new StringArray(packageNames));
+        return owner;
+    }
+    @Override public WIFIState readWIFIState(){return null;}
+    @Override public void startDefaultInterfaceMonitor(InterfaceUpdateListener listener) {
+        defaultInterfaceListener = listener;
+        notifyDefaultInterface(listener);
+    }
+    @Override public void closeDefaultInterfaceMonitor(InterfaceUpdateListener listener) {
+        if (defaultInterfaceListener == listener) defaultInterfaceListener = null;
+    }
+    @Override public void startNeighborMonitor(NeighborUpdateListener l){}
+    @Override public void closeNeighborMonitor(NeighborUpdateListener l){}
+    @Override public void registerMyInterface(String n){}
+    @Override public void checkPlatformShell(){}
+    @Override public BridgeSession createBridge(BridgeOptions o){return null;} @Override public PlatformUser lookupUser(String n){return null;} @Override public ShellSession openShellSession(PlatformUser u,String c,StringIterator e,String d,int p,int q){return null;} @Override public String lookupSFTPServer(){return "";} @Override public String readSystemSSHHostKey(){return "";} @Override public String tailscaleHostname(){return "";}
+    @Override public void sendNotification(io.nekohasekai.libbox.Notification n){} @Override public void cancelNotification(String i,int t){} @Override public int connectSSHAgent(){return -1;} @Override public SystemProxyStatus getSystemProxyStatus(){return null;} @Override public void serviceReload(){} @Override public void serviceStop(){RuntimeControlService.requestStop(this);} @Override public void setSystemProxyEnabled(boolean e){} @Override public void triggerNativeCrash(){} @Override public void writeDebugMessage(String m){Log.d(TAG,m); MainActivity.appLog("libbox 调试信息："+m,false);}
+    @Override public void clearLogs(){} @Override public void connected(){Log.i(TAG,"sing-box command stream connected"); MainActivity.appLog("libbox 控制通道已连接",false);} @Override public void disconnected(String message){Log.w(TAG,"sing-box command stream disconnected: "+message); MainActivity.appLog("libbox 控制流断开："+message,true);} @Override public void initializeClashMode(StringIterator modes,String current){} @Override public void setDefaultLogLevel(int level){} @Override public void updateClashMode(String mode){} @Override public void writeConnectionEvents(ConnectionEvents events){
+        if (events == null) return;
+        try {
+            synchronized (connectionsLock) {
+                connectionSnapshot.applyEvents(events);
+                connectionSnapshot.filterState((int) Libbox.ConnectionStateActive);
+                connectionSnapshot.sortByDate();
+                connectionsJson = encodeConnectionsLocked();
+            }
+            RuntimeSnapshotStore.writeAsync(this, "connections.json", connectionsJson);
+        } catch (Throwable error) {
+            Log.w(TAG, "Unable to snapshot sing-box connections", error);
+            MainActivity.appLog("读取 Android 连接失败：" + error.getMessage(), true);
+        }
+    } @Override public void writeLogs(LogIterator logs){
+        while (logs != null && logs.hasNext()) {
+            LogEntry entry = logs.next();
+            if (entry != null) MainActivity.coreLog(entry.getLevel(), entry.getMessage());
+        }
+    } @Override public void writeOutbounds(OutboundGroupItemIterator outbounds){} @Override public void writeStatus(StatusMessage status){
+        if (status == null || !status.getTrafficAvailable()) return;
+        try {
+            uploadTotal = status.getUplinkTotal();
+            downloadTotal = status.getDownlinkTotal();
+            synchronized (connectionsLock) {
+            connectionsJson = encodeConnectionsLocked();
+            }
+            RuntimeSnapshotStore.writeAsync(this, "connections.json", connectionsJson);
+            publishStats(status.getUplink(), status.getDownlink(),
+                    status.getUplinkTotal(), status.getDownlinkTotal(),
+                    status.getConnectionsIn() + status.getConnectionsOut());
+        } catch (Throwable error) {
+            Log.w(TAG, "Unable to publish sing-box status", error);
+            MainActivity.appLog("发布 libbox 状态失败：" + error.getMessage(), true);
+        }
+    }
+
+    private String encodeConnectionsLocked() throws Exception {
+        JSONObject result = new JSONObject();
+        result.put("uploadTotal", uploadTotal);
+        result.put("downloadTotal", downloadTotal);
+        JSONArray items = new JSONArray();
+        ConnectionIterator iterator = connectionSnapshot.iterator();
+        while (iterator != null && iterator.hasNext()) {
+            Connection connection = iterator.next();
+            if (connection == null) continue;
+            JSONObject item = new JSONObject();
+            item.put("id", safe(connection.getID()));
+            item.put("upload", connection.getUplink());
+            item.put("download", connection.getDownlink());
+            item.put("outboundType", safe(connection.getOutboundType()));
+            JSONObject metadata = new JSONObject();
+            String domain = safe(connection.getDomain());
+            String destination = safe(connection.getDestination());
+            metadata.put("host", domain.isEmpty() ? destination : domain);
+            metadata.put("destination", destination);
+            metadata.put("network", safe(connection.getNetwork()));
+            metadata.put("inboundType", safe(connection.getInboundType()));
+            metadata.put("inbound", safe(connection.getInbound()));
+            metadata.put("destinationPort", destinationPort(destination));
+            item.put("metadata", metadata);
+            JSONArray chains = new JSONArray();
+            StringIterator chain = connection.chain();
+            while (chain != null && chain.hasNext()) {
+                String hop = chain.next();
+                if (hop != null && !hop.isEmpty()) chains.put(hop);
+            }
+            if (chains.length() > 0) item.put("chains", chains);
+            item.put("rule", safe(connection.getRule()));
+            items.put(item);
+        }
+        result.put("connections", items);
+        return result.toString();
+    }
+
+    private static String safe(String value) { return value == null ? "" : value; }
+
+    private static String destinationPort(String destination) {
+        if (destination == null || destination.isEmpty()) return "";
+        int colon = destination.lastIndexOf(':');
+        return colon < 0 || colon == destination.length() - 1
+                ? "" : destination.substring(colon + 1);
+    }
+    @Override public void writeGroups(OutboundGroupIterator groups) {
+        try {
+            JSONObject proxies = new JSONObject();
+            JSONObject itemDetails = new JSONObject();
+            int groupCount = 0;
+            int itemCount = 0;
+            while (groups != null && groups.hasNext()) {
+                OutboundGroup group = groups.next();
+                if (group == null || group.getTag() == null || group.getTag().isEmpty()) continue;
+                groupCount++;
+                JSONObject value = new JSONObject();
+                value.put("type", group.getType());
+                value.put("now", group.getSelected());
+                value.put("selectable", group.getSelectable());
+                JSONArray all = new JSONArray();
+                OutboundGroupItemIterator items = group.getItems();
+                while (items != null && items.hasNext()) {
+                    OutboundGroupItem item = items.next();
+                    if (item != null && item.getTag() != null) {
+                        all.put(item.getTag());
+                        JSONObject detail = new JSONObject();
+                        detail.put("type", item.getType());
+                        detail.put("urlTestTime", item.getURLTestTime());
+                        detail.put("urlTestDelay", item.getURLTestDelay());
+                        itemDetails.put(item.getTag(), detail);
+                        itemCount++;
+                    }
+                }
+                value.put("all", all);
+                proxies.put(group.getTag(), value);
+            }
+            Iterator<String> details = itemDetails.keys();
+            while (details.hasNext()) {
+                String tag = details.next();
+                if (!proxies.has(tag)) proxies.put(tag, itemDetails.get(tag));
+            }
+            outboundGroupsJson = new JSONObject().put("proxies", proxies).toString();
+            ClashVpnService service = current;
+            if (service != null) {
+                RuntimeSnapshotStore.writeAsync(service, "outbound-groups.json",
+                        outboundGroupsJson);
+            }
+            Log.i(TAG, "libbox 出站组快照已更新：" + groupCount + " 组，" + itemCount + " 节点");
+        } catch (Throwable error) {
+            Log.w(TAG, "Unable to snapshot outbound groups", error);
+            MainActivity.appLog("读取出站线路失败：" + error.getMessage(), true);
+        }
+    }
+    private android.app.Notification buildForegroundNotification(String text) {
+        Intent openBackgroundSettings = new Intent(Intent.ACTION_VIEW,
+                android.net.Uri.parse("clash-flux://app/settings/background"),
+                this, MainActivity.class);
+        openBackgroundSettings.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP
+                | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        PendingIntent openApp = PendingIntent.getActivity(this, NOTIFICATION_ID,
+                openBackgroundSettings,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        android.app.Notification.Builder builder = Build.VERSION.SDK_INT >= 26
+                ? new android.app.Notification.Builder(this, CHANNEL_ID)
+                : new android.app.Notification.Builder(this);
+        return builder
+                .setContentTitle("Clash-Flux")
+                .setContentText(text)
+                .setSmallIcon(android.R.drawable.stat_notify_sync_noanim)
+                .setCategory(android.app.Notification.CATEGORY_SERVICE)
+                .setContentIntent(openApp)
+                .setOngoing(true)
+                .build();
+    }
+
+    private void updateForegroundNotification(String text) {
+        NotificationManager manager = getSystemService(NotificationManager.class);
+        if (manager != null) manager.notify(NOTIFICATION_ID, buildForegroundNotification(text));
+    }
+
+    private void foreground() {
+        NotificationManager manager = getSystemService(NotificationManager.class);
+        if (manager != null && Build.VERSION.SDK_INT >= 26
+                && manager.getNotificationChannel(CHANNEL_ID) == null) {
+            manager.createNotificationChannel(new NotificationChannel(
+                    CHANNEL_ID, "VPN 状态", NotificationManager.IMPORTANCE_LOW));
+        }
+        android.app.Notification notification =
+                buildForegroundNotification("等待启动 sing-box VPN 隧道");
+        if (Build.VERSION.SDK_INT >= 34) {
+            startForeground(NOTIFICATION_ID, notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+        } else {
+            startForeground(NOTIFICATION_ID, notification);
+        }
+    }
+}

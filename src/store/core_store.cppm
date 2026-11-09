@@ -1,0 +1,207 @@
+// core_store.cppm — clashflux.store.core：内核编排 store（接口即实现，单例）。
+//
+// 持有 Db / CoreProcess / ClashApi / NativeApi / CoreStreams，是 UI 与内核之间的唯一
+// 入口。线程契约：snapshot() / settings 读取等轻量方法任意线程可调；标注
+// 「阻塞」的方法（startCore/stopCore/refreshRuntime/applyConfig）会做 spawn、
+// 网络等待，UI 必须经 RunOnTaskThread 调用；State 写入只在 UI 线程（UI 层在
+// 协程恢复点把 snapshot 写进 State）。
+//
+// 启动流程（startCore）：
+//   1. 解析 sing-box 二进制（cfg::singboxBinary）——缺失 → Failed
+//   2. 读启用订阅（无订阅 = 空）经 clashflux.singbox 编译为
+//      coreWorkDir/config.json（不支持的节点/规则以 warnings 带回）
+//   3. spawn `sing-box run -c <config> -D <workdir>`，通过原生 GetVersion/GetStartedAt 确认
+//      实例就绪（≤30s，覆盖远程规则集首启下载；进程提前退出仍立即判失败）
+//   4. 就绪 → Running，拉起 /logs /traffic /connections 三条 WS 流
+module;
+#include "runtime_health.h"
+#include "wire_codec.h"
+#include "runtime_network_probe.h"
+#include "health_history.h"
+#include "runtime_plan_state.h"
+#include "connection_trace.h"
+#include "runtime_compile.h"
+#include "tun_settings.h"
+#include "rule_set_cache_ownership.h"
+#if defined(__ANDROID__)
+#include "android_profile_http.h"
+#if !defined(NDEBUG)
+#include <android/log.h>
+#endif
+#endif
+export module clashflux.store.core;
+
+import std;
+import nlohmann.json;
+import clashflux.config;
+import clashflux.utils;
+import clashflux.db;
+import clashflux.persistence;
+import clashflux.api;
+import clashflux.core;
+import clashflux.singbox;
+import clashflux.rule_provider_cache;
+import clashflux.provider_resources;
+import clashflux.stream;
+import clashflux.routing;
+import clashflux.vpn;
+
+namespace store {
+
+#if defined(__ANDROID__)
+// android_bridge: 0=stopped, 1=establishing, 2=attached, 3=failed.
+extern "C" int clashflux_android_vpn_state() noexcept;
+extern "C" int clashflux_android_core_state() noexcept;
+extern "C" bool clashflux_android_start_core() noexcept;
+extern "C" void clashflux_android_start_vpn() noexcept;
+extern "C" bool clashflux_android_stop_vpn() noexcept;
+extern "C" bool clashflux_android_set_clash_mode(const char*) noexcept;
+extern "C" bool clashflux_android_select_outbound(const char*, const char*) noexcept;
+#endif
+#if defined(CLASHFLUX_IOS)
+extern "C" bool clashflux_ios_stop_tunnel() noexcept;
+#endif
+
+export struct ProfileFidelityReport {
+    std::string profileName;
+    std::vector<singbox::FidelityNote> notes;
+    std::string error;
+    bool supported = true;
+
+    bool operator==(const ProfileFidelityReport&) const = default;
+};
+
+export struct CoreSnapshot {
+    core::CoreState state = core::CoreState::Stopped;
+    std::chrono::steady_clock::time_point runningSince{}; // 控制器确认就绪的时间
+    std::string binaryPath;      // 解析到的内核路径（空 = 未安装）
+    std::string version;         // 内核版本（Running 时）
+    std::string lastError;
+    // 订阅编译降级报告（不支持的节点/规则；启动时更新）。warnings 是自由文本
+    // 投影，fidelity 是结构化账本——UI/CLI 应按 fidelity 渲染（见
+    // docs/singbox-layers-and-fidelity.md §2），不要解析 warnings 文本。
+    std::vector<std::string> warnings;
+    std::vector<singbox::FidelityNote> fidelity;
+    std::shared_ptr<const std::vector<singbox::SourceObject>> sourceObjects;
+    std::vector<std::string> participatingSources;
+    std::uint64_t planRevision = 0; // 实际启动成功的策略版本，停止/预览时不代表生效
+    std::uint64_t nativeStartedAt = 0; // authenticated native instance identity
+    std::shared_ptr<const clashflux::connection_trace::Plan> appliedRulePlan;
+
+    // 运行配置快照（Running 时有效）
+    std::string mode;            // rule / global / direct
+    int mixedPort = 7899;
+    bool allowLan = false;
+    std::string logLevel = "info";
+    bool tunEnabled = false;
+    bool proxyListening = false; // accepted traffic inbounds; independent of controller readiness
+    std::uint64_t networkRevision = 0; // settings revision in the accepted plan
+    std::chrono::steady_clock::time_point connectedSince{};
+    // Android sing-box libbox status stream.  Desktop continues to use the
+    // sing-box clash_api WebSocket streams below.
+    std::int64_t uploadRate = 0;
+    std::int64_t downloadRate = 0;
+    std::int64_t uploadTotal = 0;
+    std::int64_t downloadTotal = 0;
+    int connectionCount = 0;
+    // Android ages originate in elapsedRealtime, then age locally after receipt.
+    std::uint64_t runtimeEpoch = 0, clientGeneration = 0, statusSequence = 0;
+    std::int64_t statusAgeMs = -1, binderAgeMs = -1;
+    std::chrono::steady_clock::time_point binderReceivedAt{};
+    bool binderAvailable = false, statusConnected = false, trafficAvailable = false;
+    std::string statusHealth = "paused";
+    unsigned statusRepairs = 0;
+
+    bool operator==(const CoreSnapshot&) const = default;  // State 变更检测
+};
+
+export struct ExternalResourceRefreshBatch {
+    unsigned attempted = 0, updated = 0, applied = 0;
+    bool deferred = false;
+    std::vector<std::string> errors;
+};
+
+export class CoreStore {
+public:
+    CoreStore() = default;
+    ~CoreStore() noexcept {
+        // 正常关闭由 AppRoot 的异步收尾负责；这里保留一个进程退出时的
+        // RAII 兜底，避免窗口被外部关闭、组合树提前卸载后 root 服务仍
+        // 持有内核。兜底只覆盖本进程直接持有的形态（服务托管/直接
+        // spawn）：adopted 不在其列——CLI `core start` 的 detached 驻留
+        // 契约就是 CLI 退出后内核继续跑（停止走 `core stop` / pidfile）。
+        // 析构阶段不能把异常带出进程；正常 UI 关闭仍由 AppRoot 的任务
+        // 线程路径负责，避免阻塞交互线程。
+        try {
+            if (process_.running()) stopCore();
+        } catch (...) {
+        }
+    }
+    CoreStore(const CoreStore&) = delete;
+    CoreStore& operator=(const CoreStore&) = delete;
+
+    // 惰性初始化（打开 Db、确保 secret 存在、准备 API 端点）。幂等。
+#include "store/core_store_state.inc"
+#include "store/core_store_diagnostics.inc"
+#include "store/core_store_evidence.inc"
+#include "store/core_store_routing.inc"
+#include "store/core_store_lifecycle.inc"
+#include "store/connection_trace.inc"
+#include "store/external_resource_scheduler.inc"
+private:
+#include "store/provider_download.inc"
+#include "store/core_store_helpers.inc"
+
+    std::unique_ptr<db::Db> db_;
+    std::unique_ptr<api::ClashApi> api_;
+    std::unique_ptr<api::NativeApi> nativeApi_;
+    provider_resources::Manager providerResources_;
+    struct ResourceRetry { std::chrono::steady_clock::time_point next{}; unsigned failures = 0; };
+    std::map<std::string, ResourceRetry> resourceRetries_;
+    std::string resourceCursor_;
+    core::CoreProcess process_;
+    stream::CoreStreams streams_;
+    std::string secret_;
+
+    std::mutex mutex_;
+    std::recursive_mutex lifecycleMutex_;
+    std::vector<singbox::NativeConnection> nativeSessions_;
+    std::once_flag initFlag_;
+    CoreSnapshot snap_;
+    clashflux::health::History healthHistory_;
+    std::atomic_bool healthCaptureFailed_{false};
+    const std::uint64_t healthSession_ = static_cast<std::uint64_t>(
+        std::chrono::system_clock::now().time_since_epoch().count());
+    clashflux::network_probe::Result observedNetwork_;
+    std::chrono::steady_clock::time_point observedNetworkAt_{};
+    std::uint64_t observedNetworkEpoch_ = 0;
+    bool observedNetworkRunning_ = false, observedNetworkTun_ = false;
+    std::optional<clashflux::network_probe::Request> lastTunProbe_;
+    std::unordered_map<std::string,std::optional<bool>> pptpEvidence_;
+    std::string binaryPath_;
+    std::unique_ptr<PreparedStart> preparedStart_;
+    std::string lastPreparedJson_, lastAppliedJson_;
+    std::shared_ptr<const clashflux::connection_trace::Plan> lastPreparedRulePlan_;
+    std::shared_ptr<const clashflux::connection_trace::Binding> connectionRuleBinding_;
+    std::optional<singbox::CompileOptions> preparedOptions_;
+    std::optional<singbox::CompileOptions> lastAppliedOptions_;
+    std::optional<singbox::CompileOptions> lastPreparedOptions_;
+    std::shared_ptr<const std::vector<singbox::SourceObject>> previewSourceObjects_;
+    std::map<std::filesystem::path, std::pair<std::filesystem::file_time_type, std::uintmax_t>> compiledSourceFiles_;
+    std::string compiledPolicyText_;
+    std::uint64_t compiledProfilesRevision_ = 0;
+    std::string lastProfileYaml_;    // 最近一次 startCore 的订阅原文（applyTun 重启用）
+    std::string compiledProxyGroups_;
+    // 缓存对应的订阅文件指纹：文件被重新下载/替换（手机上"传输失败后手动补
+    // 文件"就是这样）时必须重编，否则进程内会一直返回旧的空快照。
+    std::filesystem::file_time_type compiledProxyGroupsStamp_{};
+    std::uintmax_t compiledProxyGroupsSize_ = 0;
+};
+
+// 进程级单例（apitab g_requests 同款形态）。
+export CoreStore& coreStore() {
+    static CoreStore store;
+    return store;
+}
+
+} // namespace store

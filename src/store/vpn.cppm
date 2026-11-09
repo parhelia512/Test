@@ -1,0 +1,403 @@
+// vpn.cppm — clashflux.store.vpn：订阅化的原生 VPN 连接管理。
+//
+// 原生独立连接只保留 PPTP 系统拨号。OpenVPN 是普通订阅内容格式，
+// 由 sing-box 编译和主内核生命周期统一管理，不在本 store 创建独立会话。
+module;
+// clang-21 模块可见性 workaround（llvm#149404）：本单元 GMF 引入头文件后，
+// 经 nlohmann.json 模块会失去 std::format 的 char 重载只剩 wchar 重载；
+// 按上游 workaround 文本包含 <format> 恢复两个重载的可见性。
+#include <format>
+#include "../hydrated_once.h"
+export module clashflux.store.vpn;
+
+import std;
+import clashflux.db;
+import clashflux.persistence;
+import clashflux.config;
+import clashflux.core;
+import clashflux.pptp;
+import clashflux.stream;
+import clashflux.vpn;
+import clashflux.routing;
+import clashflux.singbox;
+import clashflux.store.core;
+
+namespace store {
+
+// 连接 id 是跨引擎、跨平台的稳定引用。规则页只保存这个 id，不保存某个
+// 引擎的临时接口名；这样同一条全局规则可以在 PPTP/sing-box 等引擎之间复用。
+export inline std::string ProfileConnectionId(std::int64_t profileId) {
+    return routing::ConnectionId(profileId);
+}
+
+namespace detail {
+
+inline std::string EncodePolicy(const vpn::VpnPolicy& policy) {
+    return routing::EncodePolicy(policy);
+}
+
+inline vpn::VpnPolicy DecodePolicy(const std::string& text) {
+    return routing::DecodePolicy(text);
+}
+
+} // namespace detail
+
+export struct PptpState {
+    std::int64_t profileId = 0;
+    std::string name;
+    vpn::ConnectionState state = vpn::ConnectionState::Idle;
+    bool toolsAvailable = false;
+    std::string interfaceName;
+    std::string gateway;
+    std::string error;
+
+    bool operator==(const PptpState&) const = default;
+};
+
+// Capability and session states are published together, including before any
+// connection has been dialed. Rendering never probes or constructs VpnStore.
+export struct VpnSnapshot {
+    bool pptpAvailable = false;
+    std::vector<PptpState> pptp;
+    bool operator==(const VpnSnapshot&) const = default;
+};
+
+export class VpnStore {
+public:
+    VpnStore() : adapter_(pptp::MakePptpAdapter()) {
+        manager_.setAdapters({adapter_});
+    }
+
+    ~VpnStore() { shutdown(); }
+
+    VpnStore(const VpnStore&) = delete;
+    VpnStore& operator=(const VpnStore&) = delete;
+
+    void init() { ensureLoaded(); }
+
+    // 全局规则是持久化的编排策略：默认主连接负责未命中的流量，rules
+    // 把特定域名/IP/网段交给某个订阅连接。返回副本，UI 不会触碰 manager
+    // 的内部容器，也不会把 settings 表访问放到渲染线程。
+    vpn::VpnPolicy globalPolicy() {
+        ensureLoaded();
+        std::lock_guard lock(operationMutex_);
+        return manager_.policy();
+    }
+
+    bool saveGlobalPolicy(vpn::VpnPolicy policy, std::string& error) {
+        ensureLoaded();
+        std::lock_guard lock(operationMutex_);
+        auto planLock = coreStore().lockPlanLifecycle();
+        const auto previous = manager_.policy();
+        policy.revision = previous.revision;
+        if (previous == policy) { error.clear(); return true; }
+        if (!routing::ValidatePlatformPolicy(policy, coreStore().db().listProfiles(), error)) return false;
+        if (!singbox::ValidateGlobalRuleSetReferences(coreStore().ruleSetLibrary(), policy.rules, error)) return false;
+        if (previous.revision == std::numeric_limits<std::uint64_t>::max()) { error = "计划修订号超出范围"; return false; }
+        policy.revision = previous.revision + 1;
+        for (std::size_t i = 0; i < policy.rules.size(); ++i) {
+            auto& rule = policy.rules[i];
+            if (rule.id.empty()) rule.id = "route-" + cfg::randomSecret();
+            rule.order = static_cast<std::int64_t>(i);
+        }
+        // 内核运行时，publishRouting → restartCore 会用同一份候选（相同 TUN
+        // 状态 + 新落库策略）在停止旧实例前做「编译 + 内核 check」，拒绝时走
+        // 下方回滚；这里再预编译一次纯属重复，且是保存全局规则卡顿的主因。
+        // 内核未运行时没有候选门禁，这里做唯一一次「编译 + check」验证。
+        if (coreStore().snapshot().state != core::CoreState::Running &&
+            !coreStore().validateRoutingPlan(coreStore().currentMainContent(),
+                                             error, &policy)) {
+            return false;
+        }
+        try {
+            if (!manager_.applyPolicy(policy, error)) {
+                // A failed rollback means the native route state is unknown.
+                if (error.find("回滚失败") != std::string::npos) coreStore().stopCore();
+                return false;
+            }
+            coreStore().db().setSetting("vpn.global_policy",
+                                       detail::EncodePolicy(policy));
+            coreStore().invalidateProxyGroupsSnapshot();
+            if (!publishRouting(error)) {
+                const auto failure = error;
+                coreStore().db().setSetting("vpn.global_policy",
+                                           detail::EncodePolicy(previous));
+                std::string rollbackError;
+                const bool restored = manager_.applyPolicy(previous, rollbackError);
+                if (!restored) {
+                    error = failure + "；恢复原生路由失败：" + rollbackError;
+                    coreStore().stopCore();
+                    return false;
+                }
+                publishRouting(rollbackError);
+                error = failure;
+                return false;
+            }
+            error.clear();
+            return true;
+        } catch (const std::exception& exception) {
+            error = exception.what();
+            std::string ignored;
+            if (!manager_.applyPolicy(previous, ignored)) coreStore().stopCore();
+            try {
+                coreStore().db().setSetting("vpn.global_policy",
+                                           detail::EncodePolicy(previous));
+                if (!publishRouting(ignored)) coreStore().stopCore();
+            } catch (...) { coreStore().stopCore(); }
+            return false;
+        }
+    }
+
+    void shutdown() noexcept {
+        std::lock_guard operationLock(operationMutex_);
+        try {
+            coreStore().stopCore();
+            std::string ignored;
+            coreStore().updateNativeRouting({}, ignored);
+        } catch (...) {
+        }
+        manager_.disconnectAll();
+        std::lock_guard snapshotLock(mutex_);
+        snapshots_.clear();
+    }
+
+    bool stopTraffic(std::string& error) {
+        ensureLoaded();
+        std::lock_guard operationLock(operationMutex_);
+        auto mainOperation = coreStore().lockNativeLifecycle();
+        const bool stopped = coreStore().stopCore();
+        error = stopped ? std::string{} : coreStore().snapshot().lastError;
+        if (error.empty() && !stopped) error = "主内核停止未确认";
+        manager_.disconnectAll();
+        return stopped;
+    }
+
+    PptpState state(std::int64_t profileId) {
+        std::lock_guard lock(mutex_);
+        return stateLocked(profileId);
+    }
+
+    std::vector<PptpState> states() {
+        std::lock_guard lock(mutex_);
+        std::vector<PptpState> result;
+        result.reserve(snapshots_.size());
+        for (const auto& [profileId, snapshot] : snapshots_) {
+            (void)profileId;
+            result.push_back(snapshot);
+        }
+        return result;
+    }
+
+    VpnSnapshot snapshot() {
+        std::lock_guard lock(mutex_);
+        VpnSnapshot result{.pptpAvailable = adapter_.descriptor.available};
+        result.pptp.reserve(snapshots_.size());
+        for (const auto& [id, state] : snapshots_) result.pptp.push_back(state);
+        return result;
+    }
+
+    bool connectPptp(const db::Profile& profile, std::string& error) {
+        ensureLoaded();
+        error = profile.type == "pptp"
+            ? "移动端不支持桌面 PPTP 系统拨号" : "该订阅不是 PPTP 类型";
+        setError(profile.id, error);
+        return false;
+    }
+
+    void disconnectPptp(std::int64_t profileId) {
+        ensureLoaded();
+        std::lock_guard operationLock(operationMutex_);
+        auto mainOperation = coreStore().lockNativeLifecycle();
+        std::string error;
+        if (!blockBeforeDisconnect(connectionId(profileId), error) ||
+            !disconnectConfirmed(connectionId(profileId), error)) {
+            setError(profileId, error);
+            throw std::runtime_error(error);
+        }
+        std::lock_guard snapshotLock(mutex_);
+        if (snapshots_.contains(profileId)) {
+            updateSnapshotLocked(profileId, {});
+        }
+    }
+
+    void forgetPptp(std::int64_t profileId) {
+        ensureLoaded();
+        std::lock_guard operationLock(operationMutex_);
+        auto mainOperation = coreStore().lockNativeLifecycle();
+        std::string error;
+        if (!blockBeforeDisconnect(connectionId(profileId), error) ||
+            !disconnectConfirmed(connectionId(profileId), error)) {
+            setError(profileId, error);
+            throw std::runtime_error(error);
+        }
+        manager_.removeConnection(connectionId(profileId));
+        std::lock_guard snapshotLock(mutex_);
+        snapshots_.erase(profileId);
+    }
+
+private:
+    inline bool publishRouting(std::string& error, std::string_view unavailable = {}) {
+        std::vector<singbox::NativeConnection> sessions;
+        for (const auto& connection : manager_.connections()) {
+            singbox::NativeConnection session;
+            session.id = connection.id;
+            session.connected = connection.id != unavailable &&
+                connection.state == vpn::ConnectionState::Connected;
+            session.interfaceName = session.connected &&
+                    connection.kind == vpn::ConnectionKind::Pptp
+                ? connection.interfaceName
+                : "";
+            session.kind = connection.kind;
+            session.transportAddress = session.connected ? connection.transportAddress : "";
+            sessions.push_back(std::move(session));
+        }
+        return coreStore().updateNativeRouting(std::move(sessions), error);
+    }
+
+    bool disconnectConfirmed(std::string_view id, std::string& error) {
+        const auto* connection = manager_.findConnection(id);
+        if (connection && connection->activeEngine) {
+            manager_.disconnect(id);
+            const std::optional<bool> evidence = manager_.findConnection(id) == nullptr;
+            coreStore().recordPptpEvidence(std::string(id), evidence);
+            if (evidence.value_or(false)) {
+                error = "暂时无法确认 PPTP 已断开；已保留连接状态，请稍后重试";
+                return false;
+            }
+        }
+        manager_.disconnect(id);
+        return true;
+    }
+
+    bool blockBeforeDisconnect(std::string_view id, std::string& error) {
+        const auto* connection = manager_.findConnection(id);
+        if (connection == nullptr || connection->state != vpn::ConnectionState::Connected) return true;
+        if (!coreStore().runningPlanUsesNative(id)) return true;
+        coreStore().stopCore();
+        if (coreStore().snapshot().state == core::CoreState::Stopped) return true;
+        error += "；主内核停止未确认";
+        return false;
+    }
+
+    static std::string connectionId(std::int64_t profileId) {
+        return ProfileConnectionId(profileId);
+    }
+
+    static std::vector<std::string> splitRoutes(const std::string& text) {
+        std::vector<std::string> routes;
+        std::size_t begin = 0;
+        while (begin <= text.size()) {
+            const std::size_t end = text.find_first_of(",\n", begin);
+            std::string route = text.substr(
+                begin, end == std::string::npos ? std::string::npos : end - begin);
+            while (!route.empty() && std::isspace(
+                                           static_cast<unsigned char>(route.front()))) {
+                route.erase(route.begin());
+            }
+            while (!route.empty() && std::isspace(
+                                           static_cast<unsigned char>(route.back()))) {
+                route.pop_back();
+            }
+            if (!route.empty()) routes.push_back(std::move(route));
+            if (end == std::string::npos) break;
+            begin = end + 1;
+        }
+        return routes;
+    }
+
+    PptpState stateLocked(std::int64_t profileId) const {
+        if (const auto it = snapshots_.find(profileId); it != snapshots_.end()) {
+            return it->second;
+        }
+        return PptpState{
+            .profileId = profileId,
+            .toolsAvailable = adapter_.descriptor.available,
+        };
+    }
+
+    void updateSnapshotLocked(std::int64_t profileId, std::string_view error) {
+        PptpState& snapshot = snapshots_[profileId];
+        snapshot.profileId = profileId;
+        snapshot.toolsAvailable = adapter_.descriptor.available;
+        if (const vpn::VpnConnection* connection =
+                manager_.findConnection(connectionId(profileId));
+            connection != nullptr) {
+            snapshot.name = connection->name;
+            snapshot.state = connection->state;
+            snapshot.interfaceName = connection->interfaceName;
+            snapshot.gateway = connection->gateway;
+        }
+        snapshot.error = std::string(error);
+    }
+
+    void setError(std::int64_t profileId, const std::string& error) {
+        std::lock_guard lock(mutex_);
+        updateSnapshotLocked(profileId, error);
+        const auto* connection = manager_.findConnection(connectionId(profileId));
+        // A failed operation/unknown IPC reply does not erase a retained live
+        // session from the UI. Its monitor still owns the authoritative state.
+        if (!connection || !connection->activeEngine ||
+            connection->state != vpn::ConnectionState::Connected)
+            snapshots_[profileId].state = vpn::ConnectionState::Failed;
+    }
+
+    void ensureLoaded() {
+        loadOnce_.Run([] { return clashflux::persistence::persistence().ready(); }, [this] {
+            coreStore().init();
+
+            const std::string savedPolicy =
+                coreStore().setting("vpn.global_policy", "");
+            if (!savedPolicy.empty()) {
+                manager_.setPolicy(detail::DecodePolicy(savedPolicy));
+            }
+
+            // 兼容旧版“连接页 PPTP”保存的 settings：首次进入订阅页时转成
+            // 一个 PPTP 订阅，之后所有入口都只走 Profile。
+            const std::string legacyConfig =
+                coreStore().setting("vpn.pptp.config", "");
+            if (!legacyConfig.empty()) {
+                std::string parseError;
+                if (!pptp::ParsePptpConfig(legacyConfig, parseError)) return;
+
+                bool alreadyMigrated = false;
+                for (const db::Profile& profile : coreStore().db().listProfiles()) {
+                    if (profile.type == "pptp") {
+                        alreadyMigrated = true;
+                        break;
+                    }
+                }
+                if (!alreadyMigrated) {
+                    db::Profile profile;
+                    profile.name = "PPTP 内网";
+                    profile.type = "pptp";
+                    profile.nativeConfig = legacyConfig;
+                    profile.nativeRoutes =
+                        coreStore().setting("vpn.pptp.routes", "");
+                    try {
+                        coreStore().db().saveProfile(profile);
+                        coreStore().setSetting("vpn.pptp.config", "");
+                        coreStore().setSetting("vpn.pptp.routes", "");
+                    } catch (...) {
+                        // 保留 settings，下一次进入时继续尝试迁移。
+                    }
+                }
+            }
+        });
+    }
+
+    clashflux::persistence::HydratedOnce loadOnce_;
+    mutable std::mutex mutex_;
+    std::mutex operationMutex_;
+    vpn::EngineAdapter adapter_;
+    vpn::VpnManager manager_;
+    std::map<std::int64_t, PptpState> snapshots_;
+    std::mutex monitorMutex_;
+    std::condition_variable_any monitorWake_;
+};
+
+export VpnStore& vpnStore() {
+    static VpnStore store;
+    return store;
+}
+
+} // namespace store

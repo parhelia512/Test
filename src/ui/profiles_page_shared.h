@@ -1,0 +1,262 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <huxerui/huxerui.h>
+
+#include "app_http_client.h"
+#include "text_document.h"
+#include "profile_card_layout.h"
+
+namespace clashflux::ui {
+
+struct ProfilesModel;
+huxerui::View ProfileLinkImportEffects(std::shared_ptr<ProfilesModel> model,
+    huxerui::NavigationController navigation, bool navigation_enabled, bool active);
+
+inline constexpr float kDialogFormHeight = 340.0F;
+
+struct NativeProfileSupport {
+    bool pptp = false;
+};
+
+struct ProfileReorderActions {
+    std::function<float(std::int64_t)> cardWidth;
+    std::function<void(std::int64_t)> begin;
+    std::function<void(std::int64_t, std::int64_t)> preview;
+    std::function<void(std::int64_t, huxerui::Point)> movePointer;
+    std::function<void(std::int64_t, std::int64_t)> drop;
+    std::function<void(std::int64_t)> cancel;
+};
+
+using ProfileEditLoader =
+    std::function<void(std::int64_t, std::function<void()>)>;
+using ProfileEditDialog = std::function<void(std::int64_t)>;
+
+struct ProfileCreateFields {
+    huxerui::State<huxerui::TextEditingValue> name;
+    huxerui::State<huxerui::TextEditingValue> url;
+    huxerui::State<huxerui::TextEditingValue> qr_content;
+    huxerui::State<std::size_t> type_index;
+    huxerui::State<huxerui::TextEditingValue> desc;
+    huxerui::State<huxerui::TextEditingValue> timeout;
+    huxerui::State<huxerui::TextEditingValue> interval;
+    huxerui::State<bool> auto_update;
+    huxerui::State<bool> system_proxy;
+    huxerui::State<bool> core_proxy;
+    huxerui::State<bool> invalid_cert;
+    huxerui::State<huxerui::TextEditingValue> pptp_server;
+    huxerui::State<huxerui::TextEditingValue> pptp_username;
+    huxerui::State<huxerui::TextEditingValue> pptp_password;
+    huxerui::State<huxerui::TextEditingValue> pptp_timeout;
+    huxerui::State<huxerui::TextEditingValue> pptp_routes;
+    huxerui::State<bool> pptp_mppe;
+    huxerui::State<std::string> picked_path;
+};
+
+enum class ProfileAddMethod { Qr, File, Url, Direct };
+
+struct ProfileImportRequest {
+    bool remote = false;
+    bool local = false;
+    bool pptp = false;
+    std::string name;
+    std::string url;
+    std::string picked_path;
+    db::Profile options;
+};
+
+struct ProfileDragPayload {
+    std::int64_t id = 0;
+    bool operator==(const ProfileDragPayload&) const = default;
+};
+
+using ProfileImportResult = std::pair<std::int64_t, std::string>;
+
+struct ProfileEditFields {
+    huxerui::State<huxerui::TextEditingValue> name;
+    huxerui::State<huxerui::TextEditingValue> url;
+    huxerui::State<std::string> type;
+    huxerui::State<huxerui::TextEditingValue> desc;
+    huxerui::State<huxerui::TextEditingValue> timeout;
+    huxerui::State<huxerui::TextEditingValue> interval;
+    huxerui::State<bool> auto_update;
+    huxerui::State<bool> system_proxy;
+    huxerui::State<bool> core_proxy;
+    huxerui::State<bool> invalid_cert;
+    huxerui::State<huxerui::TextEditingValue> pptp_server;
+    huxerui::State<huxerui::TextEditingValue> pptp_username;
+    huxerui::State<huxerui::TextEditingValue> pptp_password;
+    huxerui::State<huxerui::TextEditingValue> pptp_timeout;
+    huxerui::State<huxerui::TextEditingValue> pptp_routes;
+    huxerui::State<bool> pptp_mppe;
+};
+
+huxerui::View ProfileEditDialogContent(std::int64_t id, ProfileEditFields fields,
+    huxerui::TaskScope tasks, FluxToastHandle toast, std::function<void()> close);
+
+namespace profile_detail {
+
+huxerui::StringVariant profileTypeLabel(std::string_view type);
+// 分区标签栏（Compact）用的短标签：只把 PPTP 长名收窄，
+// 其余与 profileTypeLabel 相同。
+huxerui::StringVariant profileTypeTabLabel(std::string_view type);
+bool isNativeVpnType(std::string_view type);
+NativeProfileSupport profileSupport();
+
+void OpenProfileEditInfo(std::int64_t id, bool compact,
+                         const ProfileEditLoader& load_edit_info,
+                         const ProfileEditDialog& show_edit_info,
+                         huxerui::State<std::int64_t> edit_page_id);
+std::string truncateOneLine(const std::string& value, std::size_t maxCodePoints);
+huxerui::CanvasPainter QrPainter(const std::string& text);
+huxerui::View QrsSequenceView(
+    std::shared_ptr<const std::vector<std::string>> frames);
+int parseNumber(const huxerui::TextEditingValue& value, int fallback);
+std::vector<std::string> parseRouteField(std::string_view text);
+std::string joinRoutes(const std::vector<std::string>& routes);
+std::optional<std::string> makePptpConfig(
+    const huxerui::TextEditingValue& server,
+    const huxerui::TextEditingValue& username,
+    const huxerui::TextEditingValue& password,
+    const huxerui::TextEditingValue& timeout, bool requireMppe,
+    std::string& error);
+huxerui::StringVariant pptpStateText(const store::PptpState& state);
+
+std::size_t ResponsiveProfilePageIndex(
+    bool compact, huxerui::State<std::int64_t> edit_page_id,
+    huxerui::State<bool> create_page_open,
+    huxerui::State<std::int64_t> file_page_id);
+void OpenProfileCreate(bool compact, huxerui::State<bool> page,
+                       huxerui::TaskScope tasks,
+                       const std::function<void()>& dialog);
+
+huxerui::Task<store::FetchedProfile> AndroidFetchProfile(
+    std::shared_ptr<AppHttpClient> http, std::string url,
+    int timeoutSecs, bool allowInvalidCert = false);
+huxerui::Task<std::int64_t> AndroidImportRemote(
+    std::shared_ptr<AppHttpClient> http, const std::string& name,
+    const std::string& url, db::Profile options);
+huxerui::Task<std::string> AndroidRefreshRemote(
+    std::shared_ptr<AppHttpClient> http, std::int64_t id);
+
+huxerui::Task<std::string> RefreshProfileForPlatform(
+    std::shared_ptr<AppHttpClient> http, std::int64_t id);
+huxerui::Task<ProfileImportResult> ImportProfileForPlatform(
+    std::shared_ptr<AppHttpClient> http, ProfileImportRequest request);
+
+} // namespace profile_detail
+
+using profile_detail::AndroidFetchProfile;
+using profile_detail::AndroidImportRemote;
+using profile_detail::AndroidRefreshRemote;
+using profile_detail::ImportProfileForPlatform;
+using profile_detail::OpenProfileCreate;
+using profile_detail::OpenProfileEditInfo;
+using profile_detail::isNativeVpnType;
+using profile_detail::parseNumber;
+using profile_detail::parseRouteField;
+using profile_detail::profileTypeLabel;
+using profile_detail::profileTypeTabLabel;
+using profile_detail::QrPainter;
+using profile_detail::QrsSequenceView;
+using profile_detail::joinRoutes;
+using profile_detail::makePptpConfig;
+using profile_detail::pptpStateText;
+using profile_detail::RefreshProfileForPlatform;
+using profile_detail::ResponsiveProfilePageIndex;
+using profile_detail::truncateOneLine;
+
+huxerui::View ProfileOptionsForm(
+    huxerui::State<huxerui::TextEditingValue> desc,
+    huxerui::State<huxerui::TextEditingValue> timeout,
+    huxerui::State<huxerui::TextEditingValue> interval,
+    huxerui::State<bool> auto_update, huxerui::State<bool> system_proxy,
+    huxerui::State<bool> core_proxy, huxerui::State<bool> invalid_cert);
+huxerui::View PptpOptionsForm(
+    huxerui::State<huxerui::TextEditingValue> server,
+    huxerui::State<huxerui::TextEditingValue> username,
+    huxerui::State<huxerui::TextEditingValue> password,
+    huxerui::State<huxerui::TextEditingValue> timeout,
+    huxerui::State<huxerui::TextEditingValue> routes,
+    huxerui::State<bool> require_mppe);
+
+huxerui::View ProfileCard(
+    const db::Profile& profile, bool compact, huxerui::TaskScope tasks,
+    FluxToastHandle toast, std::shared_ptr<AppHttpClient> http,
+    std::function<void()> reload,
+    huxerui::StateList<db::Profile> profiles,
+    huxerui::State<bool> selectionPending,
+    const store::PptpState& pptpState,
+    bool connectionPending, bool openingConnection, bool connectionActionsBusy,
+    const std::function<void(std::int64_t)>& togglePptpConnection,
+    const std::function<void(std::int64_t)>& openEditInfo,
+    const std::function<void(std::int64_t)>& openEditRules,
+    const std::function<void(std::int64_t)>& openEditFile,
+    const std::function<void(std::int64_t)>& openCompiledPreview,
+    const std::function<void(std::int64_t)>& openQr,
+    const std::function<void(std::int64_t)>& openQrs,
+    const std::function<void(std::int64_t)>& openExternalResources,
+    huxerui::DialogHandle dialog,
+    ProfileReorderActions reorder = {});
+
+huxerui::View ResponsiveProfileEditSurface(
+    std::int64_t id, ProfileEditFields fields, huxerui::TaskScope tasks,
+    FluxToastHandle toast, std::function<void()> on_back);
+huxerui::View ProfileCreatePage(
+    ProfileCreateFields fields, huxerui::TaskScope tasks,
+    FluxToastHandle toast, std::shared_ptr<huxerui::FilePicker> picker,
+    std::shared_ptr<AppHttpClient> http, bool pptp_supported,
+    std::function<void()> on_back, bool embedded = false);
+huxerui::View ResponsiveProfileCreateSurface(
+    bool open, ProfileCreateFields fields, huxerui::TaskScope tasks,
+    FluxToastHandle toast, std::shared_ptr<huxerui::FilePicker> picker,
+    std::shared_ptr<AppHttpClient> http, bool pptp_supported,
+    std::function<void()> on_back);
+huxerui::View ProfileAddMethodPage(
+    ProfileCreateFields fields, huxerui::TaskScope tasks,
+    FluxToastHandle toast, std::shared_ptr<huxerui::FilePicker> picker,
+    std::shared_ptr<AppHttpClient> http, bool pptp_supported,
+    huxerui::NavigationController navigation,
+    std::function<void()> close = {});
+huxerui::View ProfileAddDialog(
+    ProfileCreateFields fields, huxerui::TaskScope tasks,
+    FluxToastHandle toast, std::shared_ptr<huxerui::FilePicker> picker,
+    std::shared_ptr<AppHttpClient> http, bool pptp_supported,
+    std::function<void()> close);
+huxerui::View ProfileCreateMethodPage(
+    ProfileAddMethod method, ProfileCreateFields fields,
+    huxerui::TaskScope tasks, FluxToastHandle toast,
+    std::shared_ptr<huxerui::FilePicker> picker,
+    std::shared_ptr<AppHttpClient> http, bool pptp_supported,
+    huxerui::NavigationController navigation, std::function<void()> on_back,
+    std::function<void()> on_complete);
+huxerui::View ProfileEditRoutePage(
+    std::int64_t id, ProfileEditFields fields, huxerui::TaskScope tasks,
+    FluxToastHandle toast, std::function<void()> on_back);
+huxerui::View ProfileFilePage(
+    std::int64_t id, huxerui::State<TextDocumentHandle> content,
+    huxerui::State<bool> loading, huxerui::TaskScope tasks,
+    FluxToastHandle toast, std::function<void()> on_back);
+huxerui::View CompiledRulesPreviewPage(TextDocumentHandle document);
+huxerui::View CompiledRulesPreviewDialog(TextDocumentHandle document,
+                                         std::function<void()> onClose);
+
+huxerui::View ProfileFileRoutePage(
+    std::int64_t id, huxerui::State<TextDocumentHandle> content,
+    huxerui::State<bool> loading, huxerui::TaskScope tasks,
+    FluxToastHandle toast, std::function<void()> on_back);
+huxerui::View ProfileFileDialog(
+    std::int64_t id, huxerui::State<TextDocumentHandle> content,
+    huxerui::State<bool> loading, FluxToastHandle toast, huxerui::DialogContext context);
+
+
+} // namespace clashflux::ui

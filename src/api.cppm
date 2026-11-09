@@ -1,0 +1,138 @@
+// api.cppm — mobile download and API contracts.
+// Android uses the Java transport; iOS uses NSURLSession. No libcurl dependency.
+// Blocking methods run on worker threads, never directly during UI composition.
+//
+// 端点约定（sing-box clash_api 与 mihomo 兼容的子集）：
+//   GET    /version                     内核版本
+//   GET    /configs                     运行配置快照（mode 等；字段非全量）
+//   PATCH  /configs                     增量改运行配置（{"mode":"global"} 等；
+//                                        sing-box 仅支持 mode 等少数字段）
+//   GET    /proxies                     全部代理与策略组
+//   PUT    /proxies/{group}             策略组切换节点（{"name": "..."}）
+//   GET    /proxies/{name}/delay        内核代理延迟测速（?url=&timeout=）
+//   GET    /group/{name}/delay          策略组测速（?timeout=；URLTest 组用组自身 URL）
+//   GET    /connections                 连接快照（REST 轮询用；推送走 WS）
+//   DELETE /connections/{id}            关闭单条连接
+//   DELETE /connections                 关闭全部连接
+// sing-box 的 /proxies/{name}/delay 会丢弃 http:// 测试地址并回落到 HTTPS
+// 默认地址；组测速必须走 /group/{name}/delay，才能保留订阅的 url-test.url。
+export module clashflux.api;
+
+import std;
+
+namespace api {
+
+// 同一文件系统提交临时文件；Windows 覆盖不先删除旧目标。
+export bool CommitFile(const std::filesystem::path& temp, const std::filesystem::path& dest,
+                       std::string& error);
+
+export struct DownloadMetrics {
+    bool transportKnown = false;
+    std::int64_t networkMicros = 0, validationMicros = 0, commitMicros = 0;
+    std::uint64_t bytes = 0;
+    long newConnections = 0;
+};
+
+export struct ApiResult {
+    bool ok = false;
+    long status = 0;          // HTTP 状态码；传输失败为 0
+    std::string body;         // 响应体（错误时也可能有，错误是 JSON message）
+    std::string error;        // 传输层错误描述；HTTP 错误时从 body 提取 message
+    // 响应头（仅订阅下载填充；名字统一小写，重定向取最后一跳）。
+    std::map<std::string, std::string> headers;
+    std::string failurePhase;
+    DownloadMetrics download;
+};
+
+// Explicit, cancellable HEAD through the running mixed inbound. No target is
+// selected implicitly; the result is about this route/target only.
+export ApiResult probeThroughProxy(const std::string& target, int mixedPort, std::stop_token cancel,
+                                  long budgetMs = 9000);
+
+export struct NativeRuntime {
+    bool ok = false;
+    std::string version;
+    std::uint64_t apiVersion = 0, startedAt = 0;
+    std::string error;
+    std::string failurePhase;
+};
+// Official StartedService over loopback gRPC-Web; independent of Clash REST.
+export class NativeApi {
+public:
+    NativeApi(std::string baseUrl, std::string secret);
+    NativeRuntime runtime(std::stop_token cancel = {});
+    std::optional<std::uint64_t> startedAt();
+private:
+    std::string base_, secret_;
+    ApiResult unary(const char* method, long timeoutMs, std::stop_token cancel);
+};
+
+// REST 客户端：baseUrl 形如 "http://127.0.0.1:29097"，secret 为 Bearer token（可空）。
+export class ClashApi {
+public:
+    ClashApi(std::string baseUrl, std::string secret);
+    ~ClashApi();
+    ClashApi(const ClashApi&) = delete;
+    ClashApi& operator=(const ClashApi&) = delete;
+
+    void setEndpoint(std::string baseUrl, std::string secret);
+    std::string baseUrl() const;
+
+    ApiResult version();
+    // Local authenticated health probe: 1s total, bounded response.
+    ApiResult probeVersion();
+    ApiResult configs();
+    ApiResult patchConfigs(const std::string& jsonBody);
+
+    ApiResult proxies();
+    ApiResult selectProxy(const std::string& group, const std::string& name);
+    // 单节点测速：ok 时 body 是 {"delay":N}；超时/失败 ok=false。
+    // testUrl 为空或 http:// 时，sing-box 使用默认 HTTPS 测速地址。
+    ApiResult proxyDelay(const std::string& name, const std::string& testUrl, int timeoutMs);
+    // 策略组测速：ok 时 body 是 {"tag":delay,...}。URLTest 组使用组自身
+    // 的 url（订阅 url-test.url），不会回落到单节点默认地址。
+    ApiResult groupDelay(const std::string& name, int timeoutMs);
+
+    ApiResult connections();
+    ApiResult rules();
+    ApiResult traceConnections();
+    ApiResult closeConnection(const std::string& id);
+    ApiResult closeAllConnections();
+
+    // 订阅下载选项：超时 / 证书校验 / 代理三态（指定代理 > 系统环境代理 >
+    // 强制直连）。使用内核代理时由调用方拼 http://127.0.0.1:<mixedPort>。
+    struct DownloadOptions {
+        long timeoutSecs = 60;
+        bool allowInvalidCert = false;
+        std::string proxyUrl;        // 非空 = 经该代理（如 http://127.0.0.1:7899）
+        bool allowProxyEnv = false;  // proxyUrl 为空时是否允许环境变量代理
+        // Explicit conditional request only: 304 returns headers without
+        // validating/replacing dest. Caller must possess a verified snapshot.
+        bool acceptNotModified = false;
+        std::size_t maxBytes = 0;    // 0=不限；非零在平台下载时拒绝超限，不截断提交
+        // Common single-value ASCII subset. Nonempty headers disable redirects
+        // on supported transports; iOS explicitly rejects this option.
+        std::map<std::string, std::string> headers;
+        // 在临时文件关闭后、替换目标前校验；空字符串表示通过。
+        // 同步运行于调用方任务线程；失败/异常保留旧文件。
+        std::function<std::string(const std::filesystem::path&)> validate;
+    };
+
+    // 订阅下载：GET url 落盘到 dest（覆盖写）。options 必传（模块接口下
+    // 默认参数 + 花括号临时量的组合 GCC 不接受）。
+    ApiResult downloadToFile(const std::string& url, const std::filesystem::path& dest,
+                             const DownloadOptions& options);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+export struct ModeResult {
+    bool ok = false;
+    std::string actual;
+    std::string error;
+};
+export ModeResult reconcileMode(ClashApi& api, const std::string& desired);
+
+} // namespace api

@@ -1,0 +1,478 @@
+#include <huxerui/huxerui.h>
+#include <algorithm>
+#include <exception>
+#include <functional>
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+#include "app_resources.h"
+#include "ui.h"
+#include "task_bridge.h"
+import clashflux.core;
+import clashflux.db;
+import clashflux.store.core;
+#include "core_model.h"
+#include "core_control.h"
+#include "settings_model.h"
+#include "profiles_model.h"
+#include "page_layout.h"
+#include "settings_group_layout.h"
+#include "action_menu.h"
+
+namespace clashflux::ui {
+namespace {
+using Network = clashflux::network::Settings;
+#if defined(__ANDROID__)
+constexpr bool kAndroidNetwork = true;
+extern "C" const char* clashflux_android_visible_apps() noexcept;
+#else
+constexpr bool kAndroidNetwork = false;
+#endif
+
+constexpr bool kLinuxNetwork = false;
+constexpr bool kRouteSetNetwork = false;
+
+struct NetworkForm {
+    Network value;
+    std::map<std::string, huxerui::TextEditingValue> fields;
+    explicit NetworkForm(const Network& source) : value(source) {
+        const auto add = [&](const std::string& name, const std::string& text) {
+            fields[name] = huxerui::TextEditingValue::FromText(text);
+        };
+        add("mixed_port", std::to_string(source.mixed_port));
+        add("http_port", source.http_port ? std::to_string(source.http_port) : "");
+        add("socks_port", source.socks_port ? std::to_string(source.socks_port) : "");
+        add("mtu", std::to_string(source.mtu));
+        add("udp_nat_max", std::to_string(source.udp_nat_max));
+        add("interface_name", source.interface_name); add("addresses", source.addresses);
+        add("routes", source.routes); add("exclusions", source.exclusions);
+        add("udp_timeout", source.udp_timeout); add("packages", source.packages);
+        add("listen_address", source.listen_address); add("bind_interface", source.bind_interface);
+        add("allowed_sources", source.allowed_sources); add("username", source.username);
+        add("password", source.password);
+    }
+    bool Changed(const Network& source) const {
+        const NetworkForm original(source);
+        if (value != original.value) return true;
+        return std::ranges::any_of(fields, [&](const auto& item) {
+            return item.second.text != original.fields.at(item.first).text;
+        });
+    }
+    // Validate one field through the same validators as the committed DTO. Other
+    // unfinished fields must not hide this field's error or its tab badge.
+    std::string FieldError(const std::string& key) const {
+        const auto& text = fields.at(key).text;
+        Network candidate;
+        if (key == "mixed_port" || key == "http_port" || key == "socks_port") {
+            const auto trim = [](std::string_view input) {
+                const auto first = input.find_first_not_of(" \t\r\n");
+                return first == std::string_view::npos ? std::string_view{} :
+                    input.substr(first, input.find_last_not_of(" \t\r\n") - first + 1);
+            };
+            const auto input = trim(text);
+            if (input.empty() && key != "mixed_port") return {};
+            int port = 0;
+            if (!clashflux::network::Integer(input, port, 1, 65535)) return "端口无效";
+            for (const auto* other : {"mixed_port", "http_port", "socks_port"}) {
+                int number = 0;
+                if (key != other && clashflux::network::Integer(trim(fields.at(other).text), number, 1, 65535)
+                    && number == port) return "不同类型的端口不能重复";
+            }
+        } else if (key == "mtu") {
+            if (value.override_mtu && !clashflux::tun_settings::ParseMtu(text))
+                return "MTU 需要填写 1280–9000 的整数";
+        } else if (key == "udp_nat_max") {
+            if (value.override_udp_nat_max && !clashflux::network::Integer(text, candidate.udp_nat_max, 0, 1048576))
+                return "UDP 会话上限需要填写 0–1048576 的整数";
+        }
+        return clashflux::network::Validate(candidate, kAndroidNetwork);
+    }
+    std::string Read(Network& output) const {
+        output = value;
+        const auto ports = ParseInboundPorts(fields.at("mixed_port").text,
+            fields.at("http_port").text, fields.at("socks_port").text);
+        if (ports.error != PortSettingsError::None)
+            return ports.error == PortSettingsError::Duplicate ? "不同类型的端口不能重复" : "端口无效";
+        output.mixed_port = std::stoi(ports.ports.mixed);
+        output.http_port = ports.ports.http.empty() ? 0 : std::stoi(ports.ports.http);
+        output.socks_port = ports.ports.socks.empty() ? 0 : std::stoi(ports.ports.socks);
+        if (value.override_mtu) {
+            const auto mtu = clashflux::tun_settings::ParseMtu(fields.at("mtu").text);
+            if (!mtu) return "MTU 需要填写 1280–9000 的整数";
+            output.mtu = *mtu;
+        }
+        if (value.override_udp_nat_max && !clashflux::network::Integer(fields.at("udp_nat_max").text,
+            output.udp_nat_max, 0, 1048576)) return "UDP 会话上限需要填写 0–1048576 的整数";
+        output.interface_name = fields.at("interface_name").text;
+        output.addresses = fields.at("addresses").text;
+        output.routes = fields.at("routes").text; output.exclusions = fields.at("exclusions").text;
+        output.udp_timeout = fields.at("udp_timeout").text; output.packages = fields.at("packages").text;
+        output.listen_address = fields.at("listen_address").text;
+        output.bind_interface = fields.at("bind_interface").text;
+        output.allowed_sources = fields.at("allowed_sources").text;
+        output.username = fields.at("username").text; output.password = fields.at("password").text;
+        return clashflux::network::Validate(output, kAndroidNetwork);
+    }
+};
+
+huxerui::View NetworkField(huxerui::State<NetworkForm> form, const std::string& key,
+                          huxerui::StringVariant label, bool multiline = false, bool secure = false) {
+    const auto error = form.Get().FieldError(key);
+    return SettingsContentRow(huxerui::TextField(form.Get().fields.at(key)).Label(label)
+        .Variant(huxerui::TextFieldVariant::Outlined).Secure(secure)
+        .Validation(error.empty() ? huxerui::ValidationResult::Valid() : huxerui::ValidationResult::Invalid(error))
+        .LineLimits(multiline ? huxerui::TextFieldLineLimits::MultiLine(2, 5) : huxerui::TextFieldLineLimits::SingleLine())
+        .OnChanged([form, key](const huxerui::TextEditingValue& value) {
+            form.Update([&](NetworkForm& next) { next.fields.at(key) = value; });
+        })).Key("network-field-" + key);
+}
+
+huxerui::View NetworkSection(std::vector<huxerui::View> rows) {
+    // One modal surface; rows own their whitespace and feedback, without nested cards.
+    return huxerui::ProvideEnvironment(SettingsRowInsets{2.0F, 8.0F, 48.0F},
+        huxerui::Column(rows).With(huxerui::Spacing(0.0F),
+            huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch)));
+}
+
+[[huxerui::composable]] huxerui::View NetworkDisclosure(huxerui::StringVariant title,
+    huxerui::State<bool> expanded, huxerui::StringVariant summary = {}) {
+    const auto& theme = huxerui::UseTheme();
+    return SettingsActionRow(huxerui::Row {
+      huxerui::Text(title).With(huxerui::Grow(1.0F)),
+      huxerui::Text(summary),
+      huxerui::Image(app::images::chevron_down).Tint(theme.colors.on_surface_variant)
+          .With(huxerui::Frame{.width = 20.0F, .height = 20.0F},
+              huxerui::Rotation(expanded.Get() ? 0.0F : -90.0F)),
+    }.With(huxerui::Spacing(8.0F), huxerui::CrossAlign(huxerui::CrossAxisAlignment::Center)),
+        [expanded] { expanded = !expanded.Get(); },
+        {.role = huxerui::SemanticRole::Button, .label = title, .expanded = expanded.Get()});
+}
+huxerui::View NetworkSwitch(huxerui::State<NetworkForm> form, bool Network::* member,
+                           huxerui::StringVariant label, huxerui::StringVariant hint) {
+    return SettingSwitchRow(label, hint, huxerui::Switch(form.Get().value.*member)
+        .OnChanged([form, member](bool value) { form.Update([&](NetworkForm& next) { next.value.*member = value; }); }));
+}
+struct Choice { std::string id; huxerui::StringVariant label; };
+huxerui::View NetworkChoice(huxerui::State<NetworkForm> form, std::string Network::* member,
+                           huxerui::StringVariant label, const std::vector<Choice>& items) {
+    const auto found = std::ranges::find(items, form.Get().value.*member, &Choice::id);
+    const auto index = found == items.end() ? 0U : static_cast<std::size_t>(found - items.begin());
+    return SettingRow(label, {},
+      huxerui::Select(items, index, [](const Choice& item) { return huxerui::Text(item.label); })
+          .Label(label).OnChanged([form, member, items](std::size_t selected) {
+              if (selected < items.size()) form.Update([&](NetworkForm& next) { next.value.*member = items[selected].id; });
+          }).With(huxerui::Frame{.width = 240.0F})
+    );
+}
+
+struct NetworkApplication { std::string package, label; bool operator==(const NetworkApplication&) const = default; };
+std::vector<NetworkApplication> ReadNetworkApplications() {
+    std::vector<NetworkApplication> result;
+#if defined(__ANDROID__)
+    for (const auto& line : clashflux::network::Lines(clashflux_android_visible_apps())) {
+        const auto tab = line.find('\t');
+        if (tab != std::string::npos) result.push_back({line.substr(0, tab), line.substr(tab + 1)});
+    }
+#endif
+    return result;
+}
+
+[[huxerui::composable]] huxerui::View NetworkApplications(huxerui::State<NetworkForm> form) {
+    const auto apps = huxerui::UseState(std::vector<NetworkApplication>{});
+    const auto loading = huxerui::UseState(false);
+    const auto tasks = huxerui::UseTaskScope();
+    const auto toast = UseFluxToast();
+    const auto load = [=] {
+        if (loading.Get()) return;
+        loading = true;
+        tasks.Launch([=]() -> huxerui::Task<void> {
+            try { apps = co_await RunOnTaskThread([] { return ReadNetworkApplications(); }); }
+            catch (...) { toast.Show(Localized("应用列表读取失败")); }
+            loading = false;
+        });
+    };
+    const auto chosen = clashflux::network::Lines(form.Get().fields.at("packages").text);
+    const auto mode = form.Get().value.package_mode;
+    const bool custom = mode == "include" || mode == "exclude";
+    const huxerui::View list = huxerui::VirtualList(apps.Get().size(), [=](std::size_t index) {
+        const auto item = apps.Get()[index];
+        const bool selected = std::find(chosen.begin(), chosen.end(), item.package) != chosen.end();
+        return huxerui::Checkbox(item.label + " (" + item.package + ")", selected)
+            .OnChanged([form, item](bool checked) {
+                form.Update([&](NetworkForm& next) {
+                    auto packages = clashflux::network::Lines(next.fields.at("packages").text);
+                    std::erase(packages, item.package);
+                    if (checked) packages.push_back(item.package);
+                    std::string text;
+                    for (const auto& package : packages) { if (!text.empty()) text += '\n'; text += package; }
+                    next.fields.at("packages") = huxerui::TextEditingValue::FromText(text);
+                });
+            }).With(huxerui::Frame{.min_height = 48.0F}).Key(item.package);
+    }).EstimatedItemExtent(48.0F).With(huxerui::Frame{.height = 240.0F});
+    return huxerui::Column {
+      NetworkChoice(form, &Network::package_mode, Localized("应用接管方式"), {
+          {"", Localized("应用：跟随配置")}, {"all", Localized("全部应用")},
+          {"include", Localized("仅选中应用")}, {"exclude", Localized("排除选中应用")}}),
+      custom ? huxerui::View(huxerui::Column {
+        NetworkField(form, "packages", Localized("应用包名（每行一个）"), true),
+        SettingsActionRow(huxerui::Text(Localized("选择可见应用")), load,
+            {.role = huxerui::SemanticRole::Button, .label = Localized("选择可见应用")})
+            .With(huxerui::Enabled(!loading.Get())),
+        loading.Get() ? SettingsContentRow(huxerui::ProgressCircle()) : huxerui::View{},
+        apps.Get().empty() ? huxerui::View{} : SettingsContentRow(list),
+      }.With(huxerui::Spacing(0.0F), huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch))) : huxerui::View{},
+    }.With(huxerui::Spacing(0.0F), huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch));
+}
+[[huxerui::composable]] huxerui::View NetworkTunBasics(huxerui::State<NetworkForm> form) {
+    const auto addresses = huxerui::UseState(!form.Get().value.addresses.empty() ||
+        !form.Get().value.interface_name.empty());
+    std::vector<huxerui::View> adapter;
+    if (!kAndroidNetwork) adapter.push_back(NetworkChoice(form, &Network::stack, Localized("协议栈"), {
+        {"", Localized("跟随配置")}, {"system", "System"}, {"gvisor", "gVisor"}, {"mixed", "Mixed"}}));
+    else adapter.push_back(SettingsContentRow(
+        huxerui::Text(Localized("Android 使用 gVisor 协议栈，严格路由由平台管理。"))));
+    adapter.push_back(NetworkSwitch(form, &Network::override_mtu, Localized("覆盖 MTU"),
+        Localized("关闭时保留配置中的 MTU")));
+    if (form.Get().value.override_mtu) adapter.push_back(NetworkField(form, "mtu", "MTU"));
+    adapter.push_back(NetworkDisclosure(Localized("网卡名称与地址"), addresses).Key("network-address-toggle"));
+    if (addresses.Get()) {
+        if (!kAndroidNetwork) adapter.push_back(NetworkField(form, "interface_name", Localized("网卡名称（留空跟随配置）")));
+        adapter.push_back(NetworkField(form, "addresses", Localized("网卡 IPv4/IPv6 地址（每行一个 CIDR）"), true));
+    }
+    return huxerui::Column {
+      NetworkSection(adapter),
+      NetworkSection({
+        NetworkChoice(form, &Network::dns_mode, Localized("DNS 接管方式"), {
+            {"", Localized("跟随配置")}, {"native", Localized("原生系统 DNS")},
+            {"hijack", Localized("劫持 DNS")}, {"disabled", Localized("关闭 DNS 接管")}}),
+        NetworkSwitch(form, &Network::ipv6, "IPv6", Localized("全局网络设置，同时影响 DNS 和虚拟网卡")),
+      }),
+      kAndroidNetwork ? huxerui::View{} : NetworkSection({
+        NetworkSwitch(form, &Network::strict_route, Localized("严格路由"), Localized("减少流量绕过虚拟网卡的情况")),
+      }),
+    }.With(huxerui::Spacing(20.0F), huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch));
+}
+
+[[huxerui::composable]] huxerui::View NetworkTunScope(huxerui::State<NetworkForm> form) {
+    std::vector<huxerui::View> sections;
+    std::vector<huxerui::View> ranges{
+        NetworkSwitch(form, &Network::override_routes, Localized("自定义接管网段"),
+            Localized("启用后仅接管所列网段；列表留空表示全部流量")),
+    };
+    if (form.Get().value.override_routes)
+        ranges.push_back(NetworkField(form, "routes", Localized("接管网段（每行一个 CIDR）"), true));
+    ranges.push_back(NetworkSwitch(form, &Network::override_exclusions, Localized("自定义排除网段"),
+        Localized("排除的流量绕过内核，不再执行全局规则")));
+    if (form.Get().value.override_exclusions)
+        ranges.push_back(NetworkField(form, "exclusions", Localized("排除网段（每行一个 CIDR）"), true));
+    sections.push_back(NetworkSection(ranges));
+    if (kAndroidNetwork) sections.push_back(NetworkSection({NetworkApplications(form)}));
+    return huxerui::Column(sections).With(huxerui::Spacing(20.0F),
+        huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch));
+}
+
+huxerui::View NetworkUdp(huxerui::State<NetworkForm> form) {
+    const std::vector<Choice> nat = {{"", Localized("跟随配置")},
+        {"endpoint_independent", Localized("端点无关")}, {"address_dependent", Localized("依赖远端地址")},
+        {"address_and_port_dependent", Localized("依赖远端地址和端口")}};
+    return huxerui::Column {
+      NetworkSection({
+        NetworkField(form, "udp_timeout", Localized("UDP 超时（例如 5m，留空跟随配置）")),
+        NetworkSwitch(form, &Network::override_udp_nat_max, Localized("覆盖 UDP 会话上限"),
+            Localized("0 表示由内核自动选择")),
+        form.Get().value.override_udp_nat_max
+            ? NetworkField(form, "udp_nat_max", Localized("UDP 会话上限")) : huxerui::View{},
+      }),
+      NetworkSection({
+        NetworkChoice(form, &Network::udp_mapping, Localized("UDP NAT 映射"), nat),
+        NetworkChoice(form, &Network::udp_filtering, Localized("UDP NAT 过滤"), nat),
+      }),
+    }.With(huxerui::Spacing(20.0F), huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch));
+}
+
+huxerui::View NetworkListeners(huxerui::State<NetworkForm> form) {
+    return huxerui::Column {
+      NetworkSection({
+        NetworkSwitch(form, &Network::override_ports, Localized("覆盖配置中的监听端口"),
+            Localized("关闭时保留原生配置中的端口；以下端口仍用于生成新监听")),
+        NetworkField(form, "mixed_port", Localized("混合端口")),
+        NetworkField(form, "http_port", Localized("HTTP 端口（留空关闭）")),
+        NetworkField(form, "socks_port", Localized("SOCKS 端口（留空关闭）")),
+      }),
+      NetworkSection({
+        NetworkSwitch(form, &Network::override_listen, Localized("覆盖监听地址"),
+            Localized("留空时按局域网开关选择；关闭覆盖则保留原生配置")),
+        form.Get().value.override_listen
+            ? NetworkField(form, "listen_address", Localized("监听 IP（留空自动选择）")) : huxerui::View{},
+        NetworkField(form, "bind_interface", Localized("绑定网络接口（留空跟随配置）")),
+      }),
+    }.With(huxerui::Spacing(20.0F), huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch));
+}
+
+huxerui::View NetworkAccess(huxerui::State<NetworkForm> form) {
+    std::vector<huxerui::View> auth{
+        NetworkSwitch(form, &Network::override_auth, Localized("覆盖代理认证"),
+            Localized("两项留空表示取消认证；系统代理无法自动提供凭据")),
+    };
+    if (form.Get().value.override_auth) {
+        auth.push_back(NetworkField(form, "username", Localized("用户名")));
+        auth.push_back(NetworkField(form, "password", Localized("密码"), false, true));
+    }
+    return huxerui::Column {
+      NetworkSection({
+        NetworkSwitch(form, &Network::allow_lan, Localized("局域网连接"), Localized("允许局域网设备连接本地代理")),
+        NetworkField(form, "allowed_sources", Localized("允许访问的网段（每行一个 CIDR，留空不限）"), true),
+        SettingsContentRow(huxerui::Text(Localized("访问限制仅作用于本地代理监听，始终允许本机回环访问。"))),
+      }),
+      NetworkSection(auth),
+    }.With(huxerui::Spacing(20.0F), huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch));
+}
+
+[[huxerui::composable]] huxerui::View NetworkTabContent(huxerui::View content,
+    std::shared_ptr<PageScrollOffset> offset, bool fullPage) {
+    const auto controller = huxerui::UseScrollController(offset->value);
+    const float inset = PageScrollInset(huxerui::UseTheme());
+    return huxerui::ScrollView(PageScrollContent(content, inset, fullPage ? inset : 2.0F))
+        .Controller(controller)
+        .With(RememberPageScroll{offset}, huxerui::Grow(1.0F), huxerui::ScrollBar());
+}
+
+struct NetworkSaveResult { std::string error; Network value; CoreView core; };
+} // namespace
+
+[[huxerui::composable]] huxerui::View NetworkSettingsEditor(bool tun, std::function<void()> onClose, bool fullPage,
+    std::shared_ptr<std::function<void()>> dismissRequest) {
+    const auto& theme = huxerui::UseTheme();
+    const auto settings = huxerui::UseService<SettingsModel>();
+    const auto control = UseCoreControl();
+    const auto baseline = huxerui::UseState(settings->view.Get().network);
+    const auto form = huxerui::UseState(NetworkForm(baseline.Get()));
+    const auto selected = huxerui::UseState(std::size_t{0});
+    const auto motion = UseSectionTabMotion();
+    const auto scrolls = huxerui::UseState(std::vector<std::shared_ptr<PageScrollOffset>>{
+        std::make_shared<PageScrollOffset>(), std::make_shared<PageScrollOffset>(),
+        std::make_shared<PageScrollOffset>()});
+    const auto alive = huxerui::UseState(true);
+    huxerui::Lifecycle([alive] { return [alive] { alive = false; }; }, 0);
+    const auto toast = UseFluxToast();
+    Network parsed;
+    const auto failure = form.Get().Read(parsed);
+    const auto title = tun ? Localized("虚拟网卡设置") : kAndroidNetwork ? Localized("本地代理设置") : Localized("系统代理设置");
+    const bool busy = control.Busy();
+    const bool valid = failure.empty() && settings->view.Get().networkError.empty() && !busy;
+    const bool canApply = control.ProxyActive();
+    const auto save = [=](bool apply) {
+        if (control.Busy()) return;
+        Network next;
+        if (const auto error = form.Get().Read(next); !error.empty()) { toast.Show(error); return; }
+        const auto expected = baseline.Get();
+        LaunchCoreOperation<NetworkSaveResult>(control.tasks, control.model, {.action = CoreAction::NetworkSettings},
+            [next, expected, apply](CoreCommand) -> huxerui::Task<NetworkSaveResult> {
+                co_return co_await RunOnTaskThread([=] {
+                    auto& core = store::coreStore();
+                    NetworkSaveResult result;
+                    result.error = core.saveNetworkSettings(next, expected, apply);
+                    result.value = core.networkSettings();
+                    result.core = ReadCoreView(true, false);
+                    return result;
+                });
+            }, [=](std::optional<NetworkSaveResult> result, std::exception_ptr error) {
+                if (error || !result) {
+                    try { if (error) std::rethrow_exception(error); }
+                    catch (const std::exception& exception) { toast.Show(exception.what()); return; }
+                    catch (...) {}
+                    toast.Show(Localized("网络设置保存失败")); return;
+                }
+                settings->PublishNetwork(result->value);
+                control.model->Update([&](CoreView& view) { view = result->core; });
+                if (!result->error.empty()) { toast.Show(result->error); return; }
+                toast.Show(apply && canApply ? Localized("网络设置已应用") : Localized("网络设置已保存，待下次连接或重启应用"));
+                if (alive.Get()) onClose();
+            });
+    };
+    const auto dialog = huxerui::UseDialog();
+    const auto close = [=] {
+        if (control.Busy()) return;
+        if (!form.Get().Changed(baseline.Get())) { onClose(); return; }
+        ConfirmDiscardChanges(dialog, onClose);
+    };
+    huxerui::Lifecycle([dismissRequest, close] {
+        if (dismissRequest) *dismissRequest = close;
+        return [dismissRequest] { if (dismissRequest) *dismissRequest = {}; };
+    }, 0);
+
+    std::vector<SectionTab> tabs;
+    std::vector<huxerui::View> pages;
+    const auto badge = [&](std::initializer_list<const char*> fields) -> std::string {
+        return std::ranges::any_of(fields, [&](const char* field) { return !form.Get().FieldError(field).empty(); })
+            ? "!" : "";
+    };
+    if (tun) {
+        tabs = {{"basic", Localized("基础"), badge({"mtu", "interface_name", "addresses"})},
+            {"scope", Localized("接管范围"), badge({"routes", "exclusions", "packages"})},
+            {"udp", "UDP", badge({"udp_timeout", "udp_nat_max"})}};
+        pages = {NetworkTunBasics(form), NetworkTunScope(form), NetworkUdp(form)};
+    } else {
+        tabs.push_back({"listen", Localized("本地监听"), badge({"mixed_port", "http_port", "socks_port",
+            "listen_address", "bind_interface"})});
+        tabs.push_back({"access", Localized("访问控制"), badge({"allowed_sources", "username", "password"})});
+        pages.push_back(NetworkListeners(form)); pages.push_back(NetworkAccess(form));
+    }
+    for (std::size_t index = 0; index < pages.size(); ++index)
+        pages[index] = NetworkTabContent(pages[index], scrolls.Get()[index], fullPage)
+            .Key("network-page-" + tabs[index].key);
+    const auto select = [selected](std::size_t index) { selected = index; };
+    const auto tabBar = SectionTabBar(tabs, tabs[selected.Get()].key, [selected, tabs](const std::string& key) {
+        const auto found = std::ranges::find(tabs, key, &SectionTab::key);
+        if (found != tabs.end()) selected = static_cast<std::size_t>(found - tabs.begin());
+    }, motion).Key("network-tabs");
+    std::vector<huxerui::View> notices;
+    if (canApply && control.model->view.Get().core.networkRevision != settings->view.Get().network.revision)
+        notices.push_back(huxerui::Text(Localized("有待应用的网络设置")));
+    if (!failure.empty()) notices.push_back(huxerui::Text(failure).Style(huxerui::TextStyle{
+        huxerui::Font::System(font_size::kCaption), theme.colors.error}));
+    if (!settings->view.Get().networkError.empty()) notices.push_back(huxerui::Text(settings->view.Get().networkError));
+    const auto content = huxerui::Column {
+      tabBar,
+      notices.empty() ? huxerui::View{} : huxerui::View{huxerui::Column(notices).With(
+          huxerui::Spacing(4.0F), huxerui::Padding(huxerui::EdgeInsets::Symmetric(fullPage ? 16.0F : 2.0F, 4.0F)),
+          huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch)).Key("network-notices")},
+      huxerui::Column {
+        huxerui::ProvideEnvironment(SectionTabContentInsets{2.0F},
+            SectionTabPages(pages, selected.Get(), select, motion)),
+      }.With(huxerui::Grow(1.0F), huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch)).Key("network-pager"),
+    }.With(huxerui::Grow(1.0F), huxerui::Enabled(!busy),
+        huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch));
+    const auto actions = DialogActions({
+      fullPage ? huxerui::View{} : DialogAction(Localized("取消"), close, false, !busy),
+      DialogAction(Localized("保存"), [save] { save(false); }, !canApply, valid).Key("network-save"),
+      canApply ? DialogAction(Localized("保存并应用"), [save] { save(true); }, true, valid)
+          .Key("network-save-apply") : huxerui::View{},
+    });
+    const auto saveMenu = UseActionMenu();
+    if (fullPage) {
+        const auto commit = [saveMenu, save, canApply] {
+            if (!canApply) { save(false); return; }
+            saveMenu.Show({
+                ActionMenuItem(app::images::check, Localized("保存并应用"), [save] { save(true); }),
+                ActionMenuItem(app::images::save, Localized("保存"), [save] { save(false); }),
+            });
+        };
+        return SecondaryPageScaffold(huxerui::Text(title, huxerui::TextRole::Title),
+            FormHeaderAction(app::images::save, Localized("保存"), commit, valid, busy)
+                .With(saveMenu.Anchor()).Key("network-save"),
+            FormPageContent(content), close, false, true, true);
+    }
+    return DialogScaffold(DialogHeader(title), content, actions, DialogSize::Large, true)
+        .On<huxerui::ViewEvents::BackRequested>(close);
+}
+
+void ShowNetworkSettingsDialog(huxerui::DialogHandle dialog, bool tun) {
+    auto request = std::make_shared<std::function<void()>>();
+    dialog.Show([tun, request](huxerui::DialogContext context) {
+        return NetworkSettingsEditor(tun, [context] { context.Dismiss(); }, false, request);
+    }, {.on_dismiss_request = [request] { if (*request) (*request)(); }});
+}
+} // namespace clashflux::ui

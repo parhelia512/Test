@@ -1,0 +1,285 @@
+# AndroidLegacy.cmake — 将 Clash-Flux 的模块源码适配到 Android NDK。
+#
+# Android NDK 的 Clang 尚未提供 iOS 构建所依赖的 CMake `import std`
+# 集成（也没有可供 CMAKE_CXX_MODULE_STD 使用的 __CMAKE::CXX23）。Android
+# 仍然使用同一套领域代码：这里在 configure 期生成一个只用于 Android 的
+# 兼容头和实现单元，只服务 Android。
+#
+# 维护约定：新增的模块接口（.cppm）要同时加入下面 `_interfaces`（顺序即头文件
+# 内的依赖顺序），新增的实现单元（.cpp）要加入 `_core` 与 `_android_legacy_inputs`；
+# UI 实现单元还要加入 `_ui_sources`。只被 .inc 片段引用的头也要进
+# `_android_legacy_inputs`；漏登记只会在这条 Android 通道上以「未声明标识符」的形式暴露。
+# 接口里用到的标准库设施必须补进
+# 兼容头的 include 列表（iOS 由 `import std;` 承担）。
+include_guard(GLOBAL)
+get_filename_component(CLASHFLUX_ANDROID_LEGACY_REPO_ROOT
+    "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+
+function(clashflux_prepare_android_sources output_directory output_header
+        output_core output_ui)
+    set(_root "${CLASHFLUX_ANDROID_LEGACY_REPO_ROOT}")
+    file(MAKE_DIRECTORY "${output_directory}/ui")
+
+    # `import std;` 在模块接口里承担了统一标准库包含的职责；兼容头显式包含
+    # 这些头，避免依赖 NDK libc++ 的传递包含行为。
+    set(_header "#pragma once\n")
+    string(APPEND _header
+        "#include <algorithm>\n"
+        "#include <array>\n"
+        "#include <atomic>\n"
+        "#include <list>\n"
+        "#include <chrono>\n"
+        "#include <charconv>\n"
+        "#include <cctype>\n"
+        "#include <condition_variable>\n"
+        "#include <cstddef>\n"
+        "#include <cstdint>\n"
+        "#include <cstdio>\n"
+        "#include <cstdlib>\n"
+        "#include <ctime>\n"
+        "#include <filesystem>\n"
+        "#include <format>\n"
+        "#include <fstream>\n"
+        "#include <functional>\n"
+        "#include <iomanip>\n"
+        "#include <iostream>\n"
+        "#include <limits>\n"
+        "#include <map>\n"
+        "#include <memory>\n"
+        "#include <mutex>\n"
+        "#include <optional>\n"
+        "#include <queue>\n"
+        "#include <random>\n"
+        "#include <ranges>\n"
+        "#include <regex>\n"
+        "#include <set>\n"
+        "#include <span>\n"
+        "#include <sstream>\n"
+        "#include <stdexcept>\n"
+        "#include <stop_token>\n"
+        "#include <string>\n"
+        "#include <string_view>\n"
+        "#include <system_error>\n"
+        "#include <thread>\n"
+        "#include <tuple>\n"
+        "#include <type_traits>\n"
+        "#include <unordered_map>\n"
+        "#include <unordered_set>\n"
+        "#include <utility>\n"
+        "#include <vector>\n"
+        "#include <nlohmann/json.hpp>\n"
+        "#include <qrcodegen.hpp>\n"
+        "#include \"wire_codec.h\"\n\n"
+    )
+
+    # The interface units are included as declarations/inline utility definitions.
+    # Classes and structs are type declarations; free functions defined in an
+    # interface are made inline so every UI codegen TU can include this header.
+    set(_interfaces
+        "${_root}/src/config.cppm"
+        "${_root}/src/utils.cppm"
+        "${_root}/src/netinfo.cppm"
+        "${_root}/src/model.cppm"
+        "${_root}/src/db.cppm"
+        "${_root}/src/vpn.cppm"
+        "${_root}/src/pptp.cppm"
+        "${_root}/src/openvpn.cppm"
+        "${_root}/src/singbox.cppm"
+        "${_root}/src/proxy_provider_cache.cppm"
+        "${_root}/src/rule_provider_cache.cppm"
+        "${_root}/src/provider_resources.cppm"
+        "${_root}/src/routing.cppm"
+        "${_root}/src/core.cppm"
+        "${_root}/src/api.cppm"
+        "${_root}/src/stream.cppm"
+        "${_root}/src/store/persistence.cppm"
+        "${_root}/src/store/core_store.cppm"
+        "${_root}/src/store/vpn.cppm"
+        "${_root}/src/store/profiles.cppm"
+    )
+    set(_android_legacy_inputs
+        ${_interfaces}
+        "${_root}/src/db.cpp"
+        "${_root}/src/core.cpp"
+        "${_root}/src/api.cpp"
+        "${_root}/src/stream.cpp"
+        "${_root}/src/wire_codec.h"
+        "${_root}/src/network_settings.h"
+        "${_root}/src/connection_trace.h"
+        "${_root}/src/runtime_health.h"
+        "${_root}/src/health_history.h"
+        "${_root}/src/health_history.cpp"
+        "${_root}/src/runtime_network_probe.h"
+        "${_root}/src/runtime_network_probe.cpp"
+        "${_root}/src/runtime_plan_state.h"
+        "${_root}/src/runtime_compile.h"
+        "${_root}/src/sqlite_schema.h"
+        "${_root}/src/sqlite_schema.cpp"
+        "${_root}/src/store/persistence.cpp"
+        "${_root}/src/ui/app.cpp"
+        "${_root}/src/ui/common.cpp"
+        "${_root}/src/ui/dialog_card.cpp"
+        "${_root}/src/ui/selectable_tile.cpp"
+        "${_root}/src/ui/connections_page.cpp"
+        "${_root}/src/ui/home_grid.cpp"
+        "${_root}/src/ui/home_grid.h"
+        "${_root}/src/ui/page_loading.cpp"
+        "${_root}/src/ui/page_loading.h"
+        "${_root}/src/ui/home_page.cpp"
+        "${_root}/src/ui/logs_page.cpp"
+        "${_root}/src/ui/profiles_page.cpp"
+        "${_root}/src/ui/profiles_page_card.cpp"
+        "${_root}/src/ui/profiles_page_forms.cpp"
+        "${_root}/src/ui/profiles_page_support.cpp"
+        "${_root}/src/ui/qrs_codec.cpp"
+        "${_root}/src/ui/qrs_codec.h"
+        "${_root}/src/ui/external_resources_page.cpp"
+        "${_root}/src/ui/subscription_rule_layout.cpp"
+        "${_root}/src/ui/home_vpn_status.h"
+        "${_root}/src/ui/core_model.h"
+        "${_root}/src/ui/core_control.h"
+        "${_root}/src/ui/core_operation.h"
+        "${_root}/src/ui/profiles_cache.h"
+        "${_root}/src/ui/profiles_model.h"
+        "${_root}/src/ui/profiles_page_shared.h"
+        "${_root}/src/ui/subscription_rule_layout.h"
+        "${_root}/src/ui/filtered_indices.h"
+        "${_root}/src/ui/proxies_model.h"
+        "${_root}/src/ui/settings_model.h"
+        "${_root}/src/ui/inbound_settings.h"
+        "${_root}/src/ui/vpn_model.h"
+        "${_root}/src/ui/proxies_page.cpp"
+        "${_root}/src/ui/rules_page.cpp"
+        "${_root}/src/ui/section_tabs.cpp"
+        "${_root}/src/ui/fidelity_page.cpp"
+        "${_root}/src/ui/settings_page.cpp"
+        "${_root}/src/ui/network_settings_editor.cpp"
+        "${_root}/src/ui/runtime_diagnostics.cpp"
+        "${_root}/src/ui/text_document.cpp"
+        "${_root}/src/ui/platform_settings.cpp"
+        "${_root}/src/ui/platform_app.cpp"
+        "${_root}/src/ui/app_update_package.h"
+        "${_root}/src/ui/app_update_package.cpp"
+        "${_root}/src/ui/app_update_model.h"
+        "${_root}/src/ui/android_update_installer.h"
+        "${_root}/src/ui/android_update_installer.cpp"
+        # Track them so AndroidLegacy regenerates its compatibility TU when a
+        # split fragment changes.
+        "${_root}/src/hydrated_once.h"
+        "${_root}/src/singbox_compile.inc"
+        "${_root}/src/singbox_sources.inc"
+        "${_root}/src/singbox_node_subscription.inc"
+        "${_root}/src/singbox_context_dns.inc"
+        "${_root}/src/singbox_proxy.inc"
+        "${_root}/src/singbox_filter.inc"
+        "${_root}/src/singbox_proxy_provider.inc"
+        "${_root}/src/singbox_mrs.inc"
+        "${_root}/src/singbox_rules.inc"
+        "${_root}/src/singbox_yaml_openvpn.inc"
+        "${_root}/src/store/core_store_helpers.inc"
+        "${_root}/src/store/provider_download.inc"
+        "${_root}/src/store/core_store_lifecycle.inc"
+        "${_root}/src/store/core_store_routing.inc"
+        "${_root}/src/store/core_store_state.inc"
+        "${_root}/src/store/core_store_diagnostics.inc"
+        "${_root}/src/store/core_store_evidence.inc"
+        "${_root}/src/ui/profiles_page_actions.inc"
+        "${_root}/src/ui/profiles_page_layout.inc"
+    )
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        ${_android_legacy_inputs}
+    )
+    foreach (_source IN LISTS _interfaces)
+        file(READ "${_source}" _content)
+        string(REPLACE "module;\n" "" _content "${_content}")
+        string(REGEX REPLACE "export module [A-Za-z0-9_.]+;" "" _content "${_content}")
+        string(REGEX REPLACE "import [A-Za-z0-9_.]+;" "" _content "${_content}")
+        string(REPLACE "export struct" "struct" _content "${_content}")
+        string(REPLACE "export class" "class" _content "${_content}")
+        string(REPLACE "export enum" "enum" _content "${_content}")
+        # Only inline exported function definitions. A broad `export ... {`
+        # rewrite also matches namespaces and declarations already marked
+        # inline, producing invalid `inline namespace a::b` and duplicate
+        # specifiers in the generated compatibility header.
+        string(REPLACE "export inline " "CLASHFLUX_ANDROID_INLINE " _content "${_content}")
+        string(REGEX REPLACE "export ([A-Za-z_][A-Za-z0-9_:<> ,&*]*\\([^;{}]*\\)[^;{}]*\\{)" "inline \\1" _content "${_content}")
+        string(REPLACE "CLASHFLUX_ANDROID_INLINE " "inline " _content "${_content}")
+        string(REPLACE "export " "" _content "${_content}")
+        string(APPEND _header "// Generated from ${_source}.\n${_content}\n")
+    endforeach()
+    set(_header_path "${output_directory}/clashflux_android_legacy.h")
+    file(WRITE "${_header_path}" "${_header}")
+
+    # Implementations are placed after the interface header in a single TU. This
+    # retains the original module dependency order while avoiding duplicate
+    # non-inline implementation symbols across Android UI TUs.
+    set(_core "#include \"clashflux_android_legacy.h\"\n\n")
+    foreach (_source IN ITEMS
+            "${_root}/src/sqlite_schema.cpp"
+            "${_root}/src/store/persistence.cpp"
+            "${_root}/src/db.cpp"
+            "${_root}/src/pptp.cpp"
+            "${_root}/src/openvpn.cpp"
+            "${_root}/src/singbox.cpp"
+            "${_root}/src/core.cpp"
+            "${_root}/src/api.cpp"
+            "${_root}/src/stream.cpp"
+            "${_root}/src/health_history.cpp"
+            "${_root}/src/runtime_network_probe.cpp")
+        file(READ "${_source}" _content)
+        string(REPLACE "module;\n" "" _content "${_content}")
+        string(REGEX REPLACE "module [A-Za-z0-9_.]+;" "" _content "${_content}")
+        string(REGEX REPLACE "import [A-Za-z0-9_.]+;" "" _content "${_content}")
+        string(APPEND _core "// Generated from ${_source}.\n${_content}\n")
+    endforeach()
+    set(_core_path "${output_directory}/clashflux_android_core.cpp")
+    file(WRITE "${_core_path}" "${_core}")
+
+    # HuxerUI codegen must see real .cpp inputs. Each Android copy has module
+    # imports removed and includes the compatibility declarations above.
+    set(_ui_inputs
+            "${_root}/src/ui/app.cpp"
+            "${_root}/src/ui/common.cpp"
+            "${_root}/src/ui/dialog_card.cpp"
+            "${_root}/src/ui/selectable_tile.cpp"
+            "${_root}/src/ui/connections_page.cpp"
+            "${_root}/src/ui/website_tests_page.cpp"
+            "${_root}/src/ui/home_grid.cpp"
+            "${_root}/src/ui/page_loading.cpp"
+            "${_root}/src/ui/home_page.cpp"
+            "${_root}/src/ui/logs_page.cpp"
+            "${_root}/src/ui/profiles_page.cpp"
+            "${_root}/src/ui/profiles_page_card.cpp"
+            "${_root}/src/ui/profiles_page_forms.cpp"
+            "${_root}/src/ui/profiles_page_support.cpp"
+            "${_root}/src/ui/qrs_codec.cpp"
+            "${_root}/src/ui/external_resources_page.cpp"
+            "${_root}/src/ui/subscription_rule_layout.cpp"
+            "${_root}/src/ui/proxies_page.cpp"
+            "${_root}/src/ui/rules_page.cpp"
+            "${_root}/src/ui/section_tabs.cpp"
+            "${_root}/src/ui/fidelity_page.cpp"
+            "${_root}/src/ui/settings_page.cpp"
+            "${_root}/src/ui/network_settings_editor.cpp"
+            "${_root}/src/ui/runtime_diagnostics.cpp"
+            "${_root}/src/ui/text_document.cpp"
+            "${_root}/src/ui/platform_settings.cpp"
+            "${_root}/src/ui/platform_app.cpp")
+    # UI edits must refresh this mirror; otherwise an incremental Gradle build
+    # keeps compiling the previous page copy until CMake happens to reconfigure.
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_ui_inputs})
+    set(_ui_sources)
+    foreach (_source IN LISTS _ui_inputs)
+        file(READ "${_source}" _content)
+        string(REGEX REPLACE "import [A-Za-z0-9_.]+;" "" _content "${_content}")
+        string(PREPEND _content "#include \"clashflux_android_legacy.h\"\n")
+        get_filename_component(_name "${_source}" NAME)
+        set(_ui_path "${output_directory}/ui/${_name}")
+        file(WRITE "${_ui_path}" "${_content}")
+        list(APPEND _ui_sources "${_ui_path}")
+    endforeach()
+
+    set(${output_header} "${_header_path}" PARENT_SCOPE)
+    set(${output_core} "${_core_path}" PARENT_SCOPE)
+    set(${output_ui} "${_ui_sources}" PARENT_SCOPE)
+endfunction()
