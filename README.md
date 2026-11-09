@@ -83,4 +83,4 @@ cmake --build build-android --target clash-flux
 - `cmake`、`third_party`：移动 native 构建与固定依赖。
 - `docs`：设计、构建和历史说明；涉及桌面的文档属于历史参考，不代表当前支持范围。
 
-版本说明见 [v0.3.100](docs/releases/v0.3.100.md)。项目仍在开发中。
+版本说明见 [v0.3.101](docs/releases/v0.3.101.md)。项目仍在开发中。

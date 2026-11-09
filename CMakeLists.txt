@@ -18,7 +18,7 @@ if(HUXERUI_PROJECT_PLAN_ONLY)
     return()
 endif()
 
-project(clash-flux VERSION 0.3.100
+project(clash-flux VERSION 0.3.101
     DESCRIPTION "Mobile sing-box proxy client" LANGUAGES NONE)
 
 if(NOT HUXERUI_LIBRARY_GRAPH_ONLY AND NOT ANDROID AND NOT IOS)
@@ -60,10 +60,13 @@ endif()
 
 if(CLASHFLUX_HUXERUI_SOURCE_DIR)
     set(CLASHFLUX_HUXERUI_FROM_SOURCE ON)
-    if(IOS)
+    # 0.4.0 起移动端静态链接 HuxerUI：Android 静态库把框架链接进 lib<app>.so，
+    # iOS 只提供 static 切片；移动仓库不再消费桌面 shared 运行时。
+    if(ANDROID OR IOS)
         set(HUXERUI_BUILD_SHARED OFF)
         set(HUXERUI_BUILD_STATIC ON)
     else()
+        set(HUXERUI_BUILD_SHARED ON)
         set(HUXERUI_BUILD_STATIC OFF)
     endif()
     set(CLASHFLUX_HUXERUI_LOCAL_TOOLS
@@ -82,7 +85,9 @@ else()
     set(HuxerUI_DIR "${HUXERUI_SDK_DIR}/lib/cmake/HuxerUI" CACHE PATH "HuxerUI package" FORCE)
     set(HUXERUI_RESOURCES_BIN
         "${HUXERUI_SDK_DIR}/share/huxerui/resources/huxerui/resources.bin" CACHE INTERNAL "")
-    find_package(HuxerUI 0.3.0 CONFIG REQUIRED COMPONENTS shared
+    # 移动 SDK 只提供 static 切片；本仓库不构建桌面目标。
+    set(CLASHFLUX_HUXERUI_SDK_COMPONENT static)
+    find_package(HuxerUI 0.4.0 CONFIG REQUIRED COMPONENTS ${CLASHFLUX_HUXERUI_SDK_COMPONENT}
         PATHS "${HUXERUI_SDK_DIR}" NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
 endif()
 

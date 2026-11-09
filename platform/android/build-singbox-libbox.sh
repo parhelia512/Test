@@ -52,6 +52,6 @@ popd >/dev/null
 # Gradle must identify cached AARs by source revision and content, not by their
 # filename alone. This sidecar travels with CLASHFLUX_SINGBOX_AAR in CI/local builds.
 readonly aar_sha256="$(sha256sum "$output" | cut -d ' ' -f 1)"
-printf '{"repository":"%s","version":"%s","revision":"%s","buildProfile":"%s","sha256":"%s","abi":"arm64-v8a"}\n' \
-    "$repo" "$version" "$revision" "$libbox_build_profile" "$aar_sha256" > "$output.metadata.json.tmp"
+printf '{"version":"%s","revision":"%s","sha256":"%s","abi":"arm64-v8a"}\n' \
+    "$version" "$revision" "$aar_sha256" > "$output.metadata.json.tmp"
 mv "$output.metadata.json.tmp" "$output.metadata.json"

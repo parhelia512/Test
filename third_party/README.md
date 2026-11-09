@@ -9,7 +9,7 @@ nlohmann::json 是 single header，直接提交在 `json/`。Glaze 等本地归�
 归档版本及来源以本项目清单为准。
 
 应用当前的 HuxerUI fork 源码提交与检出命令见 [固定版本](../docs/huxerui-fork.md)；本机独立 checkout、CI 和 Android Java/native 共用该身份，不消费维护工作树。
-当前源码基线为 SDK 0.4.0（`69f2407`）；下表 0.3.0 是仍然保留的离线 SDK 归档身份，不是源码版本。`HUXERUI_HOME` 也可显式选择固定 fork 源码。
+当前源码基线为 SDK 0.4.0（`144aff6b`）；下表 0.3.0 是仍然保留的离线 SDK 归档身份，不是源码版本；0.3.0 离线包不满足当前 0.4.0 构建要求。`HUXERUI_HOME` 也可显式选择固定 fork 源码。
 
 ## 清单与来源
 
@@ -36,8 +36,7 @@ Camera、Charts、SQLite、CodeEditor、Media 通过 `huxerui_use_library(URL, C
 移动内核由 [Leadaxe/sing-box-lx](https://github.com/Leadaxe/sing-box-lx) 的正式 tag
 `v1.14.4-lx.33`、提交 `2d9a0a52df7881f55484d48f9daecb21d135f3e9` 构建，不存放在 tarball 中。
 Android/iOS 脚本核对 tag 与提交，移动标签与 fork 默认集合一致，不启用 Clash REST API。
-Android AAR 附带 repository/version/revision/buildProfile/ABI/SHA256 元数据，Gradle 拒绝旧来源、
-旧版本或旧构建配置缓存。详情见 [Android 构建](../docs/android-build.md)
+Android AAR 附带 version/revision/ABI/SHA256 元数据，Gradle 拒绝旧版本缓存。详情见 [Android 构建](../docs/android-build.md)
 及 [内核升级记录](../docs/singbox-stable-upgrade.md)。
 
 ## 更新某个依赖

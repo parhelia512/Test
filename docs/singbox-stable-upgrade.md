@@ -257,8 +257,8 @@ Android/iOS 脚本浅取真实 tag、核对 HEAD 和 tag，不修改内核源码
   该选择已由下节 CommandClient 修正撤回。移动标签/链接参数集中在
   `platform/singbox-libbox-build.conf`，平台脚本直接调用固定 `make lib_install`
   安装的 gomobile。Android 只生成消费的 API 24 arm64 AAR。
-- AAR sidecar 与 Gradle 同时核对 repository、version、revision、buildProfile、ABI、SHA256；
-  更换构建配置必须重新生成 AAR 和 sidecar，不能为旧产物手写新身份。
+- AAR sidecar 与 Gradle 同时核对 version、revision、ABI、SHA256；
+  更换 pin 时必须重新生成 AAR 和 sidecar，不能为旧产物手写新身份。
 - `CommandClientHandler` 新增 `WriteDNSQuery`，Android 服务和带 generation 检查的代理 handler
   均实现对应回调；当前不订阅 DNS 查询流。其余已用平台接口经源码对比未发现必须适配项。
   fork 默认 MTU 对齐、detour TLS 分片和 lx 字段差异见[能力基线](singbox-layers-and-fidelity.md)。
@@ -275,7 +275,8 @@ ProfileHttpPolicy、ApkUpdatePolicy）通过；固定身份、标签和元数据
 
 基于应用 `18abb22` 的工作区，撤回前一轮额外启用 Clash API 的构建选择。
 固定仓库、版本和 revision 不变，移动标签与 fork 默认集合一致，保留 `with_lx_command`。
-AAR 构建身份改为 `clashflux-lx33-command-client-v1`；Gradle 拒绝此前构建配置的缓存。
+AAR sidecar 与 Gradle 校验收敛为 version、revision、ABI、SHA256，不再校验来源仓库和
+构建配置标识；此前按 buildProfile 区分的构建需按新元数据格式重新生成。
 
 - 共享编译器不再生成 `experimental.clash_api`，并移除原生 JSON 中继承的该对象；
   不再注入旧版 `clash-flux-control` 服务。用户原生 `services`、路由和缓存字段继续保留。

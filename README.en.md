@@ -94,4 +94,4 @@ binaries only and publishes no iOS release assets.
 - `docs`: design, build and historical documents. Desktop-specific documents are
   historical references, not a statement of current platform support.
 
-See the [v0.3.100 release notes](docs/releases/v0.3.100.md). Development continues.
+See the [v0.3.101 release notes](docs/releases/v0.3.101.md). Development continues.

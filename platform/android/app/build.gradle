@@ -35,14 +35,10 @@ abstract class StageHuxerUIAssets extends DefaultTask {
 
 def singboxAar = layout.buildDirectory.file("libs/libbox-arm64.aar")
 def singboxAarMetadata = layout.buildDirectory.file("libs/libbox-arm64.aar.metadata.json")
-def singboxRepository = "https://github.com/Leadaxe/sing-box-lx.git"
 def singboxVersion = "1.14.4-lx.33"
 def singboxRevision = "2d9a0a52df7881f55484d48f9daecb21d135f3e9"
-def singboxBuildProfile = "clashflux-lx33-command-client-v1"
 def suppliedSingboxAar = providers.environmentVariable("CLASHFLUX_SINGBOX_AAR")
 def stageSingboxAar = tasks.register("stageSingboxAar") {
-    inputs.property("repository", singboxRepository)
-    inputs.property("buildProfile", singboxBuildProfile)
     inputs.property("version", singboxVersion)
     inputs.property("revision", singboxRevision)
     // The AAR is deliberately supplied by the release/build script.  Mark the
@@ -61,10 +57,10 @@ def stageSingboxAar = tasks.register("stageSingboxAar") {
                 throw new GradleException("Missing sing-box AAR or revision metadata; rebuild with platform/android/build-singbox-libbox.sh.")
             }
             def identity = new JsonSlurper().parse(metadata)
-            if (identity.repository != singboxRepository || identity.version != singboxVersion ||
-                    identity.revision != singboxRevision || identity.buildProfile != singboxBuildProfile ||
+            if (identity.version != singboxVersion ||
+                    identity.revision != singboxRevision ||
                     identity.abi != "arm64-v8a") {
-                throw new GradleException("sing-box AAR source/build profile/ABI differs from the project pin; rebuild libbox.")
+                throw new GradleException("sing-box AAR version/revision/ABI differs from the project pin; rebuild libbox.")
             }
             MessageDigest digest = MessageDigest.getInstance("SHA-256")
             artifact.withInputStream { stream ->
@@ -162,6 +158,10 @@ def huxeruiNdkVersion = huxeruiProperty("huxeruiNdkVersion")
 def clashfluxTargetAbis = ["arm64-v8a"]
 def singboxAarAbis = ["arm64-v8a", "armeabi-v7a", "x86", "x86_64"]
 def huxeruiStl = huxeruiProperty("huxeruiStl")
+// `huxerui build android --optimization ... --lto ...` forwards these as Gradle
+// properties; pass them to CMake, which applies them to source-built targets.
+def huxeruiOptimization = providers.gradleProperty("huxeruiOptimization").getOrElse("default")
+def huxeruiLto = providers.gradleProperty("huxeruiLto").getOrElse("OFF")
 def releaseKeystoreFile = providers.gradleProperty("clashfluxReleaseKeystoreFile").orNull
 def releaseKeystorePassword = providers.gradleProperty("clashfluxReleaseKeystorePassword").orNull
 def releaseKeyAlias = providers.gradleProperty("clashfluxReleaseKeyAlias").orNull
@@ -198,13 +198,15 @@ android {
         applicationId = "dev.farna.clashflux"
         minSdk = huxeruiMinSdk
         targetSdk = huxeruiTargetSdk
-        versionCode = 178
-        versionName = "0.3.100"
+        versionCode = 179
+        versionName = "0.3.101"
 
         externalNativeBuild {
             cmake {
                 arguments "-DANDROID_STL=${huxeruiStl}",
-                        "-DHUXERUI_HOME=${huxeruiHome.absolutePath}"
+                        "-DHUXERUI_HOME=${huxeruiHome.absolutePath}",
+                        "-DHUXERUI_OPTIMIZATION=${huxeruiOptimization}",
+                        "-DHUXERUI_ENABLE_LTO=${huxeruiLto}"
             }
         }
 

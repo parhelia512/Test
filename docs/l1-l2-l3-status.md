@@ -1,9 +1,27 @@
 # L1 / L2 / L3 开发完成度复核
 
+## 2026-11-09：迁移到 HuxerUI 0.4.0 工程格式（移动端裁剪版）
+
+- 框架源码/CI/Lock pin 从 `69f24079`（0.3 集成）更新到
+  `144aff6be5f8fc8ba09eaaa7189a375322aa01af`（0.4.0 合并线）。
+- 扩展库同步到各自 SDK 0.4 迁移合并：Lib-Camera `5d6b8e81`、Lib-SQLite `882665a`、
+  Lib-Charts `a879e96c`、Lib-CodeEditor `a332e7c`（pin 不变）；Lib-Media 使用官方
+  `01341304`。
+- 工程格式迁移：Android/iOS 源码模式构建 static 切片，SDK 模式请求 `static`
+  组件；Android 新增 `MainApplication`（`Application` 初始化时加载
+  `BuildConfig.HUXERUI_APP_LIBRARY`），manifest 声明 `android:name`，移除
+  `MainActivity`/`ClashVpnService` 的重复加载；`huxeruiStl` 改为 `c++_static`；
+  `app/build.gradle` 转发 `huxeruiOptimization`/`huxeruiLto`。移动仓库无桌面
+  shared 目标，SDK 组件固定为 static。
+- 上游验证记录见 FarnaHerry/Clash-Flux `865b49d`（arm64 Release 体积、v1/v2 签名、
+  32/32 桌面回归）。本仓库按用户要求不在本机编译：Android 构建仍被本机
+  SweetEditor Windows 归档路径与 Gradle wrapper 下载阻塞，未生成 AAR/APK，
+  未做真机验收。sing-box-lx 与 CommandClient 控制面不受本次框架迁移影响。
+
 ## 2026-11-09：CommandClient 替代 Clash REST 依赖
 
 - 基于 `18abb22` 的工作区，移动构建取消 Clash API 标签，沿用固定 fork 默认集合。
-  AAR buildProfile 改为 `clashflux-lx33-command-client-v1`，旧构建必须重新生成。
+  AAR sidecar 与 Gradle 校验收敛为 version、revision、ABI、SHA256。
 - 共享编译器移除 `experimental.clash_api` 和旧版控制服务注入，保留原生缓存、路由及用户服务。
   Android 组、选择、组测速、连接、日志、流量继续使用已有 CommandClient 通道。
 - UI 在交付配置或切换模式时，将目标意图原子保存，后台各启动/恢复路径读取同一目标；
@@ -21,7 +39,8 @@
   `2d9a0a52df7881f55484d48f9daecb21d135f3e9`；真实 tag 与提交已通过 Git 核对。
 - Android/iOS 同源，初始化固定依赖子模块；共用移动构建参数。最初额外启用的 Clash API
   已改为 fork 默认移动标签，当前控制面及验证边界见本页最新的 CommandClient 记录。
-  AAR 新增 repository/buildProfile 校验，Android 兼容新增 DNS 查询回调但不订阅该流。
+  AAR sidecar 记录来源身份供追溯，Gradle 校验 version、revision、ABI、SHA256；
+  Android 兼容新增 DNS 查询回调但不订阅该流。
 - 已通过脚本语法、HuxerUI codegen、五项现有宿主 JVM 回归及身份一致性检查。
   Android 主目标因本机缺构建目录/工具链未构建；AAR/APK、iOS、签名、真机 VPN 和
   fork 新协议互通均未验收，不能据此宣称内核升级已完成运行验证。
