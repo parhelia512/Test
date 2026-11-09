@@ -51,8 +51,11 @@ iOS 工具链时逐条核对：
 platform/ios/build-singbox-libbox.sh /tmp/Libbox.xcframework
 ```
 
-脚本会检出 `SINGBOX_COMMIT` 指定的上游 revision；默认值与项目当前 sing-box pin 一致。
-构建需要 Go、Make 和可用的 iPhoneOS 与 iOS Simulator SDK。
+脚本会浅取 `SINGBOX_VERSION` 对应的正式 tag，并核对实际 HEAD 与 `SINGBOX_COMMIT`；
+默认值与项目当前 sing-box-lx pin 一致，保留真实 tag 供构建工具读取版本。
+构建需要 Go、Make 和可用的 iPhoneOS 与 iOS Simulator SDK。CI 使用 Go 1.26.10；
+脚本初始化固定的四个依赖子模块，并使用 `platform/singbox-libbox-build.conf` 的移动标签、
+版本链接参数及应用所需 `with_clash_api` 直接执行 gomobile，不修改 fork 源码。
 
 ## Apple 签名
 
@@ -86,8 +89,8 @@ Release job 只有在以下项目完成后才纳入 iOS：
 
 ## 内核版本对齐
 
-构建脚本默认使用 sing-box 1.14.3 revision
-`7054cac5124465ffdb145870d7c01885566711b1`，与 Android/libbox 和桌面一致。
-本次本地验证只覆盖 Linux；未构建新的 iOS xcframework 或验证真机生命周期。
+构建脚本默认使用 Leadaxe/sing-box-lx `v1.14.4-lx.33`，revision
+`2d9a0a52df7881f55484d48f9daecb21d135f3e9`，与 Android/libbox 一致。
+此次仅切换依赖身份；尚未构建新的 iOS xcframework 或验证真机生命周期。
 iOS 仍按 TODO 暂缓，不属于 Release 目标。升级记录见
 [稳定内核升级](singbox-stable-upgrade.md)。

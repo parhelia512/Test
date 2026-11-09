@@ -38,12 +38,13 @@ Media 当前带入 Media3 播放器依赖，图片选择功能与 Debug APK 体�
 
 ## sing-box libbox 来源与缓存
 
-当前固定 sing-box 1.14.4，源码 revision
-`c005f35300ce76427dc285481ec5695f5b179cd2`，与桌面发布内核一致。
-1.14.4 移除 PlatformInterface.useProcFS；API 24–28 在 findConnectionOwner 回调中显式调用
+当前固定 [Leadaxe/sing-box-lx](https://github.com/Leadaxe/sing-box-lx)
+`v1.14.4-lx.33`，源码 revision `2d9a0a52df7881f55484d48f9daecb21d135f3e9`，
+与实验性 iOS libbox 同源。
+上游 1.14.4 移除 PlatformInterface.useProcFS；API 24–28 在 findConnectionOwner 回调中显式调用
 Libbox.findConnectionOwner，API 29+ 继续使用 ConnectivityManager，均保留包名查询和失败反馈。
 `platform/android/build-singbox-libbox.sh /absolute/path/libbox-arm64.aar` 会同时生成
-`libbox-arm64.aar.metadata.json`，包含正式版本、实际 checkout revision、arm64-v8a ABI 与 AAR
+`libbox-arm64.aar.metadata.json`，包含源码仓库、正式版本、实际 checkout revision、arm64-v8a ABI 与 AAR
 SHA256。设置 `CLASHFLUX_SINGBOX_AAR` 时，两份文件必须在一起。
 
 Gradle `stageSingboxAar` 验证来源和摘要后再复制；无环境变量时只复用身份校验通过的
@@ -53,11 +54,17 @@ Gradle `stageSingboxAar` 验证来源和摘要后再复制；无环境变量时�
 
 Android libbox 构建只浅取正式版本 tag，核对 tag 对应的 HEAD 与固定 revision；
 保留真实 tag，避免上游 `ReadTag()` 在浅取裸 commit 后把版本写成 unknown。
-AAR 元数据包含 version，Gradle 同时核验版本、revision、ABI 与内容摘要。
+AAR 元数据包含 repository、version 和 buildProfile，Gradle 同时核验仓库、版本、revision、
+构建配置、ABI 与内容摘要。`buildProfile` 区分本应用启用 Clash API 的构建和 fork 默认构建。
 自定义 pin 时必须同时提供 `SINGBOX_VERSION` 和 `SINGBOX_COMMIT`，不伪造版本标签。
 
 上游构建要求 OpenJDK 17，脚本在获取源码前检查 JAVA_HOME；Gradle 使用的 JDK
-可以单独配置。完整升级记录见[稳定内核升级](singbox-stable-upgrade.md)。
+可以单独配置。CI 使用 Go 1.26.10，对齐 fork 的 `go.version`。
+四个本地替换依赖 wireguard-go/sing-tun/gvisor/utls 按 gitlink 初始化，不跟随子模块分支。
+移动特性标签与链接参数集中在 `platform/singbox-libbox-build.conf`；两平台直接调用
+固定 `make lib_install` 安装的 gomobile，额外启用应用所需的 `with_clash_api`，不改 fork 源码。
+Android 只构建应用消费的 API 24 arm64 AAR。DNS 查询回调已兼容，但应用不订阅 DNS 查询流。
+完整升级记录及 fork 默认行为差异见[内核升级](singbox-stable-upgrade.md)和[能力基线](singbox-layers-and-fidelity.md)。
 
 共享 JSON codec 使用固定 Glaze 9.0.0；Android Legacy 头只引用拥有型 DTO，
 `clashflux_wire` 单独编译 Glaze，不合入领域模块的兼容大 TU。接入与验证边界见

@@ -29,7 +29,7 @@ description: 修改 Clash-Flux Android 后台生命周期、权限、数据面�
   platform/android/huxerui，只有 SDK 回落才用 SDK AAR。国内 GEOIP/GEOSITE 固定
   revision/SHA256 打包，不跳 stageBundledRuleSets 或改运行时下载；自定义 Geo
   DAT/MMDB 与资源到期任务走 UI 进程订阅准备路径。
-- libbox 与固定 sing-box 同版本/revision；AAR 的 version/revision/ABI/SHA256 元数据
+- libbox 与固定 sing-box 同仓库/版本/revision；AAR 的 repository/version/revision/ABI/SHA256 元数据
   缺失或不符须重建，不能只看文件存在。Git 用 HTTPS，代理不改变内容身份。
 - APK 更新读 [应用升级](../../docs/app-updates.md)：HUI 应用作用域下载/校验、窗口
   作用域授权/安装，工作线程校验正式签名/版本，保存配置并停核后由系统确认安装；

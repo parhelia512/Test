@@ -8,6 +8,9 @@ Clash-Flux 是一个仅面向移动设备的代理客户端，使用 C++23 和 H
 Android 在独立后台进程中运行 sing-box libbox，由 `VpnService` 创建 TUN；
 主进程管理订阅数据库、配置编译和界面。iOS 保留 App 与 Packet Tunnel 的
 实验性 Simulator 构建，仍不承诺真机支持或发布 IPA。
+内核源码固定为 [Leadaxe/sing-box-lx](https://github.com/Leadaxe/sing-box-lx)
+`v1.14.4-lx.33`，提交 `2d9a0a52df7881f55484d48f9daecb21d135f3e9`；
+Android 与实验性 iOS libbox 均从该源码构建。
 
 本版本已移除 Windows、Linux、macOS 桌面源码、入口、安装包、桌面服务和 demos。
 不再提供桌面 CLI、系统托盘、系统代理设置、SCM/systemd 服务、桌面内核进程或
@@ -28,7 +31,7 @@ Android 在独立后台进程中运行 sing-box libbox，由 `VpnService` 创建
 
 - CMake 4.4（基线 4.4.2）与 Ninja。
 - 固定提交的 HuxerUI 源码或与其匹配的移动 SDK。
-- Android：JDK 17、Android SDK/NDK r28、Go，以及由脚本生成的 arm64 libbox AAR。
+- Android：JDK 17、Android SDK/NDK r28、Go 1.26.10，以及由脚本生成的 arm64 libbox AAR。
 - iOS：macOS、Xcode、LLVM 19、Go 和 iPhoneOS/Simulator SDK。
 - 固定第三方依赖通过 CPS 构建和校验，详见 [CPS 依赖管理](docs/cps-dependencies.md)。
 

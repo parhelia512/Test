@@ -1,5 +1,9 @@
 # sing-box 稳定内核升级记录
 
+当前移动内核已切换到 Leadaxe/sing-box-lx `v1.14.4-lx.33`，固定提交
+`2d9a0a52df7881f55484d48f9daecb21d135f3e9`；本次切换与验证边界见文末
+2026-11-09 记录。下方官方版本和桌面产物是历史升级证据，不代表当前构建来源。
+
 日期：2026-09-30。由 1.14.0 升级到官方最新稳定版 **1.14.2**，发布于
 2026-09-24；源码 revision：`af6e64c3b69e6132ebaee0e1a3d24e93903f6709`。
 不跟随 1.15 alpha。依据为[官方 Release](https://github.com/SagerNet/sing-box/releases/tag/v1.14.2)
@@ -236,3 +240,33 @@ StringArray 原样提取后，用 JDK 17、Android API 36 和新 classes.jar 独
 完整 compileDebugJavaWithJavac 在前置 configureCMakeDebug 失败：Gradle 未找到 CMake 4.4.2；
 该独立编译不等于完整 Java/APK 构建或真机 VPN 通过。未做 Android 真机、其它桌面平台、
 iOS xcframework、服务安装升级或完整 required 门禁；未提交、推送或发布。
+
+## 2026-11-09：移动内核切换到 sing-box-lx v1.14.4-lx.33
+
+基于应用 `c38b09f` 的工作区，按用户指定改用
+[Leadaxe/sing-box-lx](https://github.com/Leadaxe/sing-box-lx)，tag `v1.14.4-lx.33`。
+已通过 HTTPS Git 核对 annotated tag 对象 `f8e9156a1714d20f09889cc406e9f766dc4d5c47`
+解引用到固定源码 `2d9a0a52df7881f55484d48f9daecb21d135f3e9`。
+Android/iOS 脚本浅取真实 tag、核对 HEAD 和 tag，不修改内核源码。
+
+- CI、Gradle、CMake 内核标识、关于页链接和构建说明对齐该来源。
+  CI Go 为 1.26.10，与 fork 的 `go.version` 一致；Android 保留 JDK 17。
+- `go.mod` 的四个本地 replace 通过固定 gitlink 初始化 wireguard-go、sing-tun、gvisor、utls；
+  不使用 `submodule --remote`，不跟随子模块配置中的分支头。
+- fork 构建入口未提供额外 tag 参数，默认移除 Clash API。为保留应用生成的
+  `experimental.clash_api` 和模式配置，平台脚本直接调用固定 `make lib_install`
+  安装的 gomobile，移动标签/链接参数集中在 `platform/singbox-libbox-build.conf`，
+  保留 fork 移动标签并增加 `with_clash_api`。Android 只生成消费的 API 24 arm64 AAR。
+- AAR sidecar 与 Gradle 同时核对 repository、version、revision、buildProfile、ABI、SHA256；
+  旧产物和 fork 默认未启用 Clash API 的构建不能仅改名后复用，必须重新构建。
+- `CommandClientHandler` 新增 `WriteDNSQuery`，Android 服务和带 generation 检查的代理 handler
+  均实现对应回调；当前不订阅 DNS 查询流。其余已用平台接口经源码对比未发现必须适配项。
+  fork 默认 MTU 对齐、detour TLS 分片和 lx 字段差异见[能力基线](singbox-layers-and-fidelity.md)。
+  本次不扩展 Clash 映射、产品入口或宣称新协议已通过互通。
+
+实际验证：两平台脚本及共用配置 `bash -n`、关于页同版本 HuxerUI codegen、五项现有
+Android 宿主 JVM 回归（RuntimeStartPolicy、RuntimeModeReconciler、VpnUptime、
+ProfileHttpPolicy、ApkUpdatePolicy）通过；固定身份、标签和元数据字段一致性检查通过。
+`git diff --check` 通过。`cmake --build build-android --target clash-flux` 因无构建目录失败；
+本机无 Go/Android SDK/NDK/Xcode，未生成新 AAR、APK 或 xcframework，未做真机 VPN、签名
+或服务器握手验收。接口审查和宿主 JVM 回归不能替代这些验证。

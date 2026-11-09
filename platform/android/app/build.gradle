@@ -35,10 +35,14 @@ abstract class StageHuxerUIAssets extends DefaultTask {
 
 def singboxAar = layout.buildDirectory.file("libs/libbox-arm64.aar")
 def singboxAarMetadata = layout.buildDirectory.file("libs/libbox-arm64.aar.metadata.json")
-def singboxVersion = "1.14.4"
-def singboxRevision = "c005f35300ce76427dc285481ec5695f5b179cd2"
+def singboxRepository = "https://github.com/Leadaxe/sing-box-lx.git"
+def singboxVersion = "1.14.4-lx.33"
+def singboxRevision = "2d9a0a52df7881f55484d48f9daecb21d135f3e9"
+def singboxBuildProfile = "clashflux-lx33-clash-api-v1"
 def suppliedSingboxAar = providers.environmentVariable("CLASHFLUX_SINGBOX_AAR")
 def stageSingboxAar = tasks.register("stageSingboxAar") {
+    inputs.property("repository", singboxRepository)
+    inputs.property("buildProfile", singboxBuildProfile)
     inputs.property("version", singboxVersion)
     inputs.property("revision", singboxRevision)
     // The AAR is deliberately supplied by the release/build script.  Mark the
@@ -57,8 +61,10 @@ def stageSingboxAar = tasks.register("stageSingboxAar") {
                 throw new GradleException("Missing sing-box AAR or revision metadata; rebuild with platform/android/build-singbox-libbox.sh.")
             }
             def identity = new JsonSlurper().parse(metadata)
-            if (identity.version != singboxVersion || identity.revision != singboxRevision || identity.abi != "arm64-v8a") {
-                throw new GradleException("sing-box AAR source revision/ABI differs from the project pin; rebuild libbox.")
+            if (identity.repository != singboxRepository || identity.version != singboxVersion ||
+                    identity.revision != singboxRevision || identity.buildProfile != singboxBuildProfile ||
+                    identity.abi != "arm64-v8a") {
+                throw new GradleException("sing-box AAR source/build profile/ABI differs from the project pin; rebuild libbox.")
             }
             MessageDigest digest = MessageDigest.getInstance("SHA-256")
             artifact.withInputStream { stream ->

@@ -746,8 +746,8 @@ void DeleteThemeColor(const std::shared_ptr<SettingsModel>& model, const std::st
                 repository("https://github.com/HuxerUI/HuxerUI")),
             AboutActionRow(Localized("所用 HuxerUI fork"), "FarnaHerry/HuxerUI", app::images::github,
                 repository("https://github.com/FarnaHerry/HuxerUI")),
-            AboutActionRow(Localized("sing-box 内核"), "SagerNet/sing-box", app::images::github,
-                repository("https://github.com/SagerNet/sing-box")),
+            AboutActionRow(Localized("sing-box 内核"), "Leadaxe/sing-box-lx", app::images::github,
+                repository("https://github.com/Leadaxe/sing-box-lx")),
         }.With(huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch))),
         SettingsSectionCard(Localized("免责声明"), SettingsContentRow(
             huxerui::Text(Localized("Clash-Flux 不提供代理服务器或订阅服务。请仅使用可信来源的配置，并遵守所在地法律及所使用服务的条款。项目按开源许可提供，不承诺服务可用性。"))

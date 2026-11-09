@@ -9,6 +9,9 @@ Android runs sing-box libbox in a dedicated background process, with TUN provide
 `VpnService`; the UI process owns subscription storage, configuration compilation and
 presentation. The iOS App and Packet Tunnel remain experimental Simulator integrations,
 without a promise of device support or an IPA release.
+The core is pinned to [Leadaxe/sing-box-lx](https://github.com/Leadaxe/sing-box-lx)
+`v1.14.4-lx.33`, commit `2d9a0a52df7881f55484d48f9daecb21d135f3e9`;
+Android and experimental iOS libbox builds use this same source.
 
 Windows, Linux and macOS desktop sources, entry points, installers, services and demos
 have been removed. Desktop CLI, tray, system-proxy configuration, SCM/systemd services,
@@ -36,7 +39,7 @@ desktop capabilities are unavailable.
 
 - CMake 4.4 (baseline 4.4.2) and Ninja.
 - The pinned HuxerUI source revision or a matching mobile SDK.
-- Android: JDK 17, Android SDK/NDK r28, Go and an arm64 libbox AAR built by the script.
+- Android: JDK 17, Android SDK/NDK r28, Go 1.26.10 and an arm64 libbox AAR built by the script.
 - iOS: macOS, Xcode, LLVM 19, Go and iPhoneOS/Simulator SDKs.
 - Reproducible dependencies built through CPS; see [dependency management](docs/cps-dependencies.md).
 

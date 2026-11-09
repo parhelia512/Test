@@ -31,6 +31,14 @@ Camera、Charts、SQLite、CodeEditor、Media 通过 `huxerui_use_library(URL, C
 与 Android 库图同源；不自动采用旧 `third_party/lib-*` 工作树，也不在配置期打补丁。
 维护目录、审核清单与升级流程见 [HuxerUI fork](../docs/huxerui-fork.md)。
 
+## sing-box libbox
+
+移动内核由 [Leadaxe/sing-box-lx](https://github.com/Leadaxe/sing-box-lx) 的正式 tag
+`v1.14.4-lx.33`、提交 `2d9a0a52df7881f55484d48f9daecb21d135f3e9` 构建，不存放在 tarball 中。
+Android/iOS 脚本核对 tag 与提交；Android AAR 附带 repository/version/revision/ABI/SHA256
+元数据，Gradle 拒绝旧来源或旧版本缓存。详情见 [Android 构建](../docs/android-build.md)
+及 [内核升级记录](../docs/singbox-stable-upgrade.md)。
+
 ## 更新某个依赖
 
 1. 更新归档或直提源码，并核对来源、许可证与实际 SHA256；

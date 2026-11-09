@@ -37,7 +37,8 @@ env:
   # CI 必须自行 clone 并钉 commit，保证可复现）。框架补丁集中维护在
   # farna/main；main 保留官方基线。验证集成更新后同步本机 checkout 与此 pin。
   HUXERUI_COMMIT: '69f24079bafa4f19d31e387e66a6b9bac8f3776f'
-  SINGBOX_COMMIT: 'c005f35300ce76427dc285481ec5695f5b179cd2' # v1.14.4
+  SINGBOX_VERSION: '1.14.4-lx.33'
+  SINGBOX_COMMIT: '2d9a0a52df7881f55484d48f9daecb21d135f3e9' # Leadaxe/sing-box-lx v1.14.4-lx.33
 
 jobs:
   build-ios-simulator-arm64:
@@ -51,7 +52,7 @@ jobs:
       - name: Set up Go for pinned sing-box Libbox
         uses: actions/setup-go@v7
         with:
-          go-version: '1.26.7'
+          go-version: '1.26.10'
           cache: false
 
       - name: Fetch HuxerUI source (pinned) and apply compatibility patches
@@ -149,7 +150,7 @@ jobs:
       - name: Set up Go for sing-box
         uses: actions/setup-go@v7
         with:
-          go-version: '1.26.7'
+          go-version: '1.26.10'
           cache: false
 
       - name: Set up Android SDK

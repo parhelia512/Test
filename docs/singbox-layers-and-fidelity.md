@@ -17,11 +17,28 @@
 与原生 VPN 补偿或路由标记冲突则拒绝；未开启时对来源的覆盖记 Field/Approx。
 IP 规则集路由只提取目标 CIDR；PAC 由应用提供与接管，不伪装成内核字段。字段与平台边界见[首页网络设置](home-network-settings.md)。
 
+## 2026-11-09：sing-box-lx 依赖基线
+
+当前使用 [Leadaxe/sing-box-lx v1.14.4-lx.33](https://github.com/Leadaxe/sing-box-lx/tree/2d9a0a52df7881f55484d48f9daecb21d135f3e9)。
+下文基于官方 sing-box 的映射记录保留为已有实现依据，不代表 fork 完全等同行为。
+本次保持现有 Clash 转换支持范围，不因 fork 导出额外 API 或协议就自动标记为已支持。
+
+- Android `CommandClientHandler` 新增 DNS 查询回调；应用实现空接收函数，但不订阅 DNS 查询流。
+- fork 的 libbox 默认关闭 Clash API；应用构建显式启用 `with_clash_api`，保留现有
+  `experimental.clash_api` 配置和模式语义。其它移动标签沿用固定 fork，不修改内核源码。
+- fork 默认 `lx.mtu_align=clamp`，即使没有配置 `lx` 也可能调整 detour 路径的 MTU/包长。
+- 经 detour 的 TLS-over-TCP 默认开启 record fragmentation；该版实现中
+  `record_fragment:false` 仍会被此默认处理覆盖，不能承诺与官方 1.14.4 完全等价。
+- `lx.quic_sniff_decoy` 只接受对象，旧字符串/布尔值拒绝；`lx.awg_masquerade` 已移除。
+  这些 fork 字段的产品入口和 Clash 映射尚未接入；原生 JSON 是否可运行由新 libbox 校验。
+
+以上是固定源码接口及行为审查，未替代新 AAR/APK、设备 VPN 或远端握手验收。
+
 ## 1. 三层与各自铁律
 
 | 层 | 职责 | 代码位置 | 铁律 |
 |---|---|---|---|
-| L1 内核层 | 运行 sing-box，提供控制面 | 官方二进制（Windows/Linux 服务、macOS 进程）/ libbox（Android 后台）、`clashflux.core`、`clashflux.api`、`clashflux.stream` | 不 fork、不臆造字段、能力以上游文档/源码为准 |
+| L1 内核层 | 运行固定版本内核，提供控制面 | sing-box-lx libbox（Android 后台 / 实验性 iOS Packet Tunnel）、`clashflux.core`、`clashflux.api`、`clashflux.stream` | 不在应用改内核、不臆造字段、能力以所选固定源码为准 |
 | L2 翻译层 | 把 Clash 生态翻译成 sing-box 形态 | `clashflux.singbox`、`clashflux.model`、`clashflux.routing`、`clashflux.openvpn`、`clashflux.pptp` | 每条映射必须落在 exact / approx / unsupported 之一，禁止静默丢弃 |
 | L3 产品层 | 交互、状态编排、CLI、托盘 | `src/ui/*`、`clashflux.store.*`、`clashflux.cli` | 只用内核真有的能力，不做假 UI |
 
@@ -29,8 +46,10 @@ IP 规则集路由只提取目标 CIDR；PAC 由应用提供与接管，不伪�
 
 - sing-box 对未知字段**直接拒绝启动**，因此配置里出现的每个键都必须能在上游文档或源码里
   找到出处；不要靠「看起来像」猜字段。
-- 版本固定：桌面二进制与 Android libbox 必须是同一版本、同一源码 revision（当前 1.14.4）；平台资产分别校验 SHA256；升级
-  时按上游逐项复核，而不是就地改内核行为。
+- 版本固定：Android 与实验性 iOS libbox 使用同一源码仓库、版本和 revision，当前为
+  `Leadaxe/sing-box-lx` `v1.14.4-lx.33`、`2d9a0a52df7881f55484d48f9daecb21d135f3e9`。
+  AAR 校验来源、版本、revision、ABI 与内容 SHA256；升级按固定源码逐项复核。
+  本次切换不自动扩大 Clash 转换支持矩阵，fork 新增协议/字段仍须单独验证映射和保真度。
 - 启动与实例身份使用内核原生 `StartedService` 的鉴权 gRPC-Web；诊断分别记录原生接口、
   `clash_api`、统计流和指定业务目标的结果。`clash_api` 保留现有 REST/统计通道，
   未迁移的操作不宣称已迁移。原生 API 没有任意增删出站的无损配置补丁接口，

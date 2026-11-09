@@ -110,7 +110,7 @@ export std::filesystem::path singboxBinary() {
 }
 
 export std::string singboxFallbackLabel() {
-    return "sing-box 1.14.4";
+    return "sing-box " CLASHFLUX_SINGBOX_VERSION;
 }
 
 export constexpr std::string_view kControllerHost = "127.0.0.1";

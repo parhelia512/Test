@@ -1366,6 +1366,7 @@ public final class ClashVpnService extends VpnService implements PlatformInterfa
             @Override public void writeGroups(OutboundGroupIterator groups) { deliver(() -> ClashVpnService.this.writeGroups(groups)); }
             @Override public void writeLogs(LogIterator logs) { deliver(() -> ClashVpnService.this.writeLogs(logs)); }
             @Override public void writeOutbounds(OutboundGroupItemIterator outbounds) { deliver(() -> ClashVpnService.this.writeOutbounds(outbounds)); }
+            @Override public void writeDNSQuery(DnsQuery query) { deliver(() -> ClashVpnService.this.writeDNSQuery(query)); }
             @Override public void writeStatus(StatusMessage status) { deliver(() -> {
                 if (status == null) return;
                 ClashVpnService.this.writeStatus(status);
@@ -1806,6 +1807,9 @@ public final class ClashVpnService extends VpnService implements PlatformInterfa
             MainActivity.appLog("发布 libbox 状态失败：" + error.getMessage(), true);
         }
     }
+
+    // DNS query streaming is not subscribed by this application.
+    @Override public void writeDNSQuery(DnsQuery query) {}
 
     private String encodeConnectionsLocked() throws Exception {
         JSONObject result = new JSONObject();

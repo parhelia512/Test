@@ -1,5 +1,17 @@
 # L1 / L2 / L3 开发完成度复核
 
+## 2026-11-09：移动内核切换 sing-box-lx
+
+- 基于应用 `c38b09f` 的工作区，固定 Leadaxe/sing-box-lx `v1.14.4-lx.33`、
+  `2d9a0a52df7881f55484d48f9daecb21d135f3e9`；真实 tag 与提交已通过 Git 核对。
+- Android/iOS 同源，初始化固定依赖子模块；共用移动构建参数并显式保留 Clash API。
+  AAR 新增 repository/buildProfile 校验，Android 兼容新增 DNS 查询回调但不订阅该流。
+- 已通过脚本语法、HuxerUI codegen、五项现有宿主 JVM 回归及身份一致性检查。
+  Android 主目标因本机缺构建目录/工具链未构建；AAR/APK、iOS、签名、真机 VPN 和
+  fork 新协议互通均未验收，不能据此宣称内核升级已完成运行验证。
+- 当前 Clash 转换支持范围不自动扩大；fork 默认 MTU/TLS 行为差异及详细记录见
+  [能力基线](singbox-layers-and-fidelity.md)与[升级记录](singbox-stable-upgrade.md)。
+
 ## 2026-11-09：Android 正式签名证书迁移
 
 - 正式签名改用 `thronem-release.jks`，其证书 SHA-256 为

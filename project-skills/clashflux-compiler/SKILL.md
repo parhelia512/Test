@@ -10,7 +10,7 @@ description: 修改 Clash-Flux 订阅转换、协议/DNS/规则/provider 映射�
 
 ## 不可突破的边界
 
-- L1 紧贴真实 sing-box 能力、官方桌面内核与 libbox 同源码版本；不 fork 内核或造字段。Windows 数据面由服务启动，不能把“桌面内核”误解成 GUI 自行 spawn。
+- L1 紧贴所选固定内核能力；当前 Android/实验性 iOS 使用同源码 sing-box-lx `v1.14.4-lx.33`。不在应用补丁中改内核或造字段；fork 新增能力须单独验证映射与保真度后再暴露。
 - L2 统一编译 Clash YAML、原生 JSON、PPTP/OpenVPN；每个协议/组/规则/字段标 exact/approx/unsupported，不能静默丢弃或为跑通改测速 URL、证书校验等用户语义。L3 使用 Clash 词汇，只暴露真实能力。
 - 有原生等价用 exact；可表达但语义不同用 approx 并记账；无对应能力先降级记账。应用补齐须证明内核运行/未运行均有定义、失败能回滚且无第二真相源；做不到不做假 UI。
 - 用户条目消失或语义改变用 ctx.note(scope,level,subject,detail,action)；语义不变的运行事件才 ctx.warn。编译失败仍保留已产生 fidelity，JSON 为空不能抹掉 MATCH/依赖错误。
