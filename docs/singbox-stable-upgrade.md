@@ -253,12 +253,12 @@ Android/iOS 脚本浅取真实 tag、核对 HEAD 和 tag，不修改内核源码
   CI Go 为 1.26.10，与 fork 的 `go.version` 一致；Android 保留 JDK 17。
 - `go.mod` 的四个本地 replace 通过固定 gitlink 初始化 wireguard-go、sing-tun、gvisor、utls；
   不使用 `submodule --remote`，不跟随子模块配置中的分支头。
-- fork 构建入口未提供额外 tag 参数，默认移除 Clash API。为保留应用生成的
-  `experimental.clash_api` 和模式配置，平台脚本直接调用固定 `make lib_install`
-  安装的 gomobile，移动标签/链接参数集中在 `platform/singbox-libbox-build.conf`，
-  保留 fork 移动标签并增加 `with_clash_api`。Android 只生成消费的 API 24 arm64 AAR。
+- 最初为保留应用生成的 `experimental.clash_api` 而额外加入 Clash API 标签；
+  该选择已由下节 CommandClient 修正撤回。移动标签/链接参数集中在
+  `platform/singbox-libbox-build.conf`，平台脚本直接调用固定 `make lib_install`
+  安装的 gomobile。Android 只生成消费的 API 24 arm64 AAR。
 - AAR sidecar 与 Gradle 同时核对 repository、version、revision、buildProfile、ABI、SHA256；
-  旧产物和 fork 默认未启用 Clash API 的构建不能仅改名后复用，必须重新构建。
+  更换构建配置必须重新生成 AAR 和 sidecar，不能为旧产物手写新身份。
 - `CommandClientHandler` 新增 `WriteDNSQuery`，Android 服务和带 generation 检查的代理 handler
   均实现对应回调；当前不订阅 DNS 查询流。其余已用平台接口经源码对比未发现必须适配项。
   fork 默认 MTU 对齐、detour TLS 分片和 lx 字段差异见[能力基线](singbox-layers-and-fidelity.md)。
@@ -270,3 +270,25 @@ ProfileHttpPolicy、ApkUpdatePolicy）通过；固定身份、标签和元数据
 `git diff --check` 通过。`cmake --build build-android --target clash-flux` 因无构建目录失败；
 本机无 Go/Android SDK/NDK/Xcode，未生成新 AAR、APK 或 xcframework，未做真机 VPN、签名
 或服务器握手验收。接口审查和宿主 JVM 回归不能替代这些验证。
+
+## 2026-11-09：移除 Clash REST API，使用 CommandClient
+
+基于应用 `18abb22` 的工作区，撤回前一轮额外启用 Clash API 的构建选择。
+固定仓库、版本和 revision 不变，移动标签与 fork 默认集合一致，保留 `with_lx_command`。
+AAR 构建身份改为 `clashflux-lx33-command-client-v1`；Gradle 拒绝此前构建配置的缓存。
+
+- 共享编译器不再生成 `experimental.clash_api`，并移除原生 JSON 中继承的该对象；
+  不再注入旧版 `clash-flux-control` 服务。用户原生 `services`、路由和缓存字段继续保留。
+- 固定 libbox 通过 `PlatformLogWriter` 初始化独立模式/流量管理器，不依赖 Clash REST。
+  Android 已有组、选择、组测速、连接、关闭连接、日志和状态流均使用 CommandClient。
+- 启动目标模式由 UI 在交付配置前写入原子意图文件，后台各启动/恢复路径读取同一目标；
+  模式只在 CommandClient 回调确认后视为生效。程序仍处于发布前调试阶段，不保留旧版
+  `default_mode` 回退或后台旧配置清理，后台直接消费当前编译器输出。
+- 保留三种 `clash_mode` 路由条件与缓存策略，统一已知模式大小写；后台不打开 UI 数据库。
+  iOS 仍是实验性构建，其运行状态/模式桥接未完整接通，本次不宣称补齐。
+
+用户明确要求不在本机编译，最终模式传递与恢复改动只进行静态核对。
+在该要求前，五项既有宿主 JVM 策略回归通过，Android CMake 配置成功；完整 native 构建
+被固定 SweetEditor 的 Windows 归档合并脚本非法路径阻塞，Gradle 被 wrapper 下载超时阻塞。
+此前单独 native 单元编译不能作为后续模式改动的验证结果。未生成新的 AAR/APK/xcframework，
+未执行最终新增回归、真机 VPN、签名或远端握手验收。

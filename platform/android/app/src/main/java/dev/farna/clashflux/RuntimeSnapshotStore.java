@@ -20,6 +20,10 @@ final class RuntimeSnapshotStore {
         return thread;
     });
 
+    static String readModeIntent(Context context) {
+        return RuntimeModeIntent.normalize(read(context, "mode-intent.txt", ""));
+    }
+
     private RuntimeSnapshotStore() {}
 
     static void writeAsync(Context context, String name, String value) {

@@ -253,11 +253,6 @@
         const singbox::ProfileSource* updated = nullptr, bool includeAuxiliary = true) {
         singbox::CompileOptions options;
         options.profileYaml = profileYaml;
-        options.controller = cfg::controllerAddress();
-#if !defined(__ANDROID__) && !defined(CLASHFLUX_IOS)
-        options.nativeControllerPort = cfg::kNativeControllerPort;
-#endif
-        options.secret = secret_;
         applyNetworkOptions(options, networkSettings());
         options.mode = mode();
         options.logLevel = logLevel();
@@ -472,6 +467,38 @@
             }
         }
 #endif
+    }
+
+    bool publishAndroidModeIntent(const std::string& value, std::string& error) {
+#if defined(__ANDROID__)
+        if (value != "rule" && value != "global" && value != "direct") {
+            error = "不支持的出站模式";
+            return false;
+        }
+        const auto directory = cfg::dataDir() / "android-runtime";
+        std::error_code code;
+        std::filesystem::create_directories(directory, code);
+        if (code) { error = "无法创建 Android 模式意图目录：" + code.message(); return false; }
+        const auto temporary = directory / (".mode-intent-" + cfg::randomSecret());
+        {
+            std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+            output << value;
+            output.close();
+            if (!output) {
+                std::filesystem::remove(temporary, code);
+                error = "无法写入 Android 模式意图";
+                return false;
+            }
+        }
+        if (!api::CommitFile(temporary, directory / "mode-intent.txt", error)) {
+            std::filesystem::remove(temporary, code);
+            return false;
+        }
+#else
+        static_cast<void>(value);
+        static_cast<void>(error);
+#endif
+        return true;
     }
 
     bool systemProxyOurs() { return false; }

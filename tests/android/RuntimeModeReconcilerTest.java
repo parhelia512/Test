@@ -19,6 +19,25 @@ public final class RuntimeModeReconcilerTest {
     }
 
     public static void main(String[] args) throws Exception {
+        require("rule".equals(RuntimeModeIntent.normalize("Rule")),
+                "the native default Rule must normalize to the UI mode");
+        require("global".equals(RuntimeModeIntent.resolve("GLOBAL")),
+                "UI-owned recovery intent must supply the target mode");
+        require("rule".equals(RuntimeModeIntent.resolve("")),
+                "missing mode intent must default to rule");
+        require("rule".equals(RuntimeModeIntent.resolve("invalid")),
+                "unsupported mode intent must default to rule");
+
+        RuntimeModeReconciler nativeDefault = new RuntimeModeReconciler();
+        nativeDefault.update("Rule");
+        final int[] defaultWrites = {0};
+        require("rule".equals(nativeDefault.reconcile("rule", mode -> ++defaultWrites[0], 100))
+                        && defaultWrites[0] == 0,
+                "native capitalized defaults must not require an unnecessary mode write");
+        nativeDefault.update("unsupported");
+        require("rule".equals(nativeDefault.actualMode()),
+                "unknown callbacks must not replace a confirmed application mode");
+
         RuntimeModeReconciler matching = new RuntimeModeReconciler();
         matching.update("rule");
         final int[] matchingWrites = {0};

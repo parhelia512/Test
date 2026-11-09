@@ -24,8 +24,10 @@ IP 规则集路由只提取目标 CIDR；PAC 由应用提供与接管，不伪�
 本次保持现有 Clash 转换支持范围，不因 fork 导出额外 API 或协议就自动标记为已支持。
 
 - Android `CommandClientHandler` 新增 DNS 查询回调；应用实现空接收函数，但不订阅 DNS 查询流。
-- fork 的 libbox 默认关闭 Clash API；应用构建显式启用 `with_clash_api`，保留现有
-  `experimental.clash_api` 配置和模式语义。其它移动标签沿用固定 fork，不修改内核源码。
+- 移动构建沿用 fork 默认标签，不启用 Clash REST API；编译产物移除
+  `experimental.clash_api`，包括从原生 JSON 继承的配置。Android 的模式、组选择、测速、
+  连接、日志和流量使用 libbox CommandClient，模式设置必须等原生回读确认。
+  route/DNS 的 `clash_mode` 条件由独立模式管理器支持，不依赖 REST server。
 - fork 默认 `lx.mtu_align=clamp`，即使没有配置 `lx` 也可能调整 detour 路径的 MTU/包长。
 - 经 detour 的 TLS-over-TCP 默认开启 record fragmentation；该版实现中
   `record_fragment:false` 仍会被此默认处理覆盖，不能承诺与官方 1.14.4 完全等价。
@@ -50,10 +52,11 @@ IP 规则集路由只提取目标 CIDR；PAC 由应用提供与接管，不伪�
   `Leadaxe/sing-box-lx` `v1.14.4-lx.33`、`2d9a0a52df7881f55484d48f9daecb21d135f3e9`。
   AAR 校验来源、版本、revision、ABI 与内容 SHA256；升级按固定源码逐项复核。
   本次切换不自动扩大 Clash 转换支持矩阵，fork 新增协议/字段仍须单独验证映射和保真度。
-- 启动与实例身份使用内核原生 `StartedService` 的鉴权 gRPC-Web；诊断分别记录原生接口、
-  `clash_api`、统计流和指定业务目标的结果。`clash_api` 保留现有 REST/统计通道，
-  未迁移的操作不宣称已迁移。原生 API 没有任意增删出站的无损配置补丁接口，
-  完整配置仍需预备后交接；细节见 [PPTP 连接交接](native-pptp-handoff.md)。
+- 移动内核由 libbox CommandServer/StartedService 托管，Android 经 CommandClient 和
+  Binder/JNI 控制与回读；不构建 Clash REST server，也不生成 `experimental.clash_api`。
+  模式和流量管理器由 libbox 的平台日志路径初始化，与 REST server 独立。
+  完整配置仍需预备后交接，不能将运行时命令当作任意配置的无损补丁接口。
+  下文涉及桌面鉴权 gRPC-Web、Clash REST 与外部进程的记录属于历史实现。
 
 ### L2 翻译层（处理 Clash 生态）
 

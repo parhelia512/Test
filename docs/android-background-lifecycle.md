@@ -93,19 +93,27 @@ TODO（低优先级）：评估订阅级 UA 覆盖及带真实版本的规范 Cl
 
 ## 出站模式恢复与回读
 
-sing-box `experimental.cache_file` 会持久化实际 Clash 模式；重启时缓存值可能覆盖配置中的
-`experimental.clash_api.default_mode`。因此数据库保存 `core.mode=rule` 并不能证明内核没有从
-`cache.db` 恢复旧的 `direct`。Android 没有桌面 `/configs` HTTP 接口，不能复用桌面协调路径。
+sing-box `experimental.cache_file` 会持久化实际 Clash 模式；移除 Clash REST 配置后，
+原生模式管理器缺省为 `Rule`，缓存还可能恢复旧的 `direct`。数据库保存 `core.mode=rule`
+并不能证明内核当前已经使用该模式。
 
-后台服务从已提交的 `config.json` 读取目标模式，启动数据面后通过 CommandClient 的
-`initializeClashMode` 取得缓存恢复后的实际模式；不一致时调用 `setClashMode`，并等待
-`updateClashMode` 回读确认。确认失败按启动失败关闭数据面，不能提前发布 Running。Starting 阶段
-收到的新模式意图会替换本次启动目标，协调循环在确认前再次检查目标，避免旧启动配置覆盖新选择。
-运行中切换同样等待回调；无 TUN 常驻内核也可热切换，不再只按 VPN connected 判断内核是否可接收命令。
+UI 进程在交付已提交配置前，将 `core.mode` 保存为私有目录中的原子意图文件；
+运行中或停止时改选模式也更新同一文件。后台普通启动、sticky、磁贴和开机恢复
+均读取该目标意图，不访问 UI 数据库。实际模式仍来自 CommandClient 回调。
+模式意图为空或无效时使用 `rule`。后台不读取旧版 `default_mode`，也不迁移或清理旧运行配置；
+直接校验当前编译器生成的配置。
 
-libbox 的可选模式列表来自配置中的 `clash_mode` 规则和 `default_mode`，并不自动包含全部三项。
-编译器在全部策略规则末尾追加与 `route.final` 等价的 `rule` 兜底，避免缺省 direct/global 时
-`SetClashMode("rule")` 被上游静默忽略；兜底不更改原路由出口。
+启动数据面后，CommandClient 的 `initializeClashMode` 取得缓存恢复后的实际模式；
+不一致时调用 `setClashMode`，并等待 `updateClashMode` 回读确认。
+确认失败按启动失败关闭数据面，不能提前发布 Running。Starting 阶段收到的新模式
+意图会替换本次启动目标，协调循环在确认前再次检查目标，避免旧启动覆盖新选择。
+运行中切换同样等待回调；无 TUN 常驻内核也可热切换。启动只以原子比较交换初始化
+内存中的模式意图，避免文件读取覆盖 Starting 阶段已确认接收的新选择。已知模式统一为小写，
+避免原生缺省 `Rule` 与界面 `rule` 的大小写差异。
+
+libbox 的模式列表由配置中的 `clash_mode` 规则推导，不需要 `experimental.clash_api`。
+编译器在全部策略规则末尾追加与 `route.final` 等价的 `rule` 兜底，保证三种模式
+均可通过 CommandClient 选择；兜底不更改原路由出口。
 
 实际模式只保存在后台运行时内存，经现有 Binder `clashMode` 快照和 JNI 发布到 CoreStore；不新增
 SharedPreferences 或数据库第二真相源。停止或尚未取得回调时保留保存意图供预览，Running 时显示实际

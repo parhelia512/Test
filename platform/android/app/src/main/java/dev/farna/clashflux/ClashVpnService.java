@@ -44,6 +44,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -127,7 +128,7 @@ public final class ClashVpnService extends VpnService implements PlatformInterfa
     private final Object clientLock = new Object();
     private final Object clientConnectLock = new Object();
     private final RuntimeModeReconciler modeReconciler = new RuntimeModeReconciler();
-    private volatile String requestedClashMode = "";
+    private final AtomicReference<String> requestedClashMode = new AtomicReference<>("");
     private final RuntimeHealth health = new RuntimeHealth();
     private final ScheduledExecutorService healthExecutor = Executors.newSingleThreadScheduledExecutor(runnable -> {
         Thread thread = new Thread(runnable, "clashflux-status-health");
@@ -461,7 +462,8 @@ public final class ClashVpnService extends VpnService implements PlatformInterfa
             MainActivity.appLog("已找到运行配置，准备校验 libbox 配置", false);
             String configContent = new String(
                     Files.readAllBytes(config.toPath()), StandardCharsets.UTF_8);
-            if (requestedClashMode.isEmpty()) requestedClashMode = configuredClashMode(configContent);
+            requestedClashMode.compareAndSet("", RuntimeModeIntent.resolve(
+                    RuntimeSnapshotStore.readModeIntent(this)));
             configContent = runtimeConfig(configContent, noTun);
             tunHasCustomRoutes = hasCustomTunRoutes(configContent);
             checkpoint = logPreparationStage("config-wait-and-read", checkpoint);
@@ -488,8 +490,8 @@ public final class ClashVpnService extends VpnService implements PlatformInterfa
                 return;
             }
             started = true;
-            // default_mode does not override sing-box cache.db. Confirm the
-            // callback-observed mode before exposing a Running state to the UI.
+            // The cached mode may differ from the UI-owned recovery intent.
+            // Confirm the native callback before exposing Running to the UI.
             if (startRequested && !stopRequested.get()) {
                 synchronized (clientLock) {
                     health.start(SystemClock.elapsedRealtime(), SystemClock.elapsedRealtimeNanos());
@@ -540,7 +542,7 @@ public final class ClashVpnService extends VpnService implements PlatformInterfa
 
     private void reconcileRequestedClashMode(CommandClient activeClient) throws Exception {
         String actual = modeReconciler.reconcileLatest(
-                () -> requestedClashMode, activeClient::setClashMode, 10000);
+                requestedClashMode::get, activeClient::setClashMode, 10000);
         MainActivity.appLog("sing-box 出站模式已确认：" + actual, false);
     }
 
@@ -594,14 +596,6 @@ public final class ClashVpnService extends VpnService implements PlatformInterfa
         // Keep the committed VPN config intact for an actual sticky VPN restore.
         config.put("inbounds", retained);
         return config.toString();
-    }
-    private static String configuredClashMode(String content) throws Exception {
-        JSONObject experimental = new JSONObject(content).optJSONObject("experimental");
-        JSONObject clashApi = experimental == null ? null : experimental.optJSONObject("clash_api");
-        if (clashApi == null) throw new IllegalStateException("运行配置缺少 Clash 模式控制配置");
-        String mode = clashApi.optString("default_mode", "");
-        RuntimeModeReconciler.requireSupported(mode);
-        return mode;
     }
     private void requireTunRequest() {
         if (!RuntimeStartPolicy.allowTun(coreOnly, speedTestOnly, startRequested, stopRequested.get()))
@@ -1420,7 +1414,7 @@ public final class ClashVpnService extends VpnService implements PlatformInterfa
         startRequested = false;
         synchronized (clientLock) { health.stop(); }
         modeReconciler.reset();
-        requestedClashMode = "";
+        requestedClashMode.set("");
         if (healthTask != null) { healthTask.cancel(false); healthTask = null; }
         MainActivity.appLog("VPN 数据面关闭：" + msg, false);
         if (!started && tunnel == null && server == null) {
@@ -1630,15 +1624,15 @@ public final class ClashVpnService extends VpnService implements PlatformInterfa
     public static boolean setClashMode(String mode) {
         ClashVpnService service = current;
         if (service == null || mode == null || mode.isEmpty()) return false;
-        String previous = service.requestedClashMode;
+        String previous = service.requestedClashMode.get();
         try {
             RuntimeModeReconciler.requireSupported(mode);
-            service.requestedClashMode = mode;
+            previous = service.requestedClashMode.getAndSet(mode);
             if (!service.started) return true;
             service.reconcileRequestedClashMode(service.controlClient());
             return true;
         } catch (Exception error) {
-            if (service.started) service.requestedClashMode = previous;
+            if (service.started) service.requestedClashMode.compareAndSet(mode, previous);
             Log.w(TAG, "Unable to set clash mode " + mode, error);
             MainActivity.appLog("出站模式切换失败：" + error.getMessage(), true);
             return false;

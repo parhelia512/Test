@@ -25,5 +25,5 @@ description: 修改 Clash-Flux CMake/CPS 包边界、固定依赖、HuxerUI 或�
 
 ## sing-box
 
-当前移动内核来自 Leadaxe/sing-box-lx `v1.14.4-lx.33`，固定 revision `2d9a0a52df7881f55484d48f9daecb21d135f3e9`。Android/iOS 同源并保留正式 tag 供 ReadTag；AAR 元数据核验 repository/version/revision/ABI/SHA256，不凭旧 AAR 存在继续打包。
+当前移动内核来自 Leadaxe/sing-box-lx `v1.14.4-lx.33`，固定 revision `2d9a0a52df7881f55484d48f9daecb21d135f3e9`。Android/iOS 同源并保留正式 tag 供 ReadTag；移动标签沿用 fork 默认集合，不启用 Clash REST API，控制使用 CommandClient。AAR 元数据核验 repository/version/revision/buildProfile/ABI/SHA256，不凭旧 AAR 存在继续打包。
 升级时同时用 [编译器技能](../clashflux-compiler/SKILL.md) 更新能力/保真度基线，按 [测试技能](../clashflux-test/SKILL.md) 完成回归后再声称升级可用。

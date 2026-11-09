@@ -23,9 +23,10 @@ final class RuntimeModeReconciler {
     }
 
     void update(String mode) {
-        if (mode == null || mode.isEmpty()) return;
+        String normalized = RuntimeModeIntent.normalize(mode);
+        if (normalized.isEmpty()) return;
         synchronized (stateLock) {
-            actualMode = mode;
+            actualMode = normalized;
             stateLock.notifyAll();
         }
     }

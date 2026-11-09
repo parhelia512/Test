@@ -1,10 +1,26 @@
 # L1 / L2 / L3 开发完成度复核
 
+## 2026-11-09：CommandClient 替代 Clash REST 依赖
+
+- 基于 `18abb22` 的工作区，移动构建取消 Clash API 标签，沿用固定 fork 默认集合。
+  AAR buildProfile 改为 `clashflux-lx33-command-client-v1`，旧构建必须重新生成。
+- 共享编译器移除 `experimental.clash_api` 和旧版控制服务注入，保留原生缓存、路由及用户服务。
+  Android 组、选择、组测速、连接、日志、流量继续使用已有 CommandClient 通道。
+- UI 在交付配置或切换模式时，将目标意图原子保存，后台各启动/恢复路径读取同一目标；
+  缓存恢复后仍等待 CommandClient 模式回读确认。发布前调试不保留旧版配置兼容逻辑。
+- 按用户要求停止本机编译；最终变更只完成静态审查。此前五项既有 JVM 回归通过，
+  Android 配置成功，但 native 完整构建被 SweetEditor Windows 路径问题阻塞，Gradle
+  被 wrapper 下载超时阻塞。最终模式改动、新回归、AAR/APK、iOS 与真机均未构建或验收。
+- iOS 仍按实验性 TODO 保留，运行状态和模式桥接未完整接通。详情见
+  [升级记录](singbox-stable-upgrade.md#2026-11-09移除-clash-rest-api使用-commandclient)
+  和 [Android 模式恢复](android-background-lifecycle.md#出站模式恢复与回读)。
+
 ## 2026-11-09：移动内核切换 sing-box-lx
 
 - 基于应用 `c38b09f` 的工作区，固定 Leadaxe/sing-box-lx `v1.14.4-lx.33`、
   `2d9a0a52df7881f55484d48f9daecb21d135f3e9`；真实 tag 与提交已通过 Git 核对。
-- Android/iOS 同源，初始化固定依赖子模块；共用移动构建参数并显式保留 Clash API。
+- Android/iOS 同源，初始化固定依赖子模块；共用移动构建参数。最初额外启用的 Clash API
+  已改为 fork 默认移动标签，当前控制面及验证边界见本页最新的 CommandClient 记录。
   AAR 新增 repository/buildProfile 校验，Android 兼容新增 DNS 查询回调但不订阅该流。
 - 已通过脚本语法、HuxerUI codegen、五项现有宿主 JVM 回归及身份一致性检查。
   Android 主目标因本机缺构建目录/工具链未构建；AAR/APK、iOS、签名、真机 VPN 和

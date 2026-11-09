@@ -15,7 +15,7 @@ description: 修改 Clash-Flux 订阅转换、协议/DNS/规则/provider 映射�
 - 有原生等价用 exact；可表达但语义不同用 approx 并记账；无对应能力先降级记账。应用补齐须证明内核运行/未运行均有定义、失败能回滚且无第二真相源；做不到不做假 UI。
 - 用户条目消失或语义改变用 ctx.note(scope,level,subject,detail,action)；语义不变的运行事件才 ctx.warn。编译失败仍保留已产生 fidelity，JSON 为空不能抹掉 MATCH/依赖错误。
 - CompileResult.fidelity → CoreSnapshot.fidelity，warnings 只是文本投影；指定 profile 的只读保真度页不切活动来源，摘要 toast、分组 ! 角标、CLI profile check 各保留。toast 仅导入/刷新/启用等用户动作后发，不因启停/TUN/模式重编译重复弹。
-- 启动与实例身份用 StartedService 鉴权 gRPC-Web 确认，原生控制面与兼容接口健康分开记录；clash_api 保留 REST/统计流，未迁移操作不宣称已迁移。
+- 移动控制面使用 libbox CommandClient；Android 经 Binder/JNI 发布状态与动作，不依赖 Clash REST。生成配置移除 experimental.clash_api，UI 将启动/切换目标模式原子保存供后台恢复，生效等待原生回读确认；保留 route/DNS 的 clash_mode 匹配与 cache_file 用户策略。
 
 ## 按映射领域读取基线
 

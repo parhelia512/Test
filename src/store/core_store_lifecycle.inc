@@ -127,6 +127,9 @@
             // downloads/checks were running. Reject before replacing config.json.
             if (!checkNetworkConflicts(options, config, prepareError)) { fail(prepareError); return; }
             std::string commitError;
+#if defined(__ANDROID__)
+            if (!publishAndroidModeIntent(mode(), commitError)) { fail(commitError); return; }
+#endif
             if (!api::CommitFile(plan->file, configFile, commitError)) { fail(commitError); return; }
             lastPreparedOptions_ = options;
             lastPreparedJson_ = compiled.json;
@@ -719,20 +722,30 @@
 #endif
     }
 
-    // 切换出站模式（阻塞）。模式是「配置」而不是内核运行前提：内核没起来时
-    // 只写库（下次 startCore 用新配置生成 clash_mode 前置规则），内核真的在
-    // 跑时才热切换；只有热切换被内核拒绝才算失败。
+    // 模式意图持久化供后台恢复，运行中通过 CommandClient 设置并等待回读。
     bool applyMode(const std::string& m) {
         std::lock_guard operationLock(lifecycleMutex_);
         auto healthPause = streams_.pauseHealth();
         ensureOpen();
+        if (m != "rule" && m != "global" && m != "direct") return false;
         bool live = false;
 #if defined(__ANDROID__)
         // 无 TUN 的常驻 libbox 也接受模式热切换；Starting 阶段先把最新
         // 意图交给后台，由启动流程在发布 Running 前协调并确认。
         const int runtimeState = clashflux_android_core_state();
         live = runtimeState == 1 || runtimeState == 2;
-        if (live && !clashflux_android_set_clash_mode(m.c_str())) return false;
+        const auto previous = mode();
+        std::string intentError;
+        if (!publishAndroidModeIntent(m, intentError)) {
+            std::lock_guard lock(mutex_);
+            snap_.lastError = intentError;
+            return false;
+        }
+        if (live && !clashflux_android_set_clash_mode(m.c_str())) {
+            if (!publishAndroidModeIntent(previous, intentError))
+                stream::logApplication("error", "恢复 Android 模式意图失败：" + intentError);
+            return false;
+        }
 #else
         {
             std::lock_guard lock(mutex_);

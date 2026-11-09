@@ -38,7 +38,7 @@ def singboxAarMetadata = layout.buildDirectory.file("libs/libbox-arm64.aar.metad
 def singboxRepository = "https://github.com/Leadaxe/sing-box-lx.git"
 def singboxVersion = "1.14.4-lx.33"
 def singboxRevision = "2d9a0a52df7881f55484d48f9daecb21d135f3e9"
-def singboxBuildProfile = "clashflux-lx33-clash-api-v1"
+def singboxBuildProfile = "clashflux-lx33-command-client-v1"
 def suppliedSingboxAar = providers.environmentVariable("CLASHFLUX_SINGBOX_AAR")
 def stageSingboxAar = tasks.register("stageSingboxAar") {
     inputs.property("repository", singboxRepository)
@@ -385,6 +385,7 @@ def compileRuntimeStartPolicyTest = tasks.register("compileRuntimeStartPolicyTes
     source files("src/main/java/dev/farna/clashflux/RuntimeStartPolicy.java",
             "src/main/java/dev/farna/clashflux/VpnUptime.java",
             "src/main/java/dev/farna/clashflux/RuntimeModeReconciler.java",
+            "src/main/java/dev/farna/clashflux/RuntimeModeIntent.java",
             "../../../tests/android/RuntimeStartPolicyTest.java",
             "../../../tests/android/RuntimeModeReconcilerTest.java",
             "../../../tests/android/VpnUptimeTest.java")

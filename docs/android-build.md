@@ -55,15 +55,19 @@ Gradle `stageSingboxAar` 验证来源和摘要后再复制；无环境变量时�
 Android libbox 构建只浅取正式版本 tag，核对 tag 对应的 HEAD 与固定 revision；
 保留真实 tag，避免上游 `ReadTag()` 在浅取裸 commit 后把版本写成 unknown。
 AAR 元数据包含 repository、version 和 buildProfile，Gradle 同时核验仓库、版本、revision、
-构建配置、ABI 与内容摘要。`buildProfile` 区分本应用启用 Clash API 的构建和 fork 默认构建。
+构建配置、ABI 与内容摘要。当前 `buildProfile=clashflux-lx33-command-client-v1`，
+拒绝复用此前启用 Clash API 的构建，必须重新生成 AAR 和 sidecar。
 自定义 pin 时必须同时提供 `SINGBOX_VERSION` 和 `SINGBOX_COMMIT`，不伪造版本标签。
 
 上游构建要求 OpenJDK 17，脚本在获取源码前检查 JAVA_HOME；Gradle 使用的 JDK
 可以单独配置。CI 使用 Go 1.26.10，对齐 fork 的 `go.version`。
 四个本地替换依赖 wireguard-go/sing-tun/gvisor/utls 按 gitlink 初始化，不跟随子模块分支。
 移动特性标签与链接参数集中在 `platform/singbox-libbox-build.conf`；两平台直接调用
-固定 `make lib_install` 安装的 gomobile，额外启用应用所需的 `with_clash_api`，不改 fork 源码。
-Android 只构建应用消费的 API 24 arm64 AAR。DNS 查询回调已兼容，但应用不订阅 DNS 查询流。
+固定 `make lib_install` 安装的 gomobile，移动标签与 fork 默认集合一致，不启用 Clash REST API。
+Android 只构建应用消费的 API 24 arm64 AAR。模式、代理组、组测速、连接、日志和流量
+由后台 CommandClient 提供，经 Binder/JNI 回传；启动模式意图与回读确认见
+[Android 生命周期](android-background-lifecycle.md#出站模式恢复与回读)。
+DNS 查询回调已兼容，但应用不订阅 DNS 查询流。
 完整升级记录及 fork 默认行为差异见[内核升级](singbox-stable-upgrade.md)和[能力基线](singbox-layers-and-fidelity.md)。
 
 共享 JSON codec 使用固定 Glaze 9.0.0；Android Legacy 头只引用拥有型 DTO，

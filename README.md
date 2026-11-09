@@ -10,7 +10,8 @@ Android 在独立后台进程中运行 sing-box libbox，由 `VpnService` 创建
 实验性 Simulator 构建，仍不承诺真机支持或发布 IPA。
 内核源码固定为 [Leadaxe/sing-box-lx](https://github.com/Leadaxe/sing-box-lx)
 `v1.14.4-lx.33`，提交 `2d9a0a52df7881f55484d48f9daecb21d135f3e9`；
-Android 与实验性 iOS libbox 均从该源码构建。
+Android 与实验性 iOS libbox 均从该源码构建，移动构建不启用 Clash REST API；
+Android 运行控制和状态流通过 libbox CommandClient 与 Binder 传递。
 
 本版本已移除 Windows、Linux、macOS 桌面源码、入口、安装包、桌面服务和 demos。
 不再提供桌面 CLI、系统托盘、系统代理设置、SCM/systemd 服务、桌面内核进程或

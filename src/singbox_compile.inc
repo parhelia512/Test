@@ -296,37 +296,10 @@ void applyManagedSkeleton(Context& ctx, const CompileOptions& opt) {
     if (!config.contains("experimental") || !config["experimental"].is_object()) {
         config["experimental"] = nlohmann::json::object();
     }
-#if defined(__ANDROID__)
-    // Android libbox is controlled through CommandServer/CommandClient, so it
-    // must not listen on the desktop REST port.  A clash_api object is still
-    // required: libbox's internal Clash server reads default_mode from it and
-    // exposes that mode through CommandClient without opening an HTTP socket.
-    config["experimental"]["clash_api"] = {{"default_mode", opt.mode}};
-#else
-    nlohmann::json clashApi = config["experimental"].contains("clash_api") &&
-                                      config["experimental"]["clash_api"].is_object()
-                                  ? config["experimental"]["clash_api"]
-                                  : nlohmann::json::object();
-    clashApi["external_controller"] = opt.controller;
-    if (!opt.secret.empty()) clashApi["secret"] = opt.secret;
-    // mode_list 不是可写配置字段（1.14.2 已移除旧内部 ModeList 成员）：
-    // 内核从 route rules 的 clash_mode 值自动推导模式列表；规则编译末尾另有
-    // 与 route.final 等价的 rule 兜底，保证 default/cache 任意组合下三模式均可选。
-    clashApi["default_mode"] = opt.mode;
-    config["experimental"]["clash_api"] = std::move(clashApi);
-    if (opt.nativeControllerPort != 0) {
-        if (opt.secret.empty() || opt.nativeControllerPort < 1 || opt.nativeControllerPort > 65535) {
-            ctx.result.error = "原生控制接口必须使用有效端口和非空密钥"; return;
-        }
-        if (!config.contains("services")) config["services"] = nlohmann::json::array();
-        if (!config["services"].is_array() || std::ranges::any_of(config["services"], [](const auto& service) {
-            return service.is_object() && service.value("tag", "") == "clash-flux-control";
-        })) { ctx.result.error = "原生控制服务标签 clash-flux-control 冲突"; return; }
-        config["services"].push_back({{"type", "api"}, {"tag", "clash-flux-control"},
-            {"listen", "127.0.0.1"}, {"listen_port", opt.nativeControllerPort},
-            {"secret", opt.secret}, {"dashboard", false}});
-    }
-#endif
+    // Mobile control and mode reconciliation use libbox CommandClient. Remove
+    // imported Clash API settings as well: any clash_api object requests the
+    // optional REST server, even when it contains only default_mode.
+    config["experimental"].erase("clash_api");
     // 原生配置的 FakeIP/RDRC 持久化、路径和 cache_id 属于用户策略，不能
     // 为启用应用缓存而把整个对象覆盖掉。应用只管理 enabled。
     nlohmann::json cacheFile = config["experimental"].contains("cache_file") &&

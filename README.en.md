@@ -11,7 +11,8 @@ presentation. The iOS App and Packet Tunnel remain experimental Simulator integr
 without a promise of device support or an IPA release.
 The core is pinned to [Leadaxe/sing-box-lx](https://github.com/Leadaxe/sing-box-lx)
 `v1.14.4-lx.33`, commit `2d9a0a52df7881f55484d48f9daecb21d135f3e9`;
-Android and experimental iOS libbox builds use this same source.
+Android and experimental iOS libbox builds use this same source without the Clash REST API.
+Android runtime commands and state streams use libbox CommandClient and Binder.
 
 Windows, Linux and macOS desktop sources, entry points, installers, services and demos
 have been removed. Desktop CLI, tray, system-proxy configuration, SCM/systemd services,

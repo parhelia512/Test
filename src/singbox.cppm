@@ -1,11 +1,8 @@
 // singbox.cppm — clashflux.singbox：Clash 订阅 YAML → sing-box JSON 编译器。
 //
-// sing-box 不认识 Clash YAML；全平台（桌面 spawn 进程 / Android libbox）共用
-// 本编译器把订阅（或手写配置、原生 sing-box JSON）合成为 sing-box 运行时
-// 配置。clash_mode 取小写 rule/global/direct（经 clash_api mode_list 自定义，
-// 与 UI 硬编码字符串一致）。保真度第一期：基础协议/组/规则 + GEOIP/GEOSITE
-// → .srs 规则集；不支持的条目（RULE-SET、小众协议等）以警告返回而不是静默
-// 丢弃，调用方呈现给用户。
+// Android libbox 与实验性 iOS 共用本编译器，将订阅或原生 sing-box JSON
+// 合成为运行配置。clash_mode 使用与 UI 一致的小写 rule/global/direct；
+// 模式列表由路由条件推导，切换通过 libbox CommandClient。
 module;
 #include "profile_rules.h"
 #include "network_settings.h"
@@ -194,9 +191,6 @@ export struct CompileOptions {
     clashflux::network::Settings network;
     std::string profileYaml;                     // 订阅/手写配置原文（Clash YAML、
                                                  // 原生 sing-box JSON、OpenVPN .ovpn 或空）
-    std::string controller = "127.0.0.1:29097";  // clash_api external_controller
-    int nativeControllerPort = 0;                // desktop official gRPC API; 0 disables
-    std::string secret;                          // clash_api secret（可空）
     int mixedPort = 7899;
     int httpPort = 0;                            // optional HTTP-only inbound; 0 disables
     int socksPort = 0;                           // optional SOCKS-only inbound; 0 disables

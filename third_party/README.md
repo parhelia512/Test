@@ -35,8 +35,9 @@ Camera、Charts、SQLite、CodeEditor、Media 通过 `huxerui_use_library(URL, C
 
 移动内核由 [Leadaxe/sing-box-lx](https://github.com/Leadaxe/sing-box-lx) 的正式 tag
 `v1.14.4-lx.33`、提交 `2d9a0a52df7881f55484d48f9daecb21d135f3e9` 构建，不存放在 tarball 中。
-Android/iOS 脚本核对 tag 与提交；Android AAR 附带 repository/version/revision/ABI/SHA256
-元数据，Gradle 拒绝旧来源或旧版本缓存。详情见 [Android 构建](../docs/android-build.md)
+Android/iOS 脚本核对 tag 与提交，移动标签与 fork 默认集合一致，不启用 Clash REST API。
+Android AAR 附带 repository/version/revision/buildProfile/ABI/SHA256 元数据，Gradle 拒绝旧来源、
+旧版本或旧构建配置缓存。详情见 [Android 构建](../docs/android-build.md)
 及 [内核升级记录](../docs/singbox-stable-upgrade.md)。
 
 ## 更新某个依赖
