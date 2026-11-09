@@ -352,7 +352,7 @@ std::string FormatHomeUptime(std::int64_t seconds) {
     const auto tasks = huxerui::UseTaskScope();
     auto localSeconds = huxerui::UseState(home.vpnElapsedMs / 1000);
     huxerui::Lifecycle([tasks, localSeconds, elapsed = home.vpnElapsedMs,
-                        running = status.connected] {
+                        running = status.connected]() -> std::function<void()> {
         localSeconds = elapsed / 1000;
         if (!running) return [] {};
         const auto token = tasks.Launch([localSeconds]() -> huxerui::Task<void> {
