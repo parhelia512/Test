@@ -310,7 +310,6 @@ public:
             }
             p.error.clear();
             p.updatedAt = nowUnix();
-            if (p.selected) coreStore().invalidateProxyGroupsSnapshot();
         } else {
             p.error = failure;
             lastError_ = std::format("下载失败：{}", failure);
@@ -575,7 +574,6 @@ p->name = fields.name.empty() ? p->name : fields.name;
                 if (error.empty()) error = "订阅个人规则未能应用";
                 return false;
             }
-            coreStore().invalidateProxyGroupsSnapshot();
             // Publish a content revision even when only this profile's settings changed.
             data.saveProfile(*profile);
             return true;
@@ -595,7 +593,6 @@ p->name = fields.name.empty() ? p->name : fields.name;
         if (!coreStore().validateSourceUpdate(id, content, lastError_, forceProviders)) return false;
         const auto previous = yamlOf(*profile);
         if (!writeContent(*profile, content, lastError_)) return false;
-        coreStore().invalidateProxyGroupsSnapshot();
         if (coreStore().sourceParticipates(id) && coreStore().snapshot().state == core::CoreState::Running &&
             !coreStore().restartCore(coreStore().currentMainContent())) {
             lastError_ = coreStore().snapshot().lastError;
@@ -680,7 +677,6 @@ p->name = fields.name.empty() ? p->name : fields.name;
         }
         // File cleanup is performed by persistence only after the delete
         // commits and no other persisted or cached source references it.
-        if (selectedProfile) coreStore().invalidateProxyGroupsSnapshot();
     }
 
 private:
@@ -691,7 +687,6 @@ private:
             error += "；来源恢复失败：" + failure;
             coreStore().stopCore(); return;
         }
-        coreStore().invalidateProxyGroupsSnapshot();
         try {
             coreStore().db().saveProfile(profile);
             if (restoreRuntime && coreStore().sourceParticipates(profile.id) &&
@@ -865,7 +860,6 @@ private:
             lastError_ = std::format("下载失败：{}", r.error);
             return false;
         }
-        coreStore().invalidateProxyGroupsSnapshot();
         if (coreStore().sourceParticipates(p.id) && coreStore().snapshot().state == core::CoreState::Running) {
             const auto began = std::chrono::steady_clock::now();
             const bool applied = coreStore().restartCore(coreStore().currentMainContent());
@@ -902,7 +896,6 @@ private:
             restoreSource(previousProfile, previousContent, lastError_, true);
             return false;
         }
-        if (p.selected) coreStore().invalidateProxyGroupsSnapshot();
         return true;
     }
 

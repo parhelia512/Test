@@ -80,6 +80,8 @@ struct Proxy {
     bool operator==(const Proxy&) const = default;
 };
 struct Proxies {
+    std::uint64_t runtimeEpoch = 0;
+    std::uint64_t clientGeneration = 0;
     std::map<std::string, Proxy> entries;
     bool operator==(const Proxies&) const = default;
 };

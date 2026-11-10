@@ -1,21 +1,20 @@
 // proxies_model.h — 策略组快照的唯一来源（跨页面共享的 application service）。
 //
-// 此前首页卡片、代理页、托盘菜单各自用 2s / 3s / 1s 的定时器调用
-// ProxyGroupsSnapshot() 拉 /proxies 再各自解析：同一份数据每秒被请求约 1.8 次、
-// 解析三遍；而 REST 失败时会静默回落到「按订阅编译的预览」，UI 完全无法区分
-// 实时数据与预览，用户会以为切换已经生效。
+// 代理页、首页卡片、托盘菜单都只读这里的 State。快照只有一种来源：当前正在
+// 运行的内核（Android 经 Binder 的 CommandClient，桌面经 clash_api）。内核未
+// 运行、未连接或查询失败时快照为 Empty——UI 不保留上一轮结果，也不使用按订阅
+// 编译的预览，避免把「看起来像实时」的旧数据当成当前状态。
 //
-// 现在只有一个拉取器（common.cpp 的 FetchProxiesSnapshot）与一个驱动循环
+// 只有一个拉取器（common.cpp 的 FetchProxiesSnapshot）与一个驱动循环
 // （DriveProxiesModel，在 AppRoot 组合期启动一次，2s 一拍、有请求时立即补一拍），
-// 结果写进这里的 State。三个消费者读同一份 State 即可：State::Write 按
-// operator== 去重，内容没变不会通知订阅者，所以「多一个消费者」不再意味着多一次
-// 网络请求或多一次解析。
+// 结果写进这里的 State。State::Write 按 operator== 去重，内容没变不会通知订阅者。
 #pragma once
 
 #include <huxerui/huxerui.h>
 
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -25,12 +24,13 @@
 
 namespace clashflux::ui {
 
-// 快照来源。Live = 内核/服务实时数据；Preview = 内核未运行时按当前订阅编译出的
-// 预览（可预先选节点）；Empty = 无订阅或编译失败。UI 必须能区分这两者。
+struct CoreModel; // core_model.h（必须先导入 clashflux.store.core）
+
+// 快照来源。Live = 本次从正在运行的内核查询成功；Empty = 内核未运行、会话
+// 已失效或查询失败。UI 不使用订阅编译预览或上一轮结果回退。
 enum class ProxiesSource {
     Empty,
     Live,
-    Preview,
 };
 
 struct ProxiesSnapshot {
@@ -40,8 +40,12 @@ struct ProxiesSnapshot {
     std::string body;                       // 内容版本比较用的原文
     std::shared_ptr<const wire::Proxies> proxies; // 工作线程生成的不可变拥有型 DTO
     ProxiesSource source = ProxiesSource::Empty;
-    // 回落成 Preview 时的原因（REST 失败文本）；Live 时为空。把静默降级变成
-    // 可显示的信息。
+    // 产生本次结果的运行会话（Android 来自 CommandClient 查询；桌面为 0）。
+    // 必须参与去重比较：内核重启后组内容可能逐字节相同，但旧快照已不属于
+    // 当前会话，不能被 State 的相等去重留在页面上。
+    std::uint64_t runtimeEpoch = 0;
+    std::uint64_t clientGeneration = 0;
+    // 本次查询失败时的诊断，不代表可显示的代理数据。
     std::string error;
 
     bool operator==(const ProxiesSnapshot& other) const {
@@ -49,6 +53,8 @@ struct ProxiesSnapshot {
         // on each fetch and must not force State notifications for equal data.
         return loaded == other.loaded && labels == other.labels && groups == other.groups &&
                body == other.body && source == other.source &&
+               runtimeEpoch == other.runtimeEpoch &&
+               clientGeneration == other.clientGeneration &&
                error == other.error;
     }
 };
@@ -72,10 +78,16 @@ struct ProxiesModel {
 void InstallClashFluxUiModels(huxerui::ApplicationContext& context);
 
 // 在 worker 线程上取一次快照（纯阻塞 IO + 解析，不触碰 State）。
-ProxiesSnapshot FetchProxiesSnapshot();
+// runtimeEpoch/clientGeneration 是调用方在 UI 线程读到的当前内核会话；返回体
+// 携带的会话不一致（内核已重启/控制连接已更换）时结果为 Empty。
+ProxiesSnapshot FetchProxiesSnapshot(std::uint64_t runtimeEpoch,
+                                     std::uint64_t clientGeneration);
 
 // 启动唯一的数据泵（组合期调用一次）。写入恒在 UI 线程，内容相等时去重。
+// 内核不在 Running 时不发起查询，并立即发布 Empty 快照实现失效。
 void DriveProxiesModel(huxerui::TaskScope tasks,
-                       std::shared_ptr<ProxiesModel> model);
+                       std::shared_ptr<ProxiesModel> model,
+                       huxerui::State<std::size_t> pagerPage,
+                       std::shared_ptr<CoreModel> coreModel);
 
 } // namespace clashflux::ui

@@ -296,7 +296,6 @@
             data.setSetting("core.network_settings", oldText);
             throw;
         }
-        invalidateProxyGroupsSnapshot();
         return {};
     }
 
@@ -317,93 +316,12 @@
         nativeApi_ = std::move(native);
     }
 
-    // 当前选中订阅的文件路径（无选中/无文件时为空）。
     std::filesystem::path selectedProfileFile() {
         for (const auto& profile : db_->listProfiles()) {
-            if (!profile.selected || profile.type == "pptp" || profile.file.empty()) {
-                continue;
-            }
+            if (!profile.selected || profile.type == "pptp" || profile.file.empty()) continue;
             return cfg::profilesDir() / profile.file;
         }
         return {};
-    }
-
-    // 缓存是否仍是"同一个订阅文件"的快照：文件被替换/重下后自动失效。
-    auto proxySourceObjects(bool preview) {
-        std::lock_guard lock(mutex_);
-        return preview ? previewSourceObjects_ : snap_.sourceObjects;
-    }
-
-    bool proxyGroupsCacheFresh() {
-        const std::filesystem::path file = selectedProfileFile();
-        if (file.empty()) return false;
-        if (compiledProfilesRevision_ != clashflux::persistence::persistence().profilesRevision() ||
-            compiledPolicyText_ != setting("vpn.global_policy", "")) return false;
-        for (const auto& [sourceFile, fingerprint] : compiledSourceFiles_) {
-            std::error_code error;
-            const auto stamp = std::filesystem::last_write_time(sourceFile, error);
-            if (error) return false;
-            const auto bytes = std::filesystem::file_size(sourceFile, error);
-            if (error || stamp != fingerprint.first || bytes != fingerprint.second) return false;
-        }
-        std::error_code ec;
-        const auto stamp = std::filesystem::last_write_time(file, ec);
-        if (ec) return false;
-        const auto size = std::filesystem::file_size(file, ec);
-        if (ec) return false;
-        return stamp == compiledProxyGroupsStamp_ &&
-               size == compiledProxyGroupsSize_;
-    }
-
-    std::string proxyGroupsSnapshot() {
-        {
-            std::lock_guard lock(mutex_);
-            if (!compiledProxyGroups_.empty() && proxyGroupsCacheFresh()) {
-                return compiledProxyGroups_;
-            }
-        }
-
-        // Android's libbox CommandClient does not exist until the VPN service
-        // is started.  Compile the selected subscription on demand so the
-        // proxy page remains usable while the data plane is stopped.  The
-        // selected node is persisted by selectProxy() and will be applied by
-        // the next startCore() compilation.
-        std::lock_guard operationLock(lifecycleMutex_);
-        {
-            std::lock_guard lock(mutex_);
-            if (!compiledProxyGroups_.empty() && proxyGroupsCacheFresh()) {
-                return compiledProxyGroups_;
-            }
-        }
-        ensureOpen();
-
-        std::string profileYaml;
-        for (const auto& profile : db_->listProfiles()) {
-            if (!profile.selected || profile.type == "pptp" || profile.file.empty()) {
-                continue;
-            }
-            std::ifstream input(cfg::profilesDir() / profile.file,
-                                std::ios::binary);
-            if (input) {
-                profileYaml.assign(std::istreambuf_iterator<char>(input),
-                                   std::istreambuf_iterator<char>());
-            }
-            break;
-        }
-        if (profileYaml.empty()) return {};
-
-        try {
-            const auto options = routingOptions(profileYaml, false);
-            auto compiled = core::generateConfig(options);
-            if (compiled.json.empty() || !compiled.error.empty()) return {};
-            auto config = nlohmann::json::parse(compiled.json, nullptr, false);
-            if (!config.is_object()) return {};
-            const std::string snapshot = proxyGroupsFromConfig(config, compiled.sourceObjects);
-            cacheProxyGroups(options, compiled, snapshot);
-            return snapshot;
-        } catch (...) {
-            return {};
-        }
     }
 
     // 只编译、不启动：返回订阅原文的保真度账本。不 spawn、不写盘、不联网
@@ -413,7 +331,7 @@
         std::lock_guard operationLock(lifecycleMutex_);
         if (profileYaml.empty()) return {};
         try {
-            auto options = routingOptions(profileYaml, false, false, nullptr, std::nullopt, nullptr, false);
+            auto options = routingOptions(profileYaml, false, nullptr, std::nullopt, nullptr, false);
             options.auxiliarySources.clear(); options.globalRules.clear(); options.nativeConnections.clear();
             options.mainConnectionId = sourceId;
             const auto compiled = core::generateConfig(options);
@@ -466,7 +384,7 @@
                         return report;
                     }
                 }
-                auto options = routingOptions(content, false, false, nullptr, std::nullopt, nullptr, false);
+                auto options = routingOptions(content, false, nullptr, std::nullopt, nullptr, false);
                 options.auxiliarySources.clear(); options.globalRules.clear(); options.nativeConnections.clear();
                 options.mainConnectionId = routing::ConnectionId(profileId);
                 auto compiled = core::generateConfig(options);
@@ -492,25 +410,19 @@
         return singbox::FidelitySummary(fidelityForProfile(profileId));
     }
 
-    void invalidateProxyGroupsSnapshot() {
-        std::lock_guard lock(mutex_);
-        compiledProxyGroups_.clear();
-    }
-
     bool selectProxy(const std::string& group, const std::string& name) {
-        bool selected = true;
+        bool selected = false;
 #if defined(__ANDROID__)
-        if (clashflux_android_vpn_state() == 2)
-            selected =
-                clashflux_android_select_outbound(group.c_str(), name.c_str());
+        if (clashflux_android_core_state() == 2)
+            selected = clashflux_android_select_outbound(group.c_str(), name.c_str());
+#elif defined(CLASHFLUX_IOS)
+        static_cast<void>(group);
+        static_cast<void>(name);
 #else
         if (snapshot().state == core::CoreState::Running)
             selected = api_->selectProxy(group, name).ok;
 #endif
-        if (!selected) return false;
-        setSetting("proxy.selection." + group, name);
-        invalidateProxyGroupsSnapshot();
-        return true;
+        return selected;
     }
 
     std::string mode() { return setting("core.mode", "rule"); }

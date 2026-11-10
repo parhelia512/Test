@@ -179,6 +179,7 @@ private:
     std::optional<clashflux::network_probe::Request> lastTunProbe_;
     std::unordered_map<std::string,std::optional<bool>> pptpEvidence_;
     std::string binaryPath_;
+    std::string lastProfileYaml_;    // 最近一次 startCore 的订阅原文（resumeNativeRouting 重启用）
     std::unique_ptr<PreparedStart> preparedStart_;
     std::string lastPreparedJson_, lastAppliedJson_;
     std::shared_ptr<const clashflux::connection_trace::Plan> lastPreparedRulePlan_;
@@ -186,16 +187,6 @@ private:
     std::optional<singbox::CompileOptions> preparedOptions_;
     std::optional<singbox::CompileOptions> lastAppliedOptions_;
     std::optional<singbox::CompileOptions> lastPreparedOptions_;
-    std::shared_ptr<const std::vector<singbox::SourceObject>> previewSourceObjects_;
-    std::map<std::filesystem::path, std::pair<std::filesystem::file_time_type, std::uintmax_t>> compiledSourceFiles_;
-    std::string compiledPolicyText_;
-    std::uint64_t compiledProfilesRevision_ = 0;
-    std::string lastProfileYaml_;    // 最近一次 startCore 的订阅原文（applyTun 重启用）
-    std::string compiledProxyGroups_;
-    // 缓存对应的订阅文件指纹：文件被重新下载/替换（手机上"传输失败后手动补
-    // 文件"就是这样）时必须重编，否则进程内会一直返回旧的空快照。
-    std::filesystem::file_time_type compiledProxyGroupsStamp_{};
-    std::uintmax_t compiledProxyGroupsSize_ = 0;
 };
 
 // 进程级单例（apitab g_requests 同款形态）。

@@ -117,7 +117,6 @@ public:
             }
             coreStore().db().setSetting("vpn.global_policy",
                                        detail::EncodePolicy(policy));
-            coreStore().invalidateProxyGroupsSnapshot();
             if (!publishRouting(error)) {
                 const auto failure = error;
                 coreStore().db().setSetting("vpn.global_policy",

@@ -40,6 +40,11 @@ enum PageIndex : std::size_t {
 
 } // namespace pages
 
+// Android/iOS primary Pager is a compact four-slot projection of PageIndex.
+namespace pager_slots {
+inline constexpr std::size_t kProxies = 1;
+}
+
 struct AndroidVpnRuntime {
     bool ready = false;
     int state = 0;
@@ -151,6 +156,9 @@ inline bool AndroidIsIgnoringBattery() noexcept {
 }
 extern "C" int clashflux_android_vpn_state() noexcept;
 inline int AndroidVpnState() noexcept { return clashflux_android_vpn_state(); }
+// android_bridge: 0=stopped, 1=starting, 2=running, 3=failed. The resident
+// core may be Running without a VPN/TUN session, so proxy queries gate on this.
+extern "C" int clashflux_android_core_state() noexcept;
 extern "C" void clashflux_android_vpn_snapshot(bool*, int*, std::int64_t*) noexcept;
 inline AndroidVpnRuntime ReadAndroidVpnRuntime() noexcept {
     AndroidVpnRuntime result;
@@ -168,7 +176,6 @@ extern "C" bool clashflux_android_url_test(const char* group) noexcept;
 inline bool TriggerProxyGroupTest(const std::string& group) noexcept {
     return clashflux_android_url_test(group.c_str());
 }
-inline constexpr bool ProxyTestUsesNativeGroup() noexcept { return true; }
 #else
 inline void AndroidStartVpn() noexcept {}
 inline bool AndroidStopVpn() noexcept { return false; }
@@ -177,13 +184,13 @@ inline void AndroidRequestIgnoreBattery() noexcept {}
 inline void AndroidOpenBatterySettings() noexcept {}
 inline bool AndroidIsIgnoringBattery() noexcept { return false; }
 inline int AndroidVpnState() noexcept { return 0; }
+inline int clashflux_android_core_state() noexcept { return 0; }
 inline AndroidVpnRuntime ReadAndroidVpnRuntime() noexcept { return {}; }
 inline const char* clashflux_android_outbounds() noexcept { return ""; }
 inline const char* clashflux_android_connections() noexcept { return ""; }
 inline bool clashflux_android_close_connection(const char*) noexcept { return false; }
 inline bool clashflux_android_close_all_connections() noexcept { return false; }
-inline bool TriggerProxyGroupTest(const std::string&) noexcept { return true; }
-inline constexpr bool ProxyTestUsesNativeGroup() noexcept { return false; }
+inline bool TriggerProxyGroupTest(const std::string&) noexcept { return false; }
 #endif
 
 // Replace a snapshot-backed collection without storing the whole collection in
@@ -519,6 +526,8 @@ struct SelectableTileColors {
     huxerui::Color faint;
 };
 huxerui::View FittedSingleLineLabel(std::string text, huxerui::TextStyle style,
+    huxerui::TextAlign align = huxerui::TextAlign::Leading);
+huxerui::View FittedSingleLineLabelFill(std::string text, huxerui::TextStyle style,
     huxerui::TextAlign align = huxerui::TextAlign::Leading);
 
 constexpr float kSelectableTileRadius = 8.0F;

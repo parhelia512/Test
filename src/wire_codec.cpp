@@ -82,6 +82,8 @@ struct ProxyInput {
     std::int64_t urlTestTime = 0;
 };
 struct ProxiesInput {
+    std::uint64_t runtimeEpoch = 0;
+    std::uint64_t clientGeneration = 0;
     std::map<std::string, glz::raw_json> proxies;
 };
 struct DelayInput { int delay = 0; };
@@ -405,6 +407,8 @@ Result<Proxies> DecodeProxies(std::string_view text) {
     Result<Proxies> result;
     auto input = codec_detail::decode<codec_detail::ProxiesInput>(text);
     if (!input) { result.error = std::move(input.error); return result; }
+    result.value.runtimeEpoch = input.value.runtimeEpoch;
+    result.value.clientGeneration = input.value.clientGeneration;
     for (const auto& [name, raw] : input.value.proxies) {
         auto entry = codec_detail::decode<codec_detail::ProxyInput>(raw.str);
         if (!entry) { ++result.ignoredEntries; continue; }

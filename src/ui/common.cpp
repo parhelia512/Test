@@ -21,15 +21,14 @@
 #include "app_resources.h"
 #include "proxies_model.h"
 #include "website_test_model.h"
-#include "task_bridge.h"
-#include "ui.h"
 #include "page_layout.h"
 #include "responsive_shell.h"
 #include "app.h"
 #include "file_drop_zone.h"
 #include "profile_file_picker.h"
-#include "proxy_display_name.h"
 #include "settings_group_layout.h"
+#include "task_bridge.h"
+#include "ui.h"
 
 #include "wire_codec.h"
 import clashflux.config;
@@ -322,7 +321,9 @@ std::vector<ProxyGroupSnapshot> ParseProxyGroups(const wire::Proxies& snapshot, 
         for (const auto& node : group.nodes) {
             if (labels.contains(node)) group.nodeLabels[node] = labels.at(node);
             if (const auto found = proxies.find(node); found != proxies.end()) {
-                group.delays[node] = found->second.historyDelay;
+                // Prefer the latest URLTest delay; fall back to the last history
+                // entry exactly like the proxy page projection.
+                group.delays[node] = found->second.delay;
             }
         }
         groups.push_back(std::move(group));
@@ -369,58 +370,59 @@ std::vector<huxerui::MenuEntry> BuildProxyLineMenu(
 
 // ---- 策略组快照：唯一来源（见 proxies_model.h）------------------------------
 
-ProxiesSnapshot FetchProxiesSnapshot() {
+ProxiesSnapshot FetchProxiesSnapshot(std::uint64_t runtimeEpoch,
+                                     std::uint64_t clientGeneration) {
     ProxiesSnapshot next;
     next.loaded = true;
-    std::string body;
 #if defined(__ANDROID__)
     const char* raw = clashflux_android_proxy_groups();
-    // VPN 服务未启动或 Binder 尚未连接时没有实时 CommandClient 快照；此时回落到
-    // 原生 store 的「停止内核」订阅预览，并标明这是预览而非实时。
-    if (raw != nullptr && *raw != '\0' &&
-        std::string_view(raw) != "{\"proxies\":{}}") {
-        body = raw;
-        next.source = ProxiesSource::Live;
-    } else {
-        body = store::coreStore().proxyGroupsSnapshot();
-        next.source = body.empty() ? ProxiesSource::Empty : ProxiesSource::Preview;
+    if (raw == nullptr || *raw == '\0') {
+        next.error = "内核未返回实时代理列表";
+        return next;
     }
+    next.body = raw;
 #else
     const auto result = store::coreStore().api().proxies();
-    if (result.ok) {
-        body = result.body;
-        next.source = ProxiesSource::Live;
-    } else {
-        // 回落是刻意的（停内核时仍要让用户能预先选节点），但把原因记下来，
-        // 页面可以据此提示「当前是预览」，而不是把预览当实时数据展示。
-        body = store::coreStore().proxyGroupsSnapshot();
-        next.source = body.empty() ? ProxiesSource::Empty : ProxiesSource::Preview;
+    if (!result.ok) {
         next.error = result.error;
+        return next;
     }
+    next.body = result.body;
 #endif
-    next.body = std::move(body);
-    if (!next.body.empty()) {
-        auto decoded = wire::DecodeProxies(next.body);
-        if (decoded) {
-            next.proxies = std::make_shared<const wire::Proxies>(std::move(decoded.value));
-            const auto catalog = store::coreStore().proxySourceObjects(next.source == ProxiesSource::Preview);
-            if (catalog) {
-                const bool qualifySources = ShouldQualifyProxySources(*catalog);
-                for (const auto& object : *catalog) {
-                    next.labels[object.tag] = ProxyObjectDisplayName(object.objectId, object.sourceName, qualifySources);
-                }
-            }
-            for (const auto& entry : next.proxies->entries) {
-                const auto& tag = entry.first;
-                if (next.labels.contains(tag)) continue;
-                if (const auto name = DecodeSourceOutboundName(tag)) next.labels[tag] = *name;
-            }
-            next.groups = ParseProxyGroups(*next.proxies, next.labels);
-        } else {
-            next.error = "代理快照解析失败：" + decoded.error;
-            next.source = ProxiesSource::Empty;
-        }
+    auto decoded = wire::DecodeProxies(next.body);
+    if (!decoded) {
+        next.error = "代理快照解析失败：" + decoded.error;
+        next.body.clear();
+        return next;
     }
+    // 查询期间内核可能已被重启，或控制连接已重建；带旧会话编号的结果一律丢弃，
+    // 不能让迟到响应把刚清空的页面重新填上。桌面的 clash_api 响应不带会话字段，
+    // 会话一致性由调用方查询前后的 Running 判断保证。
+#if defined(__ANDROID__)
+    // 0 / UINT64_MAX 表示健康快照尚未到达或服务已被销毁（Java 用 -1 作哨兵），
+    // 此时无法判定会话；放行本次查询，由页面层的 Running + binderAvailable
+    // 决定是否展示，下一拍会带上真实编号。
+    constexpr std::uint64_t kUnknownSession = static_cast<std::uint64_t>(-1);
+    if (runtimeEpoch != 0 && runtimeEpoch != kUnknownSession &&
+        (decoded.value.runtimeEpoch != runtimeEpoch ||
+         decoded.value.clientGeneration != clientGeneration)) {
+        next.error = "代理快照会话已失效";
+        next.body.clear();
+        return next;
+    }
+    next.runtimeEpoch = decoded.value.runtimeEpoch;
+    next.clientGeneration = decoded.value.clientGeneration;
+#else
+    static_cast<void>(runtimeEpoch);
+    static_cast<void>(clientGeneration);
+#endif
+    next.source = ProxiesSource::Live;
+    next.proxies = std::make_shared<const wire::Proxies>(std::move(decoded.value));
+    for (const auto& entry : next.proxies->entries) {
+        const auto& tag = entry.first;
+        if (const auto name = DecodeSourceOutboundName(tag)) next.labels[tag] = *name;
+    }
+    next.groups = ParseProxyGroups(*next.proxies, next.labels);
     return next;
 }
 
@@ -438,13 +440,62 @@ void InstallClashFluxUiModels(huxerui::ApplicationContext& context) {
 }
 
 void DriveProxiesModel(huxerui::TaskScope tasks,
-                       std::shared_ptr<ProxiesModel> model) {
-    tasks.Launch([model]() -> huxerui::Task<void> {
+                       std::shared_ptr<ProxiesModel> model,
+                       huxerui::State<std::size_t> pagerPage,
+                       std::shared_ptr<CoreModel> coreModel) {
+    tasks.Launch([model, pagerPage, coreModel]() -> huxerui::Task<void> {
         for (;;) {
+            if (pagerPage.Get() != pager_slots::kProxies) {
+                model->snapshot = ProxiesSnapshot{};
+                co_await huxerui::Delay(std::chrono::duration<double>{0.25});
+                continue;
+            }
+            const CoreView view = coreModel->view.Get();
+            if (view.core.state != core::CoreState::Running) {
+                // 停止/启动中（含启动失败）：立即失效，不保留上一轮实时结果。
+                // 启动中显示骨架屏（loaded=false），避免闪一下「不可用」。
+                ProxiesSnapshot empty;
+                if (view.core.state != core::CoreState::Starting) {
+                    empty.loaded = true;
+                    empty.error = "代理内核未运行或查询失败，暂无实时数据";
+                }
+                model->snapshot = std::move(empty);
+                co_await huxerui::Delay(std::chrono::duration<double>{0.25});
+                continue;
+            }
+#if defined(__ANDROID__)
+            if (!view.core.binderAvailable) {
+                // 内核状态来自 Binder；通道未就绪/已断开时无法判定实时数据。
+                // 标记本轮已结束并报告不可用，不继续展示骨架或上一轮结果。
+                ProxiesSnapshot empty;
+                empty.loaded = true;
+                empty.error = "代理内核未运行或查询失败，暂无实时数据";
+                model->snapshot = std::move(empty);
+                co_await huxerui::Delay(std::chrono::duration<double>{0.25});
+                continue;
+            }
+#endif
             const std::uint64_t before = model->refreshTick.Get();
-            ProxiesSnapshot next = co_await RunOnTaskThread(FetchProxiesSnapshot);
-            // 取数据在 worker，写 State 恒在 UI 线程；内容相等时 State::Write
-            // 去重，不会引起订阅方重组。
+            const std::uint64_t epoch = view.core.runtimeEpoch;
+            const std::uint64_t generation = view.core.clientGeneration;
+            ProxiesSnapshot next = co_await RunOnTaskThread(
+                [epoch, generation] { return FetchProxiesSnapshot(epoch, generation); });
+            const CoreView after = coreModel->view.Get();
+            const bool sessionValid =
+                after.core.state == core::CoreState::Running &&
+                after.core.runtimeEpoch == epoch &&
+                after.core.clientGeneration == generation
+#if defined(__ANDROID__)
+                && after.core.binderAvailable
+#endif
+                ;
+            if (pagerPage.Get() != pager_slots::kProxies || !sessionValid) {
+                // 页面已离开或会话已更换：迟到结果不得重新填充。内核可能仍在
+                // 运行，短暂等待后重试，既不会把重启误显示成空列表，也不空转。
+                model->snapshot = ProxiesSnapshot{};
+                co_await huxerui::Delay(std::chrono::duration<double>{0.25});
+                continue;
+            }
             model->snapshot = std::move(next);
             if (model->refreshTick.Get() != before) continue;
             co_await huxerui::Delay(std::chrono::duration<double>{2.0});
@@ -525,26 +576,9 @@ bool SelectProxyLine(const std::string& group, const std::string& name) {
 
 bool StartProxyGroupTest(const std::string& group) {
 #if defined(__ANDROID__)
-    try {
-        // Android 的测速内核使用无 TUN 的 libbox 配置；如果当前没有已连接
-        // 的 VPN 服务，先只编译当前配置，再由 Java 启动 speed-test-only
-        // 服务。这样测速不会申请 VPN，也不会接管应用流量。
-        if (clashflux_android_vpn_state() != 2) {
-            auto& core = store::coreStore();
-            core.startCore(store::profilesStore().selectedYaml(), false, false,
-                           std::nullopt, true);
-            if (core.snapshot().state == core::CoreState::Failed) return false;
-        }
-        return clashflux_android_url_test(group.c_str());
-    } catch (...) {
-        return false;
-    }
+    if (clashflux_android_core_state() != 2) return false;
+    return clashflux_android_url_test(group.c_str());
 #else
-    // 桌面节点测速通过内核 delay API 完成。测速依赖内核但不需要接管流量，
-    // 应用启动先保持无代理入站的待命内核；测速不开放代理端口或恢复接管。
-    if (store::coreStore().snapshot().state != core::CoreState::Running) {
-        return false;
-    }
     return TriggerProxyGroupTest(group);
 #endif
 }

@@ -201,7 +201,6 @@ export struct CompileOptions {
                                                  // 均按当前 TUN 状态决定；Android
                                                  // 由 VpnService 提供 fd）
     bool proxyListening = true;                 // false: keep control/outbounds, suspend traffic inbounds
-    bool speedTestOnly = false;                  // 仅测速内核；保留 URLTest 组的订阅测速地址
     bool tunStrictRoute = true;                  // Android VpnService 侧保持 false（严格
                                                  // 路由会截断系统级分流）
     int tunMtu = 1400;
@@ -266,63 +265,5 @@ export bool ValidateHttpProxyProvider(const HttpProxyProviderResource& resource,
 export bool RuleSetCacheValid(const std::filesystem::path& path);
 // 返回应用自有 GEO tag 的固定下载来源；非法 tag 返回空，不能拼成路径。
 export std::string BuiltinRuleSetUrl(std::string_view tag);
-
-// 把编译产物拍成代理页使用的 /proxies 形状快照：
-//   * 组出站（selector/urltest）→ {type, now, all, selectable}
-//   * 其余出站 → {type, udp}（代理页卡片第二行的协议/UDP 元数据；内核没跑时的
-//     "订阅预览"没有真实 /proxies，这里是唯一数据源）
-// savedSelection(tag) 返回该组持久化的选中项（空串 = 没有）；命中成员时写回
-// `now`，并同步落到 `config` 里该 selector 的 `default`（写盘配置与 UI 一致）。
-// config 为空或形态不对时返回只有空 proxies 对象的快照。
-export inline std::string BuildProxySnapshot(
-    nlohmann::json& config,
-    const std::function<std::string(const std::string&)>& savedSelection = {}, bool* configChanged = nullptr) {
-    if (configChanged) *configChanged = false;
-    nlohmann::json proxies = nlohmann::json::object();
-    if (!config.is_object() || !config.contains("outbounds") ||
-        !config["outbounds"].is_array()) {
-        return nlohmann::json{{"proxies", proxies}}.dump();
-    }
-    // 先补每个节点自己的条目：代理页卡片第二行的协议/UDP 读的就是它。只写组
-    // 条目时（旧行为）parseProxies 在 all 里找不到节点对象，预览态永远是空的。
-    for (const auto& outbound : config["outbounds"]) {
-        const std::string type = outbound.value("type", "");
-        if (type == "selector" || type == "urltest") continue;  // 组条目下面生成
-        const std::string tag = outbound.value("tag", "");
-        if (tag.empty() || type.empty()) continue;
-        // 只写真实存在的类型；UDP 能力是服务端策略、客户端快照里没有，
-        // 不在这里臆测（只有内核 /proxies 真给了 udp 才由 UI 显示）。
-        proxies[tag] = {{"type", type}};
-    }
-    for (auto& outbound : config["outbounds"]) {
-        const std::string type = outbound.value("type", "");
-        if (type != "selector" && type != "urltest") continue;
-        const std::string group = outbound.value("tag", "");
-        if (group.empty()) continue;
-        const auto members =
-            outbound.value("outbounds", nlohmann::json::array());
-        std::string current = outbound.value("default", "");
-        const std::string saved =
-            savedSelection ? savedSelection(group) : std::string{};
-        if (type == "selector" && !saved.empty()) {
-            for (const auto& member : members) {
-                if (member == saved) {
-                    if (current != saved) {
-                        outbound["default"] = saved;
-                        if (configChanged) *configChanged = true;
-                    }
-                    current = saved;
-                    break;
-                }
-            }
-        }
-        if (current.empty() && !members.empty()) {
-            current = members.front().get<std::string>();
-        }
-        proxies[group] = {{"type", type}, {"now", current}, {"all", members},
-                          {"selectable", type == "selector"}};
-    }
-    return nlohmann::json{{"proxies", proxies}}.dump();
-}
 
 } // namespace singbox

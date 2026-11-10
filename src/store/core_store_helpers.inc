@@ -5,7 +5,6 @@
         singbox::CompileOptions options;
         singbox::CompileResult compiled;
         nlohmann::json config;
-        std::string proxyGroups;
         std::filesystem::path directory, file;
         ~PreparedStart() {
             std::error_code ignored;
@@ -128,16 +127,8 @@
         auto& config = plan->config;
         if (!config.is_object()) { error = "订阅编译结果不是合法 JSON 对象"; return {}; }
         if (inspectNetwork && !checkNetworkConflicts(options, config, error)) return {};
-        bool selectorChanged = false;
-        plan->proxyGroups = proxyGroupsFromConfig(config, plan->compiled.sourceObjects, options.mainConnectionId, &selectorChanged);
-        if (selectorChanged) {
-            plan->compiled.json = config.dump();
-            candidateChecked = false;
-        }
         if (cancel.stop_requested()) return {};
         trace("projection-and-json");
-        // Provider preparation already checked these exact final bytes. Only a
-        // GEO recompile or selector projection invalidates that result.
         if (!candidateChecked && !checkCompiledPlan(plan->compiled, error)) return {};
 #if defined(__ANDROID__) || defined(CLASHFLUX_IOS)
         trace("check-deferred-to-libbox");
@@ -175,63 +166,10 @@
         return plan;
     }
 
-    void cacheProxyGroups(const singbox::CompileOptions& options, singbox::CompileResult& compiled,
-                          std::string snapshot) {
-        // 记下这份快照对应的订阅文件指纹（mtime + 大小）：文件被重新下载或
-        // 替换后缓存自动失效，不会一直返回旧的空快照。
-        const std::filesystem::path file = selectedProfileFile();
-        std::error_code ec;
-        const auto stamp = std::filesystem::last_write_time(file, ec);
-        const auto size = ec ? 0 : std::filesystem::file_size(file, ec);
+    void publishCompiledSources(const singbox::CompileResult& compiled) {
         std::lock_guard lock(mutex_);
-        compiledProxyGroups_ = std::move(snapshot);
-        compiledProxyGroupsStamp_ = ec ? std::filesystem::file_time_type{}
-                                       : stamp;
-        compiledProxyGroupsSize_ = ec ? 0 : size;
-        compiledSourceFiles_.clear();
-        for (const auto& profile : db_->listProfiles()) {
-            const auto id = routing::ConnectionId(profile.id);
-            if (profile.file.empty() || (!profile.selected &&
-                !std::ranges::any_of(options.auxiliarySources, [&](const auto& source) { return source.id == id; }))) continue;
-            const auto sourceFile = cfg::profilesDir() / profile.file;
-            std::error_code error;
-            const auto sourceStamp = std::filesystem::last_write_time(sourceFile, error);
-            const auto bytes = error ? 0 : std::filesystem::file_size(sourceFile, error);
-            if (!error) compiledSourceFiles_[sourceFile] = {sourceStamp, bytes};
-        }
-        // 预览编译同样产出保真度账本：让「配置保真度」报告在内核没跑时也
-        // 有内容（startCore 那条路径看到的是同一份订阅）。
-        previewSourceObjects_ = std::make_shared<const std::vector<singbox::SourceObject>>(std::move(compiled.sourceObjects));
-        if (snap_.state != core::CoreState::Running && snap_.state != core::CoreState::Starting) {
-            snap_.fidelity = std::move(compiled.fidelity);
-            snap_.sourceObjects = previewSourceObjects_;
-        }
-        compiledProfilesRevision_ = clashflux::persistence::persistence().profilesRevision();
-        compiledPolicyText_ = setting("vpn.global_policy", "");
-    }
-
-    // 代理页快照（组 + 每节点 type/udp）由 clashflux.singbox 的纯函数生成，
-    // 便于单测；这里只把「持久化的组选中项」从 settings 里喂进去。
-    std::string proxyGroupsFromConfig(nlohmann::json& config,
-        const std::vector<singbox::SourceObject>& objects = {}, std::string main = {}, bool* configChanged = nullptr) {
-        if (main.empty()) for (const auto& profile : db_->listProfiles())
-            if (profile.selected) main = routing::ConnectionId(profile.id);
-        return singbox::BuildProxySnapshot(config, [this, &objects, &main](const std::string& group) {
-            const auto key = "proxy.selection." + group;
-            auto saved = setting(key, "");
-            if (!saved.empty()) return saved;
-            // 仅当前 main 迁移历史无来源键；次来源不继承其它订阅的同名选择。
-            for (const auto& object : objects) {
-                if (object.tag != group || object.sourceId != main || object.kind != vpn::TargetKind::Group) continue;
-                const auto legacy = setting("proxy.selection." + object.objectId, "");
-                for (const auto& member : objects) {
-                    if (member.sourceId == main && member.objectId == legacy) {
-                        setSetting(key, member.tag); return member.tag;
-                    }
-                }
-            }
-            return std::string{};
-        }, configChanged);
+        snap_.sourceObjects = std::make_shared<const std::vector<singbox::SourceObject>>(
+            compiled.sourceObjects);
     }
 
     static void applyNetworkOptions(singbox::CompileOptions& options, const clashflux::network::Settings& value) {
@@ -248,7 +186,7 @@
 
     inline singbox::CompileOptions routingOptions(
         const std::string& profileYaml, bool tunEnabled,
-        bool speedTestOnly = false, const vpn::VpnPolicy* overridePolicy = nullptr,
+        const vpn::VpnPolicy* overridePolicy = nullptr,
         const std::optional<std::string>& mainOverride = std::nullopt,
         const singbox::ProfileSource* updated = nullptr, bool includeAuxiliary = true) {
         singbox::CompileOptions options;
@@ -257,7 +195,6 @@
         options.mode = mode();
         options.logLevel = logLevel();
         options.tunInbound = tunEnabled;
-        options.speedTestOnly = speedTestOnly;
         options.ruleSetDir = cfg::coreWorkDir().string();
         options.ruleProviderDir = cfg::dataDir().string();
         options.ruleProviderCacheDir = (cfg::coreWorkDir() / "rule-providers").string();

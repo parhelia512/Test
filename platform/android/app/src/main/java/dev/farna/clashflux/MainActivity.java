@@ -661,35 +661,6 @@ public final class MainActivity extends HuxerUIActivity {
         }
     }
 
-    /** Starts libbox without requesting VPN consent for proxy-page speed tests. */
-    public static void startSpeedTestService() {
-        Context context = applicationContext;
-        MainActivity activity = current;
-        if (activity != null) context = activity.getApplicationContext();
-        if (context == null) {
-            appLog("无法启动测速内核：Activity 尚未就绪", true);
-            return;
-        }
-        final Context serviceContext = context;
-        Runnable start = () -> {
-            try {
-                Intent intent = new Intent(serviceContext, ClashVpnService.class);
-                intent.putExtra(ClashVpnService.EXTRA_SPEED_TEST_ONLY, true);
-                if (Build.VERSION.SDK_INT >= 26) {
-                    serviceContext.startForegroundService(intent);
-                } else {
-                    serviceContext.startService(intent);
-                }
-                appLog("已请求启动无 VPN 的测速内核", false);
-            } catch (RuntimeException error) {
-                Log.e(TAG, "Unable to start speed-test service", error);
-                appLog("测速内核启动失败：" + error.getMessage(), true);
-            }
-        };
-        if (activity != null) activity.runOnUiThread(start);
-        else start.run();
-    }
-
     /** Starts the resident libbox core without requesting VPN consent or TUN. */
     public static boolean startCoreOnly() {
         Context context = applicationContext;

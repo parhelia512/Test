@@ -918,13 +918,15 @@ void InstallProfileLinkActivation(huxerui::ApplicationContext& context,
     // 平台刷新泵和应用生命周期各自由平台组件收束，通用壳层只挂载它们。
 
     // 策略组快照的唯一数据泵：首页卡片、代理页、托盘菜单都只读 ProxiesModel
-    // 的 State，不再各自拉 /proxies（此前是 2s/3s/1s 三条独立轮询 + 三次解析）。
+    // 的 State，不再各自拉 /proxies。泵在每次查询前后都校验内核会话，停止、
+    // Binder 断开或内核重启后不保留任何上一轮结果。
     const auto proxiesModel = huxerui::UseService<ProxiesModel>();
+    const auto coreModel = huxerui::UseService<CoreModel>();
     huxerui::Lifecycle(
-        [applicationTasks, runtimeServices, proxiesModel] {
+        [applicationTasks, runtimeServices, proxiesModel, coreModel, pagerPage] {
             if (!runtimeServices->proxiesPumpStarted) {
                 runtimeServices->proxiesPumpStarted = true;
-                DriveProxiesModel(applicationTasks, proxiesModel);
+                DriveProxiesModel(applicationTasks, proxiesModel, pagerPage, coreModel);
             }
             return [] {};
         },
@@ -933,7 +935,6 @@ void InstallProfileLinkActivation(huxerui::ApplicationContext& context,
     // 内核/接管状态的唯一数据泵：首页三张桌面卡片、代理页、设置页、内核设置段与
     // 托盘菜单都只读 CoreModel 的 State，不再各自读 coreStore()（此前是
     // 0.5s×4 + 1s×2 六条轮询，托盘那条还带 2Hz 的子进程/HTTP 探测）。
-    const auto coreModel = huxerui::UseService<CoreModel>();
     huxerui::Lifecycle(
         [applicationTasks, runtimeServices, coreModel] {
             if (!runtimeServices->corePumpStarted) {

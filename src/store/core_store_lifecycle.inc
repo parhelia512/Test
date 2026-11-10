@@ -45,7 +45,6 @@
     void startCore(const std::string& profileYaml, bool startDetached = false,
                    bool tunEnabled = false,
                    std::optional<bool> systemProxyState = std::nullopt,
-                   bool speedTestOnly = false,
                    bool repairRuleSetCache = true,
                    bool startVpn = true) {
         std::lock_guard operationLock(lifecycleMutex_);
@@ -54,8 +53,7 @@
         // 「启动中拒绝重入」的保护会因此挡掉之后所有启动，直到重启应用。
         try {
             startCoreUnchecked(profileYaml, startDetached, tunEnabled,
-                               systemProxyState, speedTestOnly,
-                               repairRuleSetCache, startVpn);
+                               systemProxyState, repairRuleSetCache, startVpn);
         } catch (const std::exception& exception) {
             settleStartFailure(std::string{"内核启动异常："} + exception.what());
         } catch (...) {
@@ -81,7 +79,6 @@
     void startCoreUnchecked(const std::string& profileYaml, bool startDetached = false,
                             bool tunEnabled = false,
                             std::optional<bool> systemProxyState = std::nullopt,
-                            bool speedTestOnly = false,
                             bool repairRuleSetCache = true,
                             bool startVpn = true) {
         static_cast<void>(startDetached);
@@ -115,7 +112,7 @@
             std::string prepareError;
             if (!plan) {
                 auto options = preparedOptions_ ? std::move(*preparedOptions_) :
-                    routingOptions(profileYaml, tunEnabled, speedTestOnly);
+                    routingOptions(profileYaml, tunEnabled);
                 preparedOptions_.reset();
                 plan = prepareStartPlan(std::move(options), prepareError);
             }
@@ -134,11 +131,10 @@
             lastPreparedOptions_ = options;
             lastPreparedJson_ = compiled.json;
             lastPreparedRulePlan_ = std::make_shared<const clashflux::connection_trace::Plan>(std::move(compiled.rulePlan));
-            cacheProxyGroups(options, compiled, std::move(plan->proxyGroups));
+            publishCompiledSources(compiled);
             std::lock_guard lock(mutex_);
             snap_.warnings = std::move(compiled.warnings);
             snap_.fidelity = std::move(compiled.fidelity);
-            snap_.sourceObjects = previewSourceObjects_;
             snap_.participatingSources = std::move(compiled.participatingSources);
         }
 
@@ -151,15 +147,12 @@
             snap_.allowLan = false;
             snap_.logLevel = logLevel();
             snap_.tunEnabled = tunEnabled && startVpn;
-            snap_.state = (tunEnabled && startVpn) || speedTestOnly
-                              ? core::CoreState::Stopped : core::CoreState::Starting;
+            snap_.state = core::CoreState::Starting;
         }
-        if (!speedTestOnly) {
-            if (tunEnabled && startVpn) {
-                clashflux_android_start_vpn();
-            } else if (!clashflux_android_start_core()) {
-                fail("无法启动 Android sing-box 内核服务");
-            }
+        if (tunEnabled && startVpn) {
+            clashflux_android_start_vpn();
+        } else if (!clashflux_android_start_core()) {
+            fail("无法启动 Android sing-box 内核服务");
         }
         return;
 #else
@@ -276,7 +269,7 @@
         bool selectedChanged = false;
         try {
             if (cancel.stop_requested()) return false;
-            auto options = routingOptions(content, before.tunEnabled, false, nullptr, routing::ConnectionId(id));
+            auto options = routingOptions(content, before.tunEnabled, nullptr, routing::ConnectionId(id));
 #if !defined(__ANDROID__) && !defined(CLASHFLUX_IOS)
             if (running) options.proxyListening = before.proxyListening;
 #endif
@@ -287,24 +280,19 @@
             if (cancel.stop_requested()) return false;
             db_->setSelectedProfile(id);
             selectedChanged = true;
-            invalidateProxyGroupsSnapshot();
             if (running) {
                 if (!restartPreparedCore(content, std::move(candidate), before, proxy, false, cancel, began)) {
                     if (!cancel.stop_requested()) error = snapshot().lastError;
                     db_->setSelectedProfile(previous);
-                    invalidateProxyGroupsSnapshot();
                     return false;
                 }
             } else {
-                cacheProxyGroups(candidate->options, candidate->compiled, std::move(candidate->proxyGroups));
+                publishCompiledSources(candidate->compiled);
             }
             if (fidelitySummary) *fidelitySummary = summary;
             return true;
         } catch (const std::exception& exception) {
-            if (selectedChanged) {
-                db_->setSelectedProfile(previous);
-                invalidateProxyGroupsSnapshot();
-            }
+            if (selectedChanged) db_->setSelectedProfile(previous);
             error = exception.what();
             return false;
         }
@@ -320,7 +308,7 @@
         ensureOpen();
         try {
             if (cancel.stop_requested()) return false;
-            auto options = routingOptions(profileYaml, snapshot().tunEnabled, false, policy, main);
+            auto options = routingOptions(profileYaml, snapshot().tunEnabled, policy, main);
             singbox::CompileResult compiled;
             bool candidateChecked = false;
             if (!prepareHttpRuleProviders(options, compiled, error, policy, cancel, nullptr,
@@ -415,7 +403,6 @@
                 if (error.empty()) error = "规则集未能应用";
                 return false;
             }
-            invalidateProxyGroupsSnapshot();
             return true;
         } catch (const std::exception& exception) { error = exception.what(); return false; }
     }
@@ -454,7 +441,7 @@
     singbox::CompileResult profileRulesPreview(std::int64_t id, const std::string& content) {
         std::lock_guard lock(lifecycleMutex_);
         ensureOpen();
-        auto options = routingOptions(content, false, false, nullptr,
+        auto options = routingOptions(content, false, nullptr,
             routing::ConnectionId(id), nullptr, false);
         auto result = singbox::compileConfig(options);
         if (result.error.empty() && !result.json.empty()) {
@@ -472,7 +459,7 @@
     bool validateProfileRuleSource(std::int64_t id, const std::string& content, std::string& error) {
         std::lock_guard lock(lifecycleMutex_);
         ensureOpen();
-        auto options = routingOptions(content, false, false, nullptr,
+        auto options = routingOptions(content, false, nullptr,
             routing::ConnectionId(id), nullptr, false);
         singbox::CompileResult compiled;
         bool candidateChecked = false;
@@ -558,7 +545,7 @@
             bool main = false;
             for (const auto& profile : db_->listProfiles()) if (profile.id == id && profile.selected) main = true;
             auto options = routingOptions(main ? content : currentMainContent(), snapshot().tunEnabled,
-                                          false, nullptr, std::nullopt, &updated);
+                                          nullptr, std::nullopt, &updated);
             if (forceProviderRefresh) options.forceProviderRefreshSources.insert(sourceId);
             if (sourceId == options.mainConnectionId) options.profileYaml = content;
             else {
@@ -616,7 +603,7 @@
             const bool participating = options.mainConnectionId == sourceId ||
                 std::ranges::any_of(options.auxiliarySources, [&](const auto& source) { return source.id == sourceId; });
             if (!participating) {
-                options = routingOptions(expectedContent, false, false, nullptr, sourceId, nullptr, false);
+                options = routingOptions(expectedContent, false, nullptr, sourceId, nullptr, false);
                 options.auxiliarySources.clear(); options.globalRules.clear(); options.nativeConnections.clear();
             }
             options.refreshProviderKey = selected.cacheKey;

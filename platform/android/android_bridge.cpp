@@ -397,7 +397,7 @@ Java_dev_farna_clashflux_MainActivity_nativeStartCore(JNIEnv*, jclass) {
                 // 悬浮按钮 / 设置开关 / 快捷磁贴）或服务回收恢复拉起。Java 侧
                 // 对 core-only 请求自带保护：VPN 存活时保留隧道模式不重启。
                 core.startCore(store::profilesStore().selectedYaml(), false,
-                               tunEnabled, std::nullopt, false, true,
+                               tunEnabled, std::nullopt, true,
                                /*startVpn=*/false);
                 log_android(tunEnabled
                     ? "Android sing-box core started with the persisted VPN/TUN mode"

@@ -26,24 +26,19 @@
 // 挂按钮；Compact 悬浮导航之上留出内缩量。
 //
 // 数据流：只读 ProxiesModel 的 State（AppRoot 驱动的唯一来源），原文变化时才
-// 到任务线程解析，只同步有变化的组。测速 / 切节点
-// 都是阻塞 REST，全部走 RunOnTaskThread；点击事件处理器内不直接写 State
-// （约定 6），只 Launch 协程。
+// 到任务线程解析，只同步有变化的组。测速 / 切节点均走运行内核的 CommandClient
+// 或桌面 API，所有阻塞调用在 worker 上执行；页面仅展示内核实时回写的数据。
 #include <huxerui/huxerui.h>
 
 #include "app_resources.h"
 
 #include <algorithm>
 #include <chrono>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <fstream>
-#include <iterator>
+#include <format>
 #include <map>
-#include <optional>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -58,11 +53,8 @@
 #include "proxy_node_tile.h"
 
 #include "wire_codec.h"
-import clashflux.config;
 import clashflux.core;
-import clashflux.singbox;
 import clashflux.store.core;
-import clashflux.utils;
 
 // CoreView 含 store::CoreSnapshot，必须在模块导入之后（同 profiles_cache.h）。
 #include "core_model.h"
@@ -74,9 +66,7 @@ struct ProxyNode {
     std::string name;
     std::string displayName;
     std::string type;
-    int delay = 0;      // 0 = 未测；来自 history 或测速结果
-    std::int64_t urlTestTime = 0;
-    bool timeout = false;
+    int delay = 0;      // 0 = 未测；只来自本次内核查询回写的 history/urlTestDelay
     bool udp = false;
     bool isGroup = false;      // 该节点本身是策略组（订阅里的 url-test 分支）
     // 卡片第二行的元数据（协议大写 [+ " · UDP" 仅当内核真给了 udp]）：
@@ -135,7 +125,6 @@ std::vector<ProxyGroup> parseProxies(const std::shared_ptr<const wire::Proxies>&
                 node.udp = found->second.udp;
                 node.isGroup = isGroupType(node.type);
                 node.delay = found->second.delay;
-                node.urlTestTime = found->second.testTime;
             }
             node.detail = BuildNodeDetail(node);
             group.nodes.push_back(std::move(node));
@@ -330,104 +319,47 @@ constexpr float kProxyNodeWidth = 196.0F;
 // 桌面右下角悬浮测速按钮的滚动尾部净空：56pt 按钮 + 24pt 底部外边距。
 constexpr float kSpeedFabFooterHeight = 80.0F;
 
-// 延迟槽能放下的字符数（"测速中…"/"99999 ms"），超出截断成省略号。
+// sing-box CommandClient owns URLTest and its configured timeout.
 constexpr std::size_t kNodeMetaChars = 8;
-// sing-box constant.TCPTimeout；单节点和组测速都使用内核同一上限。
-constexpr int kProxyDelayTimeoutMs = 15000;
-
-huxerui::Task<int> MeasureProxyDelay(const std::string& tag) {
-    co_return co_await RunOnTaskThread([tag] {
-        // Empty URL lets sing-box use its own default test URL (HTTPS
-        // www.gstatic.com/generate_204), matching CommandClient.urlTest and
-        // /proxies/{name}/delay without an explicit url parameter.
-        const auto result = store::coreStore().api().proxyDelay(tag, "", kProxyDelayTimeoutMs);
-        if (!result.ok) return 0;
-        const auto delay = wire::DecodeDelay(result.body);
-        return delay ? delay.value : 0;
-    });
-}
-
-huxerui::Task<std::map<std::string, int>> MeasureProxyGroupDelay(const std::string& group) {
-    co_return co_await RunOnTaskThread([group] {
-        // Native group test: URLTest groups use their own url-test.url;
-        // other groups use the kernel's default test URL. The kernel runs
-        // the batch itself with its native concurrency and history updates.
-        const auto result = store::coreStore().api().groupDelay(group, kProxyDelayTimeoutMs);
-        if (!result.ok) return std::map<std::string, int>{};
-        auto decoded = wire::DecodeGroupDelays(result.body);
-        return decoded ? std::move(decoded.value) : std::map<std::string, int>{};
-    });
-}
 
 // 节点矩形卡：名称占两行，底部元数据左侧可收缩，右侧固定为测速槽。
 // （组类型节点写「组·分支当前选中」），延迟按区间着色；选中态 primary 底。
 // 宽度由 VirtualGrid 均分，高度由 EstimatedRowExtent 提供估计。
 [[huxerui::composable]] huxerui::View NodeCard(
     const ProxyNode& node, bool selected,
-    bool selectable, std::function<void()> onActivate, std::size_t detailLimit) {
+    bool selectable, std::function<void()> onActivate) {
     const huxerui::ThemeSpec& theme = huxerui::UseTheme();
-    const auto tasks = huxerui::UseApplicationTaskScope();
-    const auto coreModel = huxerui::UseService<CoreModel>();
-    const auto toast = UseFluxToast();
     const auto tests = huxerui::UseService<ProxiesModel>()->tests;
     static_cast<void>(tests->generation.Get()); // Rebind after a runtime-plan change.
-    const auto entry = tests->Get(node.name, node.delay, node.timeout, node.urlTestTime);
-    const auto probe = entry->value;
-    huxerui::Lifecycle([entry, nodeDelay = node.delay, nodeTestTime = node.urlTestTime] {
-        if (!entry->value.Get().testing && nodeTestTime > 0 && nodeTestTime != entry->baselineTime.Get()) {
-            entry->value = ProbeState{nodeDelay > 0 ? nodeDelay : 0, nodeDelay <= 0, false};
-            entry->baselineTime = nodeTestTime;
-        }
-    }, node.delay, node.urlTestTime);
+    const bool testing = tests->progress.Get().busy;
+    const int delay = node.delay;
 
-    const ProbeState currentProbe = probe.Get();
-    const int delay = currentProbe.delay;
-    const bool timeout = currentProbe.timeout;
-
-    // 右侧槽位只放"测速结果"：
-    //   测速中… / N ms / 超时（**仅真正测过且失败**）/ 空占位（从未测过）。
-    // 以前把 delay==0 一律画成"超时"，未测速的节点满屏红字，现在留空但保留等宽
-    // 占位，卡片之间仍然对齐。
+    // 延迟只来自本次 CommandClient 快照；UI 不保留上一轮测速结果，也不自行生成超时。
     std::string meta;
-    if (!node.isGroup) {
-        if (currentProbe.testing) {
-            meta = "测速中…";
-        } else if (delay > 0) {
-            meta = std::format("{} ms", delay);
-        } else if (timeout) {
-            meta = "超时";
-        }
+    if (!node.isGroup && testing) {
+        meta = "测速中…";
+    } else if (!node.isGroup && delay > 0) {
+        meta = std::format("{} ms", delay);
     }
-    // 第二行与延迟都在卡片宽度内截断成省略号：huxerui 的 Text 没有省略号能力，
-    // 与名称用同一套字符预算（延迟槽更窄，预算更小）。短字符串走 SSO，不额外
-    // 分配。第二行元数据本身在解析期算好（见 ProxyNode::detail）。
-    const std::string detail =
-        node.detail.size() > detailLimit ? truncateOneLine(node.detail, detailLimit)
-                                         : node.detail;
+    const std::string detail = node.detail;
     const std::string localizedMeta =
-        meta == "测速中…" ? huxerui::UseString(Localized("测速中…"))
-        : meta == "超时" ? huxerui::UseString(Localized("超时"))
-                         : meta;
+        meta == "测速中…" ? huxerui::UseString(Localized("测速中…")) : meta;
     const std::string metaText = localizedMeta.size() > kNodeMetaChars
                                      ? truncateOneLine(localizedMeta, kNodeMetaChars)
                                      : localizedMeta;
 
-    // 卡片表面与文字色来自统一原语：未选中 islands.active，选中
-    // primary_container 淡染底（描边由 SelectableTile 落笔）。
     const SelectableTileColors tile =
         ResolveSelectableTileColors(theme, selected);
     const huxerui::Color detailColor = selected ? tile.fg : tile.muted;
     const huxerui::TextStyle detailStyle{
         huxerui::Font::System(font_size::kCaption), detailColor};
     const huxerui::View detailView =
-        FittedSingleLineLabel(detail, detailStyle);
+        FittedSingleLineLabelFill(detail, detailStyle);
     const huxerui::Color metaColor =
         selected ? tile.fg
-                 : (meta == "超时"
-                        ? theme.colors.error
-                        : (meta.empty() || meta == "测速中…"
-                               ? tile.muted
-                               : delayColor(theme, delay, false)));
+                 : (meta.empty() || meta == "测速中…"
+                        ? tile.muted
+                        : delayColor(theme, delay, false));
     // 延迟槽固定宽度（含"测速中…"），内容**右对齐**贴住卡片右边距：以前 Text
     // 在槽内左对齐，短文本（"128 ms"）右侧会多出一截空隙，看着像没对齐；未测速
     // 时留空占位，卡片之间仍然对齐。
@@ -446,60 +378,33 @@ huxerui::Task<std::map<std::string, int>> MeasureProxyGroupDelay(const std::stri
     // 两行：第一行名称，第二行是「元数据（左）＋ 测速（右）」同一基线左右对齐。
     // 表面 / 内边距 / 圆角 / 交互全部交给 SelectableTile——代理页节点卡就是这套
     // 形状的标准（订阅卡等其它列表项同样复用它）。
-    // URLTest 等只读组没有手动选择动作；整卡交互与正常节点一致，点击只提示。
-    // Windows 的禁用透明度会为每张卡创建单独的 Direct2D 图层。
-    const auto startProbe = [tasks, coreModel, tests, entry, tag = node.name, toast] {
-        if (coreModel->view.Get().core.state != core::CoreState::Running) {
-            toast.Show(Localized("测速需要内核就绪，请检查内核服务"));
-            return;
-        }
-        const auto valid = [coreModel, revision = coreModel->view.Get().core.planRevision] {
-            const auto& core = coreModel->view.Get().core;
-            return core.state == core::CoreState::Running && core.planRevision == revision;
-        };
-        LaunchSingleProxyProbe(tasks, tests, tag, entry, MeasureProxyDelay, valid);
-    };
+    // 组测速入口统一在页面右下角的悬浮按钮；节点卡右侧只显示最近一次内核
+    // URLTest 回写的延迟，不提供单节点测速、也不保存任何测速结果。
     return ProxyNodeTile(NodeTitle(node.displayName, tile.fg),
         detailView,
         std::move(metaView), selected, node.displayName, std::move(onActivate),
         selectable ? SelectableTileInteraction::Selectable : SelectableTileInteraction::ReadOnly,
-        !node.isGroup && !ProxyTestUsesNativeGroup(), currentProbe.testing,
-        tests->progress.Get().busy, startProbe);
+        false, testing,
+        tests->progress.Get().busy, [] {});
 }
-
-// 页面级「乐观选中意图」：点击后渲染立刻读到目标节点。以前直接改 `groups`
-// （StateList）——那会让整张 VirtualGrid 失效并重排，大订阅下点一下卡一下；
-// 现在只写这个小 State，只有可见的卡片重组。模型快照追平后清掉意图。
-struct SelectionIntent {
-    std::string group;
-    std::string node;
-
-    bool operator==(const SelectionIntent&) const = default;
-};
 
 // 节点点击动作：**所有成员都只是"选中当前线路"**。成员本身是策略组时（订阅里
 // 的 url-test 组，如「自动选择」）表示"这条线路交给它自动挑最快"，与 Clash
 // Verge / metacubexd 一致：没有"点进去看子组"这一层，子组是标签栏里的独立分组。
 // 切换写在任务协程里（点击节点可能随列表换组卸载）。
 std::function<void()> NodeSelectAction(
-    huxerui::State<SelectionIntent> intent, huxerui::TaskScope tasks,
-    std::shared_ptr<ProxiesModel> proxiesModel, std::function<void()> onFailure,
-    std::function<void()> onReadOnly,
+    huxerui::TaskScope tasks, std::shared_ptr<ProxiesModel> proxiesModel,
+    std::function<void()> onFailure, std::function<void()> onReadOnly,
     const ProxyGroup& group, const ProxyNode& node) {
     const std::string groupName = group.name;
     const std::string nodeName = node.name;
     if (!group.selectable) return onReadOnly;
-    const SelectionIntent target{groupName, nodeName};
-    return [intent, tasks, proxiesModel, onFailure, target, groupName,
-            nodeName] {
+    return [tasks, proxiesModel, onFailure, groupName, nodeName] {
         tasks.Launch([=]() -> huxerui::Task<void> {
             co_await huxerui::Delay(std::chrono::duration<double>{0});
-            intent = target;
             const bool selected = co_await RunOnTaskThread(
                 [=] { return SelectProxyLine(groupName, nodeName); });
             if (!selected) {
-                // 失败回落：只有意图仍停在本目标上才撤销（用户已点别的就不覆盖）。
-                if (intent.Get() == target) intent = SelectionIntent{};
                 if (onFailure) onFailure();
                 co_return;
             }
@@ -518,7 +423,6 @@ std::function<void()> NodeSelectAction(
     const auto proxiesModel = huxerui::UseService<ProxiesModel>();
     const auto coreModel = huxerui::UseService<CoreModel>();
     auto groups = huxerui::UseStateList<ProxyGroup>();
-    auto coreState = huxerui::UseState<core::CoreState>(core::CoreState::Stopped);
     auto mode = huxerui::UseState<std::string>("rule");
     auto proxySearch = huxerui::UseState(huxerui::TextEditingValue{});
     auto sectionMotion = UseSectionTabMotion();
@@ -534,19 +438,18 @@ std::function<void()> NodeSelectAction(
     auto parsedLabels = huxerui::UseState<std::map<std::string, std::string>>({});
     auto parsedBody = huxerui::UseState<std::string>("");
     auto projectionGeneration = huxerui::UseState<std::uint64_t>(0);
-    // 乐观选中意图（见 SelectionIntent）：只写这个小组 State，不动 groups。
-    auto selectionIntent = huxerui::UseState<SelectionIntent>(SelectionIntent{});
 
     // 数据流完全由模型驱动（见 *_model.h）：内核状态、策略组快照任一变化才
     // 重新投影嵌套分组，**没有定时器**。唯一数据泵已完成 JSON 解码，
     // 页面在任务线程投影普通 DTO，UI 线程只发布模型。
     huxerui::Lifecycle(
-        [tasks, groups, coreState, mode, proxiesModel, coreModel, testModel,
-         parsedLabels, parsedBody, projectionGeneration, selectionIntent] {
+        [tasks, groups, mode, proxiesModel, coreModel, testModel,
+         parsedLabels, parsedBody, projectionGeneration] {
             const store::CoreSnapshot core = coreModel->view.Get().core;
-            coreState = core.state;
-            testModel->ObserveContext(core.state == core::CoreState::Running, core.planRevision);
-            // Stopped previews use saved intent; live pages show the actual core mode.
+            testModel->ObserveContext(core.state == core::CoreState::Running,
+                                      core.binderAvailable, core.planRevision,
+                                      core.runtimeEpoch, core.clientGeneration);
+            // 页面只跟随内核**实际**出站模式；不再回落到保存的模式意图。
             mode = coreModel->view.Get().Mode();
             const ProxiesSnapshot& current = proxiesModel->snapshot.Get();
             if (current.body != parsedBody.Get() || current.labels != parsedLabels.Get()) {
@@ -554,25 +457,11 @@ std::function<void()> NodeSelectAction(
                 parsedBody = current.body;
                 const auto ticket = projectionGeneration.Get() + 1;
                 projectionGeneration = ticket;
-                tasks.Launch([groups, selectionIntent, projectionGeneration, ticket,
+                tasks.Launch([groups, projectionGeneration, ticket,
                               snapshot = current.proxies, labels = current.labels]() -> huxerui::Task<void> {
                     auto parsed = co_await RunOnTaskThread(
                         [snapshot = std::move(snapshot), labels = std::move(labels)] { return parseProxies(snapshot, labels); });
                     if (projectionGeneration.Get() != ticket) co_return;
-                    // 未确认的乐观选中：模型追平就清意图，否则继续用意图值
-                    // 覆盖解析结果（点击立刻上屏，不等 2s 那拍）。
-                    const SelectionIntent pending = selectionIntent.Get();
-                    if (!pending.node.empty()) {
-                        for (ProxyGroup& parsedGroup : parsed) {
-                            if (parsedGroup.name != pending.group) continue;
-                            if (parsedGroup.now == pending.node) {
-                                selectionIntent = SelectionIntent{};
-                            } else {
-                                parsedGroup.now = pending.node;
-                            }
-                            break;
-                        }
-                    }
                     SyncProxyGroups(groups, std::move(parsed));
                 });
             }
@@ -580,74 +469,53 @@ std::function<void()> NodeSelectAction(
         },
         coreModel->view, proxiesModel->snapshot);
 
-    // 组测速触发：桌面统一走内核 /group/{name}/delay（URLTest 组保留订阅的
-    // url-test.url，内核内部并发 10）；Android 调用 libbox urlTest，UI 只消费
-    // 内核回写的结果。
+    // 组测速触发：Android 调用 libbox CommandClient.urlTest，UI 只消费内核回写；
+    // 其它平台使用本地 API 实现。结果不会在 UI 中合成或缓存。
     const std::function<void(const std::string&)> triggerGroupTest =
-        [testTasks, toast, testModel, coreModel, proxiesModel, groups](std::string groupName) {
-            std::vector<ProxyNode> nodes;
-            for (const auto& group : groups) {
-                if (group.name == groupName) nodes = group.nodes;
-            }
-            testTasks.Launch([toast, testTasks, testModel, coreModel, proxiesModel,
-                              nodes = std::move(nodes), groupName = std::move(groupName)]() -> huxerui::Task<void> {
-                if (testModel->progress.Get().busy || testModel->singlePending.Get() != 0) co_return;
+        [testTasks, toast, testModel, coreModel, proxiesModel](std::string groupName) {
+            testTasks.Launch([toast, testModel, coreModel, proxiesModel,
+                              groupName = std::move(groupName)]() -> huxerui::Task<void> {
+                if (testModel->progress.Get().busy) co_return;
                 if (coreModel->view.Get().core.state != core::CoreState::Running) {
                     toast.Show(Localized("测速需要内核就绪，请检查内核服务"));
                     co_return;
                 }
-                const auto valid = [coreModel, revision = coreModel->view.Get().core.planRevision] {
-                    const auto& core = coreModel->view.Get().core;
-                    return core.state == core::CoreState::Running && core.planRevision == revision;
-                };
                 const int generation = testModel->Begin();
                 bool ok = false;
                 try {
                     ok = co_await RunOnTaskThread([groupName] { return StartProxyGroupTest(groupName); });
-                } catch (const std::exception&) {}
+                } catch (...) {
+                }
                 if (!testModel->Current(generation)) co_return;
-                if (!ok || !valid()) {
+                if (!ok) {
                     testModel->End(generation);
                     toast.Show(Localized("测速失败：内核未运行或启动失败"));
                     co_return;
                 }
-                std::vector<ProxyProbeTarget> targets;
-                for (const auto& node : nodes) {
-                    if (node.isGroup) continue;
-                    const auto probe = testModel->Get(node.name, node.delay, node.timeout, node.urlTestTime);
-                    if (testModel->Start(probe, generation, node.urlTestTime)) targets.push_back({node.name, probe});
-                }
-                const bool native = ProxyTestUsesNativeGroup();
-                const auto pollProbe = [proxiesModel](const std::string& tag)
-                    -> std::optional<std::pair<int, std::int64_t>> {
-                    const auto snapshot = proxiesModel->snapshot.Get().proxies;
-                    if (!snapshot) return std::nullopt;
-                    const auto node = snapshot->entries.find(tag);
-                    if (node == snapshot->entries.end()) return std::nullopt;
-                    return std::pair{node->second.delay, node->second.testTime};
-                };
-                if (native) {
-                    LaunchNativeProxyProbeBatch(testTasks, testModel, std::move(targets), generation, valid,
-                        pollProbe);
-                } else {
-                    // 所有组都由内核批量测速；不要逐节点 fan-out，否则会
-                    // 丢失组 URL / 组参数，也无法得到与 sing-box 相同的
-                    // 并发和历史写入顺序。内核批处理期间轮询 /proxies，
-                    // 让每个节点在自己的结果写入 history 后立即显示。
-                    LaunchProxyGroupProbeBatch(testTasks, testModel, groupName,
-                        std::move(targets), generation, MeasureProxyGroupDelay, valid,
-                        pollProbe);
-                }
-                testModel->Broadcast(generation, groupName);
-                co_await WaitForProxyTestBatch(testModel, generation, native);
+                proxiesModel->RequestRefresh();
+                testModel->End(generation);
             });
         };
 
     // 按出站模式解析根分组与当前组（渲染期校验：组消失回落，嵌套前缀逐级
-    // 校验）。直连不经过节点，不展示订阅组。
+    // 校验）。直连不经过节点，不展示订阅组。快照不是 Live 时（内核停止、Binder
+    // 断开、查询失败）连标签栏和悬浮测速也不渲染，避免旧投影残留在界面上。
     const huxerui::StateList<ProxyGroup> all = groups;
-    const bool direct = mode.Get() == "direct";
-    const bool global = mode.Get() == "global";
+    const ProxiesSnapshot& liveSnapshot = proxiesModel->snapshot.Get();
+    const store::CoreSnapshot coreNow = coreModel->view.Get().core;
+    // Live 还需与**当前**运行会话一致：内核停止、Binder 断开或 epoch/代次变化
+    // 后，快照即使还没被数据泵清掉也立即视为不可用，迟到结果不会重新上屏。
+    const bool live = liveSnapshot.source == ProxiesSource::Live &&
+                      liveSnapshot.proxies != nullptr &&
+                      coreNow.state == core::CoreState::Running
+#if defined(__ANDROID__)
+                      && coreNow.binderAvailable &&
+                      liveSnapshot.runtimeEpoch == coreNow.runtimeEpoch &&
+                      liveSnapshot.clientGeneration == coreNow.clientGeneration
+#endif
+        ;
+    const bool direct = live && mode.Get() == "direct";
+    const bool global = live && mode.Get() == "global";
     const ProxyGroup* syntheticGlobal = findGroup(all, "GLOBAL");
     // 全局模式的根组 = 内核**实际**走哪个出站。sing-box 的 GLOBAL 是 clash_api
     // 合成的只读组（type Fallback，`PUT /proxies/GLOBAL` 会 404），它的 `now`
@@ -686,7 +554,9 @@ std::function<void()> NodeSelectAction(
     // 线路（＝交给它自动挑最快），也能直接切到它自己的标签查看/测速，因此不再
     // 需要"点进子组"那一层。全局模式只保留 GLOBAL（或平台回落组），直连不走组。
     std::vector<const ProxyGroup*> rootGroups;
-    if (global) {
+    if (!live) {
+        // 非实时快照：不展示任何组、标签或节点。
+    } else if (global) {
         if (globalRoot != nullptr) rootGroups.push_back(globalRoot);
     } else if (!direct) {
         for (const auto& g : all) {
@@ -735,8 +605,7 @@ std::function<void()> NodeSelectAction(
 
     const bool compact =
         huxerui::UseViewportClass() == huxerui::ViewportClass::Compact;
-    // 协议文本的实际宽度由 FittedSingleLineLabel 在卡片测量阶段决定。
-    const std::size_t detailLimit = compact ? 7 : 12;
+    // 协议文本在卡片测量阶段按实际可用宽度省略，右侧测速槽固定占位。
 
     // 不可见时只保留本页 State/Lifecycle，不构建重子树：huxerui 的 Pager 会把
     // 四个一级页同时挂载，隐藏页即使不重组，其已挂载子树仍随每一帧被重新测量。
@@ -791,10 +660,8 @@ std::function<void()> NodeSelectAction(
         huxerui::View grid = PageVirtualGrid(
                                  nodeCount,
                                  [groups, visibleNodes = std::move(visibleNodes),
-                                  detailLimit,
                                   tasks, toast, contentGroupName,
-                                  nodeCount, compact, proxiesModel,
-                                  selectionIntent](std::size_t index)
+                                  nodeCount, compact, proxiesModel](std::size_t index)
                                      -> huxerui::View {
                                      const ProxyGroup* group =
                                          findGroup(groups, contentGroupName);
@@ -805,19 +672,12 @@ std::function<void()> NodeSelectAction(
                                      const ProxyNode& node =
                                          group->nodes[visibleNodes[index]];
                                      const std::string nodeName = node.name;
-                                     // 乐观意图优先于模型快照里的 now。
-                                     const SelectionIntent pending =
-                                         selectionIntent.Get();
-                                     const std::string currentNow =
-                                         pending.group == group->name
-                                             ? pending.node
-                                             : group->now;
+                                     const std::string currentNow = group->now;
                                      return NodeCard(
                                                 node, nodeName == currentNow,
                                                 group->selectable,
-                                                NodeSelectAction(
-                                                    selectionIntent, tasks,
-                                                    proxiesModel,
+                                                    NodeSelectAction(
+                                                        tasks, proxiesModel,
                                                     [toast] {
                                                         toast.Show(
                                                             Localized("线路切换失败，请查看日志"));
@@ -826,8 +686,7 @@ std::function<void()> NodeSelectAction(
                                                         toast.Show(Localized(
                                                             "此分组不支持手动切换节点，仅作展示"));
                                                     },
-                                                    *group, node),
-                                                detailLimit)
+                                                    *group, node))
                                          .Key(group->name + "::" + nodeName);
                                  }, PageScrollInset(theme, true), kSectionCardSpacing,
                                  compact ? kCompactFloatingNavigationInset : (showSpeedFab ? kSpeedFabFooterHeight : 0.0F))
@@ -848,7 +707,11 @@ std::function<void()> NodeSelectAction(
     }
 
     huxerui::View body;
-    if (direct) {
+    if (!live) {
+        // 内核停止、Binder 断开或查询失败：不展示任何缓存/预览，只给实时不可用提示。
+        // Running 且首次查询在途时 loaded=false，走上面的骨架屏分支。
+        body = EmptyState(Localized("代理内核未运行或查询失败，暂无实时数据"), app::images::proxies);
+    } else if (direct) {
         body = EmptyState(Localized("直连模式 —— 流量不经过任何代理节点"), app::images::proxies);
     } else if (rootGroups.empty()) {
         body = EmptyState(Localized(global ? "全局模式暂无可用策略组"
@@ -864,28 +727,10 @@ std::function<void()> NodeSelectAction(
     if (!tabNames.empty()) {
         std::vector<SectionTab> groupTabs;
         groupTabs.reserve(tabNames.size());
-        // 保真度角标：这份订阅编译时被降级 / 跳过的组，在标签上带一个 "!"。这里只
-        // 做「哪个组有问题」的定位，明细在设置页「配置保真度」
-        // （见 docs/singbox-layers-and-fidelity.md §2）。
-        const std::vector<singbox::FidelityNote> fidelity =
-            coreModel->view.Get().core.fidelity;
-        const auto catalog = coreModel->view.Get().core.sourceObjects;
-        const auto groupHasFidelityNote = [&fidelity, &catalog](const std::string& name) {
-            std::string source, object = name;
-            if (catalog) for (const auto& entry : *catalog) if (entry.tag == name) {
-                source = entry.sourceId; object = entry.objectId; break;
-            }
-            return std::any_of(
-                fidelity.begin(), fidelity.end(),
-                [&source, &object](const singbox::FidelityNote& note) {
-                    return note.scope == singbox::FidelityScope::Group &&
-                           note.subject == object && note.sourceId == source;
-                });
-        };
         for (const std::string& name : tabNames) {
             groupTabs.push_back(SectionTab{
                 name, findGroup(all, name) ? findGroup(all, name)->displayName : name,
-                groupHasFidelityNote(name) ? std::string{"!"} : std::string{}});
+                std::string{}});
         }
         columnChildren.push_back(
             SectionTabBar(groupTabs, selectedRoot, selectGroup, sectionMotion,
@@ -918,7 +763,7 @@ std::function<void()> NodeSelectAction(
             huxerui::IconButton(app::images::speed, Localized("测速"))
                 .With(huxerui::Tooltip(Localized("测试当前分组延迟")),
                       huxerui::Frame{.width = 56.0F, .height = 56.0F},
-                      huxerui::Enabled(!progress.busy && testModel->singlePending.Get() == 0),
+                      huxerui::Enabled(!progress.busy),
                       huxerui::Opacity(testing ? 0.0F : 1.0F),
                       huxerui::Foreground(theme.colors.on_primary),
                       huxerui::Semantics{.role = huxerui::SemanticRole::Button,
