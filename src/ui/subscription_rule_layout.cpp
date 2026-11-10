@@ -96,8 +96,14 @@ huxerui::View FittedSingleLineLabelFill(std::string text, huxerui::TextStyle sty
         std::string line = text;
         std::replace(line.begin(), line.end(), '\n', ' ');
         std::replace(line.begin(), line.end(), '\r', ' ');
+        // The Row carries no children; without an explicit height it measures 0
+        // and the fitted extension's clip bounds collapse to an empty rect.
+        const float height =
+            line.empty()
+                ? 0.0F
+                : std::ceil(huxerui::UseTextMeasurer().MeasureText(line, style).size.height);
         return huxerui::Row{}
-            .With(huxerui::Grow(1.0F), huxerui::Frame{.min_width = 0.0F},
+            .With(huxerui::Grow(1.0F), huxerui::Frame{.min_width = 0.0F, .height = height},
                   huxerui::CrossAlign(huxerui::CrossAxisAlignment::Stretch),
                   FittedRuleLabel{line, style, align});
     }).With(huxerui::Semantics{.role = huxerui::SemanticRole::Text, .label = text});
