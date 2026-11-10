@@ -103,6 +103,19 @@ bool isSelectorType(const std::string& t) {
 // 卡片第二行元数据（定义在 NodeCard 之前，声明放这里供解析期调用）。
 std::string BuildNodeDetail(const ProxyNode& node);
 
+bool IsLiveProxySnapshot(const ProxiesSnapshot& snapshot,
+                         const store::CoreSnapshot& core) {
+    if (snapshot.source != ProxiesSource::Live || !snapshot.proxies ||
+        core.state != core::CoreState::Running) return false;
+#if defined(__ANDROID__)
+    return core.binderAvailable &&
+           snapshot.runtimeEpoch == core.runtimeEpoch &&
+           snapshot.clientGeneration == core.clientGeneration;
+#else
+    return true;
+#endif
+}
+
 std::vector<ProxyGroup> parseProxies(const std::shared_ptr<const wire::Proxies>& snapshot,
     const std::map<std::string, std::string>& labels) {
     std::vector<ProxyGroup> groups;
@@ -505,15 +518,7 @@ std::function<void()> NodeSelectAction(
     const store::CoreSnapshot coreNow = coreModel->view.Get().core;
     // Live 还需与**当前**运行会话一致：内核停止、Binder 断开或 epoch/代次变化
     // 后，快照即使还没被数据泵清掉也立即视为不可用，迟到结果不会重新上屏。
-    const bool live = liveSnapshot.source == ProxiesSource::Live &&
-                      liveSnapshot.proxies != nullptr &&
-                      coreNow.state == core::CoreState::Running
-#if defined(__ANDROID__)
-                      && coreNow.binderAvailable &&
-                      liveSnapshot.runtimeEpoch == coreNow.runtimeEpoch &&
-                      liveSnapshot.clientGeneration == coreNow.clientGeneration
-#endif
-        ;
+    const bool live = IsLiveProxySnapshot(liveSnapshot, coreNow);
     const bool direct = live && mode.Get() == "direct";
     const bool global = live && mode.Get() == "global";
     const ProxyGroup* syntheticGlobal = findGroup(all, "GLOBAL");
