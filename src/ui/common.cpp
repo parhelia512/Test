@@ -82,10 +82,6 @@ void StartExternalResourceRefreshPump(huxerui::TaskScope tasks) {
 
 namespace {
 
-bool isSelectorType(const std::string& type) {
-    return type == "Selector" || type == "selector";
-}
-
 enum class CoreApplyStatus { Applied, PermissionDenied, ServiceInstallFailed, Failed };
 struct CoreApplyResult {
     CoreApplyStatus status = CoreApplyStatus::Failed;
@@ -303,70 +299,7 @@ std::optional<std::string> DecodeSourceOutboundName(std::string_view tag) {
     return decode(tag.substr(separator + 3));
 }
 
-// 只服务于 FetchProxiesSnapshot：拥有型策略组 DTO → 扁平快照。不再是公开 API——
-// 消费方一律读 ProxiesModel，避免又出现第二个「各自解析」的入口。
-std::vector<ProxyGroupSnapshot> ParseProxyGroups(const wire::Proxies& snapshot, const std::map<std::string, std::string>& labels) {
-    std::vector<ProxyGroupSnapshot> groups;
-    const auto& proxies = snapshot.entries;
-    for (const auto& [name, value] : proxies) {
-        if (!value.members) continue;
-        ProxyGroupSnapshot group;
-        group.name = name;
-        group.displayName = labels.contains(name) ? labels.at(name) : name;
-
-        group.type = value.type;
-        group.current = value.now;
-        group.selectable = value.selectable.value_or(isSelectorType(group.type));
-        group.nodes = *value.members;
-        for (const auto& node : group.nodes) {
-            if (labels.contains(node)) group.nodeLabels[node] = labels.at(node);
-            if (const auto found = proxies.find(node); found != proxies.end()) {
-                // Prefer the latest URLTest delay; fall back to the last history
-                // entry exactly like the proxy page projection.
-                group.delays[node] = found->second.delay;
-            }
-        }
-        groups.push_back(std::move(group));
-    }
-    return groups;
-}
-
 } // namespace
-
-std::vector<huxerui::MenuEntry> BuildProxyLineMenu(
-    const std::vector<ProxyGroupSnapshot>& groups,
-    std::function<void(const std::string&, const std::string&)> on_select,
-    const std::function<std::string(huxerui::StringVariant)>& resolveLabel) {
-    std::vector<huxerui::MenuEntry> entries;
-    for (const ProxyGroupSnapshot& group : groups) {
-        if (!group.selectable) {
-            entries.push_back(huxerui::MenuItem(
-                resolveLabel(LocalizedFormat("{}（自动测速，不支持手动切换）", group.displayName)),
-                [] {}).Enabled(false));
-            continue;
-        }
-        std::vector<huxerui::MenuEntry> nodes;
-        for (const std::string& node : group.nodes) {
-            nodes.push_back(huxerui::MenuItem(
-                                group.nodeLabels.contains(node) ? group.nodeLabels.at(node) : node,
-                                [on_select, groupName = group.name, node] {
-                                    on_select(groupName, node);
-                                })
-                                .Checked(node == group.current));
-        }
-        if (nodes.empty()) {
-            nodes.push_back(
-                huxerui::MenuItem(resolveLabel(Localized("暂无可切换线路")), [] {}).Enabled(false));
-        }
-        entries.push_back(
-            huxerui::MenuItem(group.displayName, std::move(nodes)));
-    }
-    if (entries.empty()) {
-        entries.push_back(
-            huxerui::MenuItem(resolveLabel(Localized("暂无可切换线路")), [] {}).Enabled(false));
-    }
-    return entries;
-}
 
 // ---- 策略组快照：唯一来源（见 proxies_model.h）------------------------------
 
@@ -422,7 +355,6 @@ ProxiesSnapshot FetchProxiesSnapshot(std::uint64_t runtimeEpoch,
         const auto& tag = entry.first;
         if (const auto name = DecodeSourceOutboundName(tag)) next.labels[tag] = *name;
     }
-    next.groups = ParseProxyGroups(*next.proxies, next.labels);
     return next;
 }
 

@@ -9,7 +9,6 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -204,23 +203,6 @@ void ReplaceStateList(huxerui::StateList<T> list, std::vector<T> values) {
     }
 }
 
-// 当前运行内核公开的可切换策略组快照。桌面来自 clash_api，Android 来自
-// libbox CommandClient；UI 只依赖这份跨平台模型，不直接知道平台 API。
-struct ProxyGroupSnapshot {
-    std::string name; // 内核 tag，始终用于 API 与持久化
-    std::string displayName;
-    std::map<std::string, std::string> nodeLabels;
-    std::string type;
-    std::string current;
-    std::vector<std::string> nodes;
-    std::map<std::string, int> delays;
-    // sing-box URLTest/Fallback groups are readable but cannot be changed
-    // with SelectOutbound; only selector groups are manually selectable.
-    bool selectable = false;
-
-    bool operator==(const ProxyGroupSnapshot&) const = default;
-};
-
 inline huxerui::Color DelayLevelColor(const huxerui::ThemeSpec& theme, int delay,
                                       bool unavailable = false) {
     if (unavailable || delay <= 0) return theme.colors.error;
@@ -230,16 +212,7 @@ inline huxerui::Color DelayLevelColor(const huxerui::ThemeSpec& theme, int delay
     return theme.colors.error;
 }
 
-// 由组合期调用，resolveLabel 将应用 Locale 的资源解析为拥有型菜单文案。
-std::vector<huxerui::MenuEntry> BuildProxyLineMenu(
-    const std::vector<ProxyGroupSnapshot>& groups,
-    std::function<void(const std::string&, const std::string&)> on_select,
-    const std::function<std::string(huxerui::StringVariant)>& resolveLabel);
-
-// 策略组快照不在本层暴露取数接口：唯一来源是 ProxiesModel（proxies_model.h），
-// 由 AppRoot 驱动刷新，页面/托盘只读它的 State。下面两个调用均可能触发阻塞
-// REST，调用方必须经 RunOnTaskThread 执行；Android 的切换由 libbox bridge 提供
-// 同名能力。
+// 代理组选择与测速只操作已运行内核；调用方必须经 RunOnTaskThread 执行。
 bool SelectProxyLine(const std::string& group, const std::string& name);
 bool StartProxyGroupTest(const std::string& group);
 

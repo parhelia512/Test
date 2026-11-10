@@ -1,26 +1,18 @@
-// proxies_model.h — 策略组快照的唯一来源（跨页面共享的 application service）。
-//
-// 代理页、首页卡片、托盘菜单都只读这里的 State。快照只有一种来源：当前正在
-// 运行的内核（Android 经 Binder 的 CommandClient，桌面经 clash_api）。内核未
-// 运行、未连接或查询失败时快照为 Empty——UI 不保留上一轮结果，也不使用按订阅
-// 编译的预览，避免把「看起来像实时」的旧数据当成当前状态。
-//
-// 只有一个拉取器（common.cpp 的 FetchProxiesSnapshot）与一个驱动循环
-// （DriveProxiesModel，在 AppRoot 组合期启动一次，2s 一拍、有请求时立即补一拍），
-// 结果写进这里的 State。State::Write 按 operator== 去重，内容没变不会通知订阅者。
+// 代理页直接读原始 wire::Proxies；模型不缓存派生的组/节点列表。快照仅来自
+// 当前运行内核，停止、会话失效或查询失败时 UI 不回退到预览或旧结果。
+// 唯一拉取器由 common.cpp 的 FetchProxiesSnapshot 和 DriveProxiesModel 组成。
 #pragma once
 
 #include <huxerui/huxerui.h>
 
 #include <cstdint>
-#include <memory>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "wire_codec.h"
 #include "proxy_test_model.h"
-#include "ui.h" // ProxyGroupSnapshot
 
 namespace clashflux::ui {
 
@@ -35,10 +27,10 @@ enum class ProxiesSource {
 
 struct ProxiesSnapshot {
     bool loaded = false;                     // 首轮获取（成功或失败）已结束
-    std::vector<ProxyGroupSnapshot> groups; // 扁平表示（首页卡片 / 托盘菜单）
-    std::map<std::string, std::string> labels; // 稳定 tag → 来源限定的显示名
-    std::string body;                       // 内容版本比较用的原文
-    std::shared_ptr<const wire::Proxies> proxies; // 工作线程生成的不可变拥有型 DTO
+    std::map<std::string, std::string> labels; // 稳定 tag → 当前运行内核的显示名
+    std::string body;                       // 原始内容与快照 DTO 的版本比较
+    // State 去重按 DTO 值比较，忽略 shared_ptr 地址。
+    std::shared_ptr<const wire::Proxies> proxies;
     ProxiesSource source = ProxiesSource::Empty;
     // 产生本次结果的运行会话（Android 来自 CommandClient 查询；桌面为 0）。
     // 必须参与去重比较：内核重启后组内容可能逐字节相同，但旧快照已不属于
@@ -49,10 +41,10 @@ struct ProxiesSnapshot {
     std::string error;
 
     bool operator==(const ProxiesSnapshot& other) const {
-        // DTO is a deterministic projection of body. Pointer identity changes
-        // on each fetch and must not force State notifications for equal data.
-        return loaded == other.loaded && labels == other.labels && groups == other.groups &&
+        return loaded == other.loaded && labels == other.labels &&
                body == other.body && source == other.source &&
+               ((!proxies && !other.proxies) ||
+                (proxies && other.proxies && *proxies == *other.proxies)) &&
                runtimeEpoch == other.runtimeEpoch &&
                clientGeneration == other.clientGeneration &&
                error == other.error;
@@ -66,8 +58,7 @@ struct ProxiesModel {
     // 必须带初值：huxerui::State 的默认构造是「空 cell」，读取/写入都会抛
     // "Lifecycle dependency State is empty"。
     huxerui::State<ProxiesSnapshot> snapshot{ProxiesSnapshot{}};
-    // 用户动作（切节点 / 测速 / 切换订阅）后自增：驱动循环看到计数变化就跳过
-    // 本次等待、立即再拉一拍。动作方不需要知道数据怎么取。
+    // 2s poll or explicit action request skips the current wait and triggers a fresh query.
     huxerui::State<std::uint64_t> refreshTick{0};
 
     void RequestRefresh() { refreshTick = refreshTick.Get() + 1; }
