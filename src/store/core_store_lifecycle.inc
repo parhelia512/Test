@@ -230,12 +230,15 @@
         }
 #endif
         streams_.stop();
-        std::lock_guard lock(mutex_);
-        snap_.state = core::CoreState::Stopped;
-        snap_.runningSince = {};
-        snap_.version.clear();
-        snap_.lastError.clear();
-        clashflux::runtime_plan::Stopped(snap_);
+        {
+            std::lock_guard lock(mutex_);
+            snap_.state = core::CoreState::Stopped;
+            snap_.runningSince = {};
+            snap_.version.clear();
+            snap_.lastError.clear();
+            clashflux::runtime_plan::Stopped(snap_);
+        }
+        // Evidence capture reads snapshot(), which acquires mutex_ again.
         captureHealthEvidence(false);
         return true;
     }

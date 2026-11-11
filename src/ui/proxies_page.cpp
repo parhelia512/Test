@@ -331,11 +331,11 @@ std::function<void()> NodeSelectAction(
         },
         coreModel->view, proxiesModel->snapshot);
 
-    // 组测速触发：Android 调用 libbox CommandClient.urlTest，UI 只消费内核回写；
-    // 其它平台使用本地 API 实现。结果不会在 UI 中合成或缓存。
+    // urlTest 返回只表示请求已提交；结果由现有实时快照刷新获取，
+    // 不在请求返回后刷新配置、重启内核或追加查询。
     const std::function<void(const std::string&)> triggerGroupTest =
-        [testTasks, toast, testModel, coreModel, proxiesModel](std::string groupName) {
-            testTasks.Launch([toast, testModel, coreModel, proxiesModel,
+        [testTasks, toast, testModel, coreModel](std::string groupName) {
+            testTasks.Launch([toast, testModel, coreModel,
                               groupName = std::move(groupName)]() -> huxerui::Task<void> {
                 if (testModel->progress.Get().busy) co_return;
                 if (coreModel->view.Get().core.state != core::CoreState::Running) {
@@ -349,13 +349,10 @@ std::function<void()> NodeSelectAction(
                 } catch (...) {
                 }
                 if (!testModel->Current(generation)) co_return;
-                if (!ok) {
-                    testModel->End(generation);
-                    toast.Show(Localized("测速失败：内核未运行或启动失败"));
-                    co_return;
-                }
-                proxiesModel->RequestRefresh();
                 testModel->End(generation);
+                if (!ok) {
+                    toast.Show(Localized("测速失败：内核未运行或启动失败"));
+                }
             });
         };
 
