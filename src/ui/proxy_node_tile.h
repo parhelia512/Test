@@ -59,7 +59,6 @@ inline huxerui::View ProxyNodeTile(huxerui::View title, huxerui::View detail,
                 huxerui::Row{
                     std::move(detailView).With(huxerui::Grow(1.0F),
                         huxerui::Frame{.min_width = 0.0F}),
-                    huxerui::Spacer(),
                     std::move(slot),
                 }.With(huxerui::CrossAlign(huxerui::CrossAxisAlignment::End)),
             }.With(huxerui::Spacing(2.0F),
